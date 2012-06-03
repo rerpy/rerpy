@@ -1,6 +1,11 @@
 import sqlite3
 import string
-import pprint
+import re
+from charlton import CharltonError
+from charlton.origin import Origin
+from charlton.parse_core import Token, Operator, parse
+
+__all__ = ["Events"]
 
 # An injective map from arbitrary non-empty unicode strings to strings that
 # match the regex [_a-zA-Z][_a-zA-Z0-9]+ (i.e., are valid SQL identifiers)
@@ -40,11 +45,21 @@ def test__munge_name():
 def _table_name(key):
     return "attr_" + _munge_name(key)
 
-def _index(obj):
-    if isinstance(obj, tuple):
+def _index(obj, origin=None):
+    if isinstance(obj, (int, long)):
+        return (0, obj)
+    elif (isinstance(obj, tuple)
+          and len(obj) == 2
+          and isinstance(obj[0], (int, long))
+          and isinstance(obj[1], (int, long))):
         return obj
     else:
-        return (0, obj)
+        raise CharltonError("bad index: %s" % (obj,), origin)
+
+def test__index():
+    assert _index(1) == (0, 1)
+    assert _index(10) == (0, 10)
+    assert _index((10, 20)) == (10, 20)
 
 class Events(object):
     NUMERIC = "numeric"
@@ -65,26 +80,6 @@ class Events(object):
         c.execute("CREATE INDEX sys_events_era_offset_idx ON sys_events "
                   "(era, offset);")
 
-    # def _munge_key(self, key):
-    #     new_key = []
-    #     for i in xrange(len(key)):
-    #         if key[i] in string.letters:
-    #             new_key.append(key[i])
-    #             break
-    #     for char in key[i + 1:]:
-    #         if char in string.letters + "_" + string.digits:
-    #             new_key.append(char)
-    #     return "".join(new_key)
-
-    # def _table_name(self, key):
-    #     munged = self._munge_key(key)
-    #     if munged != key:
-    #         err = ("Illegal event attribute name %r. Names must begin with a "
-    #                "letter, and contain only letters, digits, and underscores."
-    #                " For example: %r" % (key, munged))
-    #         raise ValueError, err
-    #     return "attr_%s" % (key,)
-
     def _value_type(self, key, value):
         # must come first, because issubclass(bool, int)
         if isinstance(value, bool):
@@ -96,7 +91,9 @@ class Events(object):
         elif value is None:
             return None
         else:
-            raise ValueError, "Invalid value %r for key %s: must be a string, number, bool, or None" % (value, key)
+            raise ValueError, ("Invalid value %r for key %s: "
+                               "must be a string, number, bool, or None"
+                               % (value, key))
 
     def _value_type_for_key(self, key):
         c = self._connection.cursor()
@@ -112,6 +109,7 @@ class Events(object):
             return
         wanted_type = self._value_type_for_key(key)
         if wanted_type is None:
+            c = self._connection.cursor()
             c.execute("INSERT INTO sys_key_types (key, type) VALUES (?, ?);",
                       (key, value_type))
         else:
@@ -154,32 +152,6 @@ class Events(object):
                           % (_table_name(key),), (event_id, value))
             return Event(self, event_id)
 
-    def at(self, index):
-        return self.in_range(era, start=index, count=1)
-
-    # XX this is all wrong
-    def in_range(self, era, start=0, stop=None, stop_incr=None):
-        if start < 0:
-            start += self._era_lens[era]
-        if stop is None:
-            if stop_incr is None:
-                stop = self._era_lens[era]
-            else:
-                stop = start + stop_incr
-        else:
-            if stop_incr is not None:
-                raise ValueError, "can't specify stop= and stop_incr= together"
-        if stop < 0:
-            stop += self._era_lens[era]
-        c = self._connection.cursor()
-        c.execute("SELECT id FROM sys_events"
-                  " WHERE era = ?"
-                  " AND offset >= ? AND offset < ?"
-                  " ORDER BY era, offset;",
-                  (era, start, stop))
-        for (id,) in c:
-            yield Event(self, id)
-
     def _delete_event(self, id):
         with self._connection:
             c = self._connection.cursor()
@@ -211,6 +183,69 @@ class Events(object):
                 c.execute("INSERT INTO %s (event_id, value) VALUES (?, ?);"
                           % (table,), (id, value))
 
+    @property
+    def placeholder(self):
+        return PlaceholderEvent(self)
+
+    @property
+    def ANY(self):
+        return LiteralQuery(self, True)
+
+    def find(self, *args, **kwargs):
+        "Usage: either find(a=1, b=2) or find(query_obj) or find(\"string\")"
+        if len(args) == 0 and kwargs:
+            p = self.placeholder
+            equalities = []
+            if "INDEX" in kwargs:
+                equalities.append(p.index == kwargs.pop("INDEX"))
+            for k, v in kwargs.iteritems():
+                equalities.append(p[k] == v)
+            query = reduce(lambda a, b: a & b, equalities)
+            args = [query]
+            kwargs = {}
+        if not (len(args) == 1 and not kwargs):
+            raise TypeError("Usage: find(a=1, b=2) or find(query_obj) "
+                            "or find(\"query string\")")
+        query = args[0]
+        if isinstance(query, basestring):
+            query = query_from_string(self, query)
+        if not isinstance(query, Query):
+            raise ValueError, "expected a query object, not %r" % (query,)
+        if not query._is_bool():
+            raise CharltonError("query object must be boolean", query)
+        if query._events is not self:
+            raise ValueError("query object does not refer to this Events "
+                             "object")
+        sql_expr = query._sql_expr()
+        sql_expr.tables.add("sys_events")
+        joins = ["%s.event_id == sys_events.id" % (table,)
+                 for table in sql_expr.tables if table != "sys_events"]
+        c = self._connection.cursor()
+        code = ("SELECT sys_events.id FROM %s WHERE (%s) "
+                % (", ".join(sql_expr.tables), sql_expr.code))
+        if joins:
+            code += " AND (%s)" % (" AND ".join(joins))
+        code += "ORDER BY sys_events.era, sys_events.offset"
+        #print code, sql_expr.args
+        c.execute(code, sql_expr.args)
+        for (id,) in c:
+            yield Event(self, id)
+
+    def at(self, index):
+        return self.find(INDEX=index)
+
+    def __iter__(self):
+        return self.find(self.ANY)
+
+    def __len__(self):
+        c = self._connection.cursor()
+        c.execute("SELECT count(*) FROM sys_events;")
+        return c.fetchone()[0]
+
+    def __repr__(self):
+        return "<%s object with %s entries>" % (self.__class__.__name__,
+                                                len(self))
+
 class Event(object):
     def __init__(self, events, id):
         self._events = events
@@ -221,7 +256,10 @@ class Event(object):
         return self._events._event_index(self._id)
 
     def __getitem__(self, key):
-        row = self._events._event_select_attr(self._id, key)
+        try:
+            row = self._events._event_select_attr(self._id, key)
+        except sqlite3.OperationalError:
+            raise KeyError, key
         if row is None:
             raise KeyError, key
         return row[0]
@@ -239,18 +277,7 @@ class Event(object):
             except KeyError:
                 continue
             
-    # Everything else is defined in terms of the above methods:
-    def __getattr__(self, name):
-        if name.startswith("_"):
-            raise AttributeError, name
-        try:
-            return self[name]
-        except KeyError:
-            raise AttributeError, name
-
-    # We intentionally don't define __setattr__ -- too dangerous! __getattr__
-    # support is just a convenience -- use __getitem__/__setitem__ support
-    # instead.
+    # Everything else is defined in terms of the above methods.
 
     def get(self, key, default=None):
         try:
@@ -262,6 +289,21 @@ class Event(object):
         for key, _ in self.iteritems():
             yield key
 
+    iterkeys = __iter__
+
+    def itervalues(self):
+        for _, value in self.iteritems():
+            yield value
+
+    def keys(self):
+        return list(self.iterkeys())
+
+    def values(self):
+        return list(self.itervalues())
+
+    def items(self):
+        return list(self.iteritems())
+
     def __contains__(self):
         try:
             self[key]
@@ -271,10 +313,26 @@ class Event(object):
             return True
 
     def __repr__(self):
-        return "<%s %s at (%s): %s>" % (
+        return "<%s %s at %s: %s>" % (
             self.__class__.__name__, self._id, self.index,
-            #pprint.pformat(dict(self.iteritems()), indent=4)
             repr(dict(self.iteritems())))
+
+###############################################
+#
+# The query specification system (Python API)
+#
+###############################################
+
+class PlaceholderEvent(object):
+    def __init__(self, events):
+        self._events = events
+
+    def __getitem__(self, key):
+        return AttrQuery(self._events, key)
+
+    @property
+    def index(self):
+        return IndexQuery(self._events)
 
 class SqlExpr(object):
     def __init__(self, code, tables, args):
@@ -282,185 +340,186 @@ class SqlExpr(object):
         self.tables = tables
         self.args = args
 
-class Constraint(object):
-    origin = None
-
-    def __init__(self, events):
+class Query(object):
+    def __init__(self, events, origin=None):
         self._events = events
+        self.origin = origin
 
-    @classmethod
-    def _as_constraint(cls, other):
-        if isinstance(other, Constraint):
+    def _as_constraint(self, other):
+        if isinstance(other, Query):
             return other
-        return Literal(other)
+        return LiteralQuery(self._events, other)
+
+    def _make_op(self, sql_op, children, children_bool):
+        children = [self._as_constraint(child) for child in children]
+        for child in children:
+            if child._is_bool() != children_bool:
+                if children_bool:
+                    expected = "boolean"
+                else:
+                    expected = "non-boolean"
+                msg = ("%s operator expected %s arguments "
+                       "(check your parentheses?)" % (sql_op, expected))
+                raise CharltonError(msg, child)
+            assert child._events is self._events
+        return QueryOperator(self._events, sql_op, children,
+                                  Origin.combine(children))
 
     def __eq__(self, other):
-        return Operator(self._events,
-                        "==",
-                        [self, other],
-                        False)
+        return self._make_op("==", [self, other], False)
 
-class Operator(object):
-    def __init__(self, events, sql_op, children, children_bool):
-        self.sql_op = sql_op
-        if INDEX in 
-        children = [Constraint._as_constraint(child) for child in children]
-        for child in children:
-            if child.is_bool(events) != children_bool:
-                raise CharltonError("operator '%s' %s boolean arguments"
-                                    % (sql_op, ["did not expect",
-                                                "expected"][children_bool]),
-                                    child)
-        self.children = children
-        
-    def is_bool(self, events):
-        return True
+    def __ne__(self, other):
+        return self._make_op("!=", [self, other], False)
 
-class Attr(object):
-    def __init__(self, name, origin=None):
-        self._name = name
-        self.origin = origin
+    def __lt__(self, other):
+        return self._make_op("<", [self, other], False)
 
-    def to_sql(self):
-        table_id = _table_name(self._name)
-        return SqlExpr(table_id + ".value",
-                       set([table_id]),
-                       [])
+    def __gt__(self, other):
+        return self._make_op(">", [self, other], False)
 
-    def is_bool(self, events):
-        wanted_type = events._value_type_for_key(self._name)
-        if wanted_type is None:
-            raise CharltonError("unknown attribute %r" % (self._name), self)
-        return wanted_type == Events.BOOL
+    def __le__(self, other):
+        return self._make_op("<=", [self, other], False)
 
-class SysField(object):
-    def __init__(self, origin=None):
-        self.origin = origin
+    def __ge__(self, other):
+        return self._make_op(">=", [self, other], False)
 
-    def to_sql(self):
-        return SqlExpr("sys_events.%s" % (self._sys_field),
-                       set(["sys_events"]),
-                       [])
+    def __and__(self, other):
+        return self._make_op("AND", [self, other], True)
 
-    def is_bool(self, events):
-        return False
+    def __or__(self, other):
+        return self._make_op("OR", [self, other], True)
 
-class Era(SysField):
-    _sys_field = "era"
+    def __invert__(self, other):
+        return self._make_op("NOT", [self], True)
 
-class Offset(SysField):
-    _sys_field = "offset"
+    def _is_bool(self):
+        assert False
 
-OFFSET = object()
-class Offset(object):
-    def __init__(self, origin=None):
-        self.origin = origin
+    def _sql_expr(self):
+        assert False
 
-    def to_sql(self):
-        
-
-    def is_bool(self, events):
-        return False
-
-class Literal(object):
-    def __init__(self, value, origin=None):
+class LiteralQuery(Query):
+    def __init__(self, events, value, origin=None):
+        Query.__init__(self, events, origin)
         self._value = value
-        self.origin = origin
 
-    def to_sql(self):
+    # So that "10 == index" will get processed by Index._make_op instead of
+    # us:
+    def _make_op(self, sql_op, children, children_bool):
+        for child in children:
+            if isinstance(child, Index):
+                return NotImplemented
+        return Query._make_op(self, sql_op, children, children_bool)
+
+    def _sql_expr(self):
+        if not isinstance(self._value, (bool, basestring, int, float)):
+            raise CharltonError("literals must be boolean, strings, or numbers",
+                                self)
         return SqlExpr("?", set(), [self._value])
 
-    def is_bool(self, events):
+    def _is_bool(self):
         return isinstance(self._value, bool)
 
-class BinOp(object):
-    sql_op = NotImplemented
+    def __repr__(self):
+        return "<%s %r>" % (self.__class__.__name__, self._value)
 
-    def __init__(self, lhs, rhs, origin=None):
-        self._lhs = lhs
-        self._rhs = rhs
-        self.origin = origin
+class AttrQuery(Query):
+    def __init__(self, events, name, origin=None):
+        Query.__init__(self, events, origin)
+        self._name = name
 
-    def to_sql(self):
-        lhs_sqlexpr = self._lhs.to_sql()
-        rhs_sqlexpr = self._rhs.to_sql()
+    def _sql_expr(self):
+        table_id = _table_name(self._name)
+        return SqlExpr(table_id + ".value", set([table_id]), [])
+
+    def _is_bool(self):
+        known_type = self._events._value_type_for_key(self._name)
+        if known_type is None:
+            raise CharltonError("unknown attribute %r" % (self._name), self)
+        return known_type == Events.BOOL
+
+    def __repr__(self):
+        return "<%s %r>" % (self.__class__.__name__, self._name)
+
+class SysFieldQuery(Query):
+    def _sql_expr(self):
+        return SqlExpr("sys_events.%s" % (self._sys_field), set(), [])
+
+    def _is_bool(self):
+        return False
+
+    def __repr__(self):
+        return "<%s>" % (self.__class__.__name__,)
+
+class EraQuery(SysFieldQuery):
+    _sys_field = "era"
+
+class OffsetQuery(SysFieldQuery):
+    _sys_field = "offset"
+
+class IndexQuery(Query):
+    def _make_op(self, sql_op, children, children_bool):
+        if children[0] is self:
+            other_idx = 1
+        else:
+            assert children[1] is self
+            other_idx = 0
+        other = self._as_constraint(children[other_idx])
+        if not isinstance(other, LiteralQuery):
+            raise CharltonError("index can only be compared with literal "
+                                "values", other)
+        index = _index(other._value, other.origin)
+        era = EraQuery(self._events, self.origin)
+        era_args = [era, index[0]]
+        if sql_op == "<":
+            era_op = "<="
+        elif sql_op == ">":
+            era_op = ">="
+        else:
+            era_op = sql_op
+        offset = OffsetQuery(self._events, self.origin)
+        offset_args = [offset, index[1]]
+        if other_idx == 0:
+            era_args = era_args[::-1]
+            offset_args = offset_args[::-1]
+        return (era._make_op(era_op, era_args, children_bool)
+                & offset._make_op(sql_op, offset_args, children_bool))
+
+    def _is_bool(self):
+        return False
+
+class QueryOperator(Query):
+    def __init__(self, events, sql_op, children, origin=None):
+        Query.__init__(self, events, origin)
+        self._sql_op = sql_op
+        assert 1 <= len(children) <= 2
+        self._children = children
+        
+    def _sql_expr(self):
+        if len(self._children) == 1:
+            lhs_sqlexpr = SqlExpr("", set(), [])
+        else:
+            lhs_sqlexpr = self._children[0]._sql_expr()
+        rhs_sqlexpr = self._children[1]._sql_expr()
         return SqlExpr("(%s %s %s)"
-                       % (lhs_sqlexpr.code, self.sql_op, rhs_sqlexpr.code),
+                       % (lhs_sqlexpr.code, self._sql_op, rhs_sqlexpr.code),
                        lhs_sqlexpr.tables.union(rhs_sqlexpr.tables),
                        lhs_sqlexpr.args + rhs_sqlexpr.args)
 
-    def is_bool(self, events):
+    def _is_bool(self):
         return True
 
-class AND(BinOp):
-    sql_op = "AND"
-    boolean = True
+    def __repr__(self):
+        return "<%s (%s %r)>" % (self.__class__.__name__,
+                                 self._sql_op,
+                                 self._children)
 
-class OR(BinOp):
-    sql_op = "OR"
-    boolean = True
+########################################
+#
+# A string-based query language
+#
+########################################
 
-class NOT(object):
-    boolean = True
-
-    def __init__(self, arg, origin=None):
-        self._arg = arg
-        self.origin = origin
-
-    def to_sql(self):
-        sqlexpr = self._arg.to_sql()
-        return SqlExpr("(NOT %s)" % (sqlexpr.code,), sqlexpr.tables, sqlexpr.args)
-
-    def is_bool(self, events):
-        return True
-
-class EQ(BinOp):
-    sql_op = "=="
-
-class NEQ(BinOp):
-    sql_op = "!="
-
-class LT(BinOp):
-    sql_op = "<"
-
-class GT(BinOp):
-    sql_op = ">"
-
-class GTE(BinOp):
-    sql_op = ">="
-
-class LTE(BinOp):
-    sql_op = "<="
-
-def _eval_comma(events, tree):
-    # Two children, both literals, returns a twople
-
-def _eval_comparison(events, tree):
-    comparisons = {"==": EQ,
-                   "!=": NEQ,
-                   "<": LT,
-                   ">": GT,
-                   ">=": GTE,
-                   "<=": LTE}
-    # check for list values and OFFSET magic
-    # if either side is OFFSET, then the other side gets evaluated and can be
-    # a pair. We are the only the place that actually dispatches to
-    # _eval_comma.
-
-def _eval(events, tree, want_bool):
-    # This never lets pairs out
-
-def _eval_literal(events, tree):
-    return Literal(tree.extra)
-
-def _eval_attr(events, tree, want_bool):
-    return 
-
-from charlton import CharltonError
-from charlton.origin import Origin
-from charlton.parse_core import Token, Operator, parse
-
-_open_paren = Operator("(", -1, -9999999)
 _punct_ops = [
     Operator("==", 2, 100),
     Operator("!=", 2, 100),
@@ -478,8 +537,6 @@ _text_ops = [
 _ops = _punct_ops + _text_ops
 
 _atomic = ["ATTR", "LITERAL"]
-
-import re
 
 def _read_quoted_string(string, i):
     start = i
@@ -581,199 +638,37 @@ def _tokenize(string):
             raise CharltonError("unrecognized token",
                                 Origin(string, i, i + 1))
 
-# class SyntaxOperator(object):
-#     def __init__(self, token, arity, precedence, filter, domain):
-#         self.token = token
-#         self.arity = arity
-#         self.precedence = precedence
-#         self.filter = filter
-#         self.want_type = domain
+_op_to_pymethod = {"==": "__eq__",
+                 "!=": "__ne__",
+                 "<": "__lt__",
+                 ">": "__gt__",
+                 "<=": "__le__",
+                 ">=": "__ge__",
+                 "and": "__and__",
+                 "or": "__or__",
+                 "not": "__invert__",
+                 }
+def _eval(events, tree):
+    if tree.type in _op_to_pymethod:
+        eval_args = [_eval(events, arg) for arg in tree.args]
+        return getattr(eval_args[0], _op_to_pymethod[tree.type])(*eval_args[1:])
+    elif tree.type == "LITERAL":
+        return LiteralQuery(events, tree.token.extra, tree.origin)
+    elif tree.type == "ATTR":
+        if tree.token.extra == "INDEX":
+            return IndexQuery(events, tree.origin)
+        else:
+            return AttrQuery(events, tree.token.extra, tree.origin)
+    elif tree.type == ",":
+        eval_args = [_eval(events, arg) for arg in tree.args]
+        for arg in eval_args:
+            if not isinstance(arg, LiteralQuery):
+                raise CharltonError("comma operator can only be applied "
+                                    "to literals, not %s" % (arg,), arg)
+        twople = (eval_args[0]._value, eval_args[1]._value)
+        return LiteralQuery(events, twople)
+    else:
+        assert False
 
-#     def __repr__(self):
-#         return "<Op %r>" % (self.token,)
-
-# class Token(object):
-#     def __init__(self, type, token, s, span):
-#         self.type = type
-#         self.token = token
-#         self.string = s
-#         self.span = span
-
-#     def __repr__(self):
-#         return "%s(%r, %r from %r)" % (self.__class__.__name__,
-#                                        self.type, self.token,
-#                                        self.string[self.span[0]:self.span[1]])
-
-# class CharStream(object):
-#     def __init__(self, s):
-#         self._i = 0
-#         self.string = s
-
-#     def peek(self):
-#         if self.done():
-#             return None
-#         return self.string[self._i]
-
-#     def tell(self):
-#         return self._i
-
-#     def done(self):
-#         return self._i >= len(self.string)
-
-#     def next(self):
-#         char = self.peek()
-#         if char is not None:
-#             self._i += 1
-#         return char
-
-#     def match_re(self, regex):
-#         if self.done():
-#             return None
-#         match = regex.match(self.string, self._i)
-#         if match is None:
-#             return None
-#         self._i = match.end()
-#         return (match.span(), match.group())
-
-#     def match(self, s):
-#         if self.done():
-#             return None
-#         if self.string[self._i:].startswith(s):
-#             span = (self._i, self._i + len(s))
-#             self._i += len(s)
-#             return (span, s)
-#         else:
-#             return None
-
-# class TokenizerError(Exception):
-#     def __init__(self, message, s, offset):
-#         Exception.__init__(self, message)
-#         self.message = message
-#         self.string = s
-#         self.offset = offset
-
-#     def __str__(self):
-#         return ("%s\n    %s\n    %s^"
-#                 % (self.message,
-#                    self.string,
-#                    " " * self.offset))
-# import re
-# whitespace_re = re.compile(r"\s+", re.UNICODE)
-# num_re = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?")
-# int_re = re.compile(r"[-+]?[0-9]+$")
-# # This works because \w matches underscore, letters, and digits.
-# # But if a token starts with a digit, then it'll be caught by num_re above
-# # first, so in fact this works like "[_a-z][_a-z0-9]*" except for being
-# # unicode-enabled.
-# ident_re = re.compile(r"\w+", re.IGNORECASE | re.UNICODE)
-
-# _punct_tokens = [op.token for op in _punct_ops]
-# _punct_tokens.sort(key=len, reverse=True)
-# _text_tokens = set([op.token for op in _text_ops])
-
-# def _read_quoted_string(stream):
-#     start = stream.tell()
-#     quote_type = stream.next()
-#     assert quote_type in "\"'`"
-#     chars = []
-#     while not stream.done():
-#         char = stream.peek()
-#         if char == quote_type:
-#             break
-#         elif char == "\\":
-#             # Consume the backslash
-#             stream.next()
-#             if stream.done():
-#                 break
-#             escaped_char = stream.next()
-#             if escaped_char in "\"'`\\":
-#                 chars.append(escaped_char)
-#             else:
-#                 raise TokenizerError("unrecognized escape sequence \\%s"
-#                                      % (escaped_char,),
-#                                      stream.string, stream.tell() - 2)
-#         else:
-#             chars.append(stream.next())
-#     if stream.done():
-#         raise TokenizerError("unclosed string", stream.string, start)
-#     assert stream.next() == quote_type
-#     span = (start, stream.tell())
-#     if quote_type == "`":
-#         type = "ATTR"
-#     else:
-#         type = "LITERAL"
-#     return Token(type, "".join(chars), stream.string, span)
-
-# def tokenize(s):
-#     stream = CharStream(s)
-#     while not stream.done():
-#         match = stream.match_re(whitespace_re)
-#         if match is not None:
-#             continue
-#         match = stream.match_re(num_re)
-#         if match is not None:
-#             (span, num_str) = match
-#             if int_re.match(num_str):
-#                 num = int(num_str)
-#             else:
-#                 num = float(num_str)
-#             yield Token("LITERAL", num, s, span)
-#             continue
-#         if stream.peek() in "\"'`":
-#             yield _read_quoted_string(stream)
-#             continue
-#         if stream.peek() == "(":
-#             yield Token("OPEN-PAREN", "(", s,
-#                         (stream.tell(), stream.tell() + 1))
-#             stream.next()
-#             continue
-#         if stream.peek() == ")":
-#             yield Token("CLOSE-PAREN", ")", s,
-#                         (stream.tell(), stream.tell() + 1))
-#             stream.next()
-#             continue
-#         for punct_token in _punct_tokens:
-#             match = stream.match(punct_token)
-#             if match is not None:
-#                 yield Token("OP", match[1], s, match[0])
-#                 break
-#         else:
-#             match = stream.match_re(ident_re)
-#             if match is None:
-#                 raise TokenizerError("unknown token", s, stream.tell())
-#             span, token = match
-#             if token.lower() in _text_tokens:
-#                 yield Token("OP", token.lower(), s, span)
-#             else:
-#                 yield Token("ATTR", token, s, span)
-#     yield Token("END", None, s, (len(s), len(s)))
-
-
-# class ParseError(Exception):
-#     pass
-
-# def parse(s):
-#     unary_ops = {}
-#     binary_ops = {}
-#     for op in _ops:
-#         if op.arity == 1:
-#             unary_ops[op.token] = op
-#         elif op.arity == 2:
-#             binary_ops[op.token] = op
-#         else:
-#             assert False
-
-#     op_stack = []
-#     noun_stack = []
-    
-#     want_noun = True
-#     for token in tokenize(s):
-#         if want_noun:
-#             if token.type == "OPEN-PAREN":
-#                 op_stack.append(_open_paren)
-#             elif token.type == "OP":
-#                 if token.token in unary_ops:
-#                     op_stack.append(unary_ops[token])
-#                 else:
-#                     raise ParseError("
-                   
+def query_from_string(events, string):
+    return _eval(events, parse(_tokenize(string), _ops, _atomic))
