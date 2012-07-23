@@ -1,11 +1,16 @@
 import sqlite3
 import string
 import re
-from charlton import CharltonError
-from charlton.origin import Origin
-from charlton.parse_core import Token, Operator, parse
+import struct
+from cStringIO import StringIO
+from patsy import PatsyError
+from patsy.origin import Origin
+from patsy.parse_core import Token, Operator, parse
 
-__all__ = ["Events"]
+__all__ = ["Events", "EventsError"]
+
+class EventsError(PatsyError):
+    pass
 
 # An injective map from arbitrary non-empty unicode strings to strings that
 # match the regex [_a-zA-Z][_a-zA-Z0-9]+ (i.e., are valid SQL identifiers)
@@ -45,29 +50,14 @@ def test__munge_name():
 def _table_name(key):
     return "attr_" + _munge_name(key)
 
-def _index(obj, origin=None):
-    if isinstance(obj, (int, long)):
-        return (0, obj)
-    elif (isinstance(obj, tuple)
-          and len(obj) == 2
-          and isinstance(obj[0], (int, long))
-          and isinstance(obj[1], (int, long))):
-        return obj
-    else:
-        raise CharltonError("bad index: %s" % (obj,), origin)
-
-def test__index():
-    assert _index(1) == (0, 1)
-    assert _index(10) == (0, 10)
-    assert _index((10, 20)) == (10, 20)
-
 class Events(object):
     NUMERIC = "numeric"
     BLOB = "text"
     BOOL = "bool"
 
-    def __init__(self, era_lens):
-        self._era_lens = era_lens
+    # Index type is like (int, int) or (str, int, int) or int, etc.
+    def __init__(self, index_type):
+        self._index_type = index_type
         self._connection = sqlite3.connect(":memory:")
         self._keys = set()
 
@@ -75,12 +65,89 @@ class Events(object):
         c.execute("PRAGMA case_sensitive_like = true;")
         c.execute("CREATE TABLE sys_events "
                   "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                  "era INTEGER NOT NULL, offset INTEGER NOT NULL);")
+                  "event_index BLOB NOT NULL);")
         c.execute("CREATE TABLE sys_key_types (key PRIMARY KEY, type)");
-        c.execute("CREATE INDEX sys_events_era_offset_idx ON sys_events "
-                  "(era, offset);")
+        c.execute("CREATE INDEX sys_events_index_idx "
+                  "ON sys_events (event_index);")
 
-    def _value_type(self, key, value):
+    # The idea here is to encode/decode the index structures we care about
+    # (tuples of ints and strings) in a way that is (1) unique, (2) sorts
+    # properly in the database (so >, < comparisons work).
+    def _encode_index(self, idx, origin=None):
+        buf = StringIO()
+        index_type = self._index_type
+        if not isinstance(index_type, tuple):
+            index_type = (index_type,)
+            idx = (idx,)
+        if not isinstance(idx, tuple) or len(idx) != len(index_type):
+            raise EventsError("wrong length index %r" % (idx,), origin)
+        for (obj, type) in zip(idx, index_type):
+            if not isinstance(obj, type):
+                raise EventsError("index object %r not of type %s"
+                                  % (obj, type), origin)
+            try:
+                if type is int:
+                    # inverted sign bit goes first so that negatives will
+                    # compare smaller than positives
+                    buf.write(struct.pack(">Bq", obj >= 0, obj))
+                elif type is str:
+                    buf.write(struct.pack(">I", len(obj)))
+                    buf.write(obj)
+            except struct.error:
+                raise EventsError("bad index value: wanted %s, got %r"
+                                  % (type, obj), origin)
+        return buf.getvalue()
+
+    def _decode_index(self, idx_str):
+        idx = []
+        offset = 0
+        index_type = self._index_type
+        if not isinstance(index_type, tuple):
+            index_type = (index_type,)
+        for type in index_type:
+            if type is int:
+                idx.append(struct.unpack_from(">Bq", idx_str, offset)[1])
+                offset += struct.calcsize(">Bq")
+            elif type is str:
+                length = struct.unpack_from(">I", idx_str, offset)[0]
+                offset += struct.calcsize(">I")
+                idx.append(idx_str[offset:offset + length])
+                offset += length
+        if not isinstance(self._index_type, tuple):
+            return idx[0]
+        else:
+            return tuple(idx)
+
+    # Convert str's to buffer objects before passing them into sqlite, because
+    # that is how you tell the sqlite3 module to store them as
+    # BLOBs. (sqlite3.Binary is an alias for 'buffer'.) This encoding/decoding
+    # is layered *on top* of index encoding/decoding, if that is in use.
+    def _encode_value(self, val):
+        if isinstance(val, str):
+            return sqlite3.Binary(val)
+        else:
+            return val
+
+    # And reverse the transformation on the way out.
+    def _decode_value(self, val):
+        if isinstance(val, sqlite3.Binary):
+            return str(val)
+        else:
+            return val
+
+    def _execute(self, c, sql, args):
+        return c.execute(sql, [self._encode_value(arg) for arg in args])
+
+    def _value_type_for_key(self, key):
+        c = self._connection.cursor()
+        code = "SELECT type FROM sys_key_types WHERE key = ?;"
+        self._execute(c, code, (key,))
+        row = c.fetchone()
+        if row is None:
+            return None
+        return self._decode_value(row[0])
+
+    def _value_type(self, value):
         # must come first, because issubclass(bool, int)
         if isinstance(value, bool):
             return self.BOOL
@@ -91,27 +158,21 @@ class Events(object):
         elif value is None:
             return None
         else:
-            raise ValueError, ("Invalid value %r for key %s: "
+            raise ValueError, ("Invalid value %r: "
                                "must be a string, number, bool, or None"
-                               % (value, key))
-
-    def _value_type_for_key(self, key):
-        c = self._connection.cursor()
-        c.execute("SELECT type FROM sys_key_types WHERE key = ?;", (key,))
-        row = c.fetchone()
-        if row is None:
-            return None
-        return row[0]
+                               % (value,))
 
     def _observe_value_for_key(self, key, value):
-        value_type = self._value_type(key, value)
+        value_type = self._value_type(value)
         if value_type is None:
             return
         wanted_type = self._value_type_for_key(key)
         if wanted_type is None:
             c = self._connection.cursor()
-            c.execute("INSERT INTO sys_key_types (key, type) VALUES (?, ?);",
-                      (key, value_type))
+            self._execute(c,
+                          "INSERT INTO sys_key_types (key, type) "
+                            "VALUES (?, ?);",
+                          (key, value_type))
         else:
             if wanted_type != value_type:
                 err = ("Invalid value %r for key %s: wanted %s"
@@ -123,65 +184,82 @@ class Events(object):
     def _ensure_table(self, key):
         table = _table_name(key)
         self._connection.execute("CREATE TABLE IF NOT EXISTS %s ("
-                                 "event_id INTEGER PRIMARY KEY, "
-                                 "value);" % (table,))
+                                   "event_id INTEGER PRIMARY KEY, "
+                                   "value);" % (table,))
         self._connection.execute("CREATE INDEX IF NOT EXISTS %s_idx "
-                                 "ON %s (value);" % (table, table))
+                                   "ON %s (value);" % (table, table))
         self._keys.add(key)
 
     def add_event(self, index, info):
-        era, offset = _index(index)
-        if era >= len(self._era_lens):
-            raise ValueError, "Bad era index: %s" % (era,)
-        if offset >= self._era_lens[era]:
-            raise ValueError, "Offset %s is past end of era" % (offset,)
         # Create tables up front before entering transaction:
         for key in info:
             self._ensure_table(key)
         with self._connection:
             c = self._connection.cursor()
-            assert isinstance(era, (int, long))
-            assert isinstance(offset, (int, long))
-            c.execute("INSERT INTO sys_events (era, offset) values (?, ?)",
-                      (era, offset))
+            self._execute(c, "INSERT INTO sys_events (event_index) values (?)",
+                          [self._encode_index(index)])
             event_id = c.lastrowid
             for key, value in info.iteritems():
-                value_type = self._value_type(key, value)
                 self._observe_value_for_key(key, value)
-                c.execute("INSERT INTO %s (event_id, value) VALUES (?, ?);"
-                          % (_table_name(key),), (event_id, value))
+                self._execute(c,
+                              "INSERT INTO %s (event_id, value) VALUES (?, ?);"
+                                % (_table_name(key),),
+                              (event_id, value))
             return Event(self, event_id)
 
     def _delete_event(self, id):
         with self._connection:
             c = self._connection.cursor()
-            c.execute("DELETE FROM sys_events WHERE id = ?;", (id,))
+            self._execute(c, "DELETE FROM sys_events WHERE id = ?;", (id,))
             for key in self._keys:
-                c.execute("DELETE FROM %s WHERE event_id = ?;"
-                          % (_table_name(key),), (id,))
+                self._execute(c,
+                              "DELETE FROM %s WHERE event_id = ?;"
+                                % (_table_name(key),),
+                              (id,))
 
     def _event_index(self, id):
         c = self._connection.cursor()
-        c.execute("SELECT era, offset FROM sys_events WHERE id = ?;", (id,))
-        return c.fetchone()
+        code = "SELECT event_index FROM sys_events WHERE id = ?;"
+        self._execute(c, code, (id,))
+        return self._decode_index(self._decode_value(c.fetchone()[0]))
 
-    def _event_select_attr(self, id, key):
+    def _event_getitem(self, id, key):
         c = self._connection.cursor()
         table = _table_name(key)
-        c.execute("SELECT value FROM %s WHERE event_id = ?;" % (table,), (id,))
-        return tuple(c.fetchone())
+        code = "SELECT value FROM %s WHERE event_id = ?;" % (table,)
+        try:
+            self._execute(c, code, (id,))
+            row = c.fetchone()
+        except sqlite3.OperationalError:
+            raise KeyError, key
+        if row is None:
+            raise KeyError, key
+        return self._decode_value(row[0])
 
-    def _event_set_attr(self, id, key, value):
+    def _event_setitem(self, id, key, value):
         self._ensure_table(key)
         with self._connection:
             c = self._connection.cursor()
             table = _table_name(key)
             self._observe_value_for_key(key, value)        
-            c.execute("UPDATE %s SET value = ? WHERE event_id = ?;"
-                      % (table,), (value, id))
+            self._execute(c,
+                          "UPDATE %s SET value = ? WHERE event_id = ?;"
+                            % (table,),
+                          (value, id))
             if c.rowcount == 0:
-                c.execute("INSERT INTO %s (event_id, value) VALUES (?, ?);"
-                          % (table,), (id, value))
+                self._execute(c,
+                              "INSERT INTO %s (event_id, value) VALUES (?, ?);"
+                                % (table,),
+                              (id, value))
+
+    def _event_delitem(self, id, key):
+        # Raise a KeyError if it doesn't exist:
+        self._event_getitem(id, key)
+        # Okay, now delete it
+        c = self._connection.cursor()
+        table = _table_name(key)
+        code = "DELETE FROM %s WHERE event_id = ?;" % (table,)
+        self._execute(c, code, (id,))
 
     @property
     def placeholder(self):
@@ -192,7 +270,9 @@ class Events(object):
         return LiteralQuery(self, True)
 
     def find(self, *args, **kwargs):
-        "Usage: either find(a=1, b=2) or find(query_obj) or find(\"string\")"
+        "Usage: find(a=1, b=2) or find(query_obj) or find(\"string\") or find()"
+        if not args and not kwargs:
+            args = (self.ANY,)
         if len(args) == 0 and kwargs:
             p = self.placeholder
             equalities = []
@@ -211,8 +291,8 @@ class Events(object):
             query = query_from_string(self, query)
         if not isinstance(query, Query):
             raise ValueError, "expected a query object, not %r" % (query,)
-        if not query._is_bool():
-            raise CharltonError("query object must be boolean", query)
+        if query._value_type() != self.BOOL:
+            raise EventsError("query object must be boolean", query)
         if query._events is not self:
             raise ValueError("query object does not refer to this Events "
                              "object")
@@ -225,22 +305,22 @@ class Events(object):
                 % (", ".join(sql_expr.tables), sql_expr.code))
         if joins:
             code += " AND (%s)" % (" AND ".join(joins))
-        code += "ORDER BY sys_events.era, sys_events.offset"
+        code += "ORDER BY sys_events.event_index"
         #print code, sql_expr.args
-        c.execute(code, sql_expr.args)
-        for (id,) in c:
-            yield Event(self, id)
+        self._execute(c, code, sql_expr.args)
+        for (db_id,) in c:
+            yield Event(self, self._decode_value(db_id))
 
     def at(self, index):
-        return self.find(INDEX=index)
+        return list(self.find(INDEX=index))
 
     def __iter__(self):
         return self.find(self.ANY)
 
     def __len__(self):
         c = self._connection.cursor()
-        c.execute("SELECT count(*) FROM sys_events;")
-        return c.fetchone()[0]
+        self._execute(c, "SELECT count(*) FROM sys_events;", [])
+        return self._decode_value(c.fetchone()[0])
 
     def __repr__(self):
         return "<%s object with %s entries>" % (self.__class__.__name__,
@@ -256,16 +336,13 @@ class Event(object):
         return self._events._event_index(self._id)
 
     def __getitem__(self, key):
-        try:
-            row = self._events._event_select_attr(self._id, key)
-        except sqlite3.OperationalError:
-            raise KeyError, key
-        if row is None:
-            raise KeyError, key
-        return row[0]
+        return self._events._event_getitem(self._id, key)
 
     def __setitem__(self, key, value):
-        self._events._event_set_attr(self._id, key, value)
+        self._events._event_setitem(self._id, key, value)
+
+    def __delitem__(self, key):
+        self._events._event_delitem(self._id, key)
 
     def delete(self):
         self._events._delete_event(self._id)
@@ -304,7 +381,7 @@ class Event(object):
     def items(self):
         return list(self.iteritems())
 
-    def __contains__(self):
+    def __contains__(self, key):
         try:
             self[key]
         except KeyError:
@@ -316,6 +393,23 @@ class Event(object):
         return "<%s %s at %s: %s>" % (
             self.__class__.__name__, self._id, self.index,
             repr(dict(self.iteritems())))
+
+    # For the IPython pretty-printer:
+    #   http://ipython.org/ipython-doc/dev/api/generated/IPython.lib.pretty.html
+    def _repr_pretty_(self, p, cycle):
+        assert not cycle
+        p.begin_group(2, "<%s at %s:" % (self.__class__.__name__, self.index))
+        p.breakable()
+        p.pretty(dict(self.iteritems()))
+        p.end_group(2, ">")
+            
+
+def test_index_encoding():
+    tests = [(0, 0), (10, 10), (0, 1000), (1000, 0), (2**54, 2**63)]
+    for t in tests:
+        assert _decode_index(_encode_index(t)) == t
+    encoded_tests = [_encode_index(t) for t in tests]
+    assert sorted(encoded_tests) == sorted(tests)
 
 ###############################################
 #
@@ -347,52 +441,69 @@ class Query(object):
 
     def _as_constraint(self, other):
         if isinstance(other, Query):
+            assert other._events is self._events
             return other
         return LiteralQuery(self._events, other)
 
-    def _make_op(self, sql_op, children, children_bool):
+    def _make_op(self, op_name, sql_op, children, expected_type=None):
         children = [self._as_constraint(child) for child in children]
-        for child in children:
-            if child._is_bool() != children_bool:
-                if children_bool:
-                    expected = "boolean"
-                else:
-                    expected = "non-boolean"
-                msg = ("%s operator expected %s arguments "
-                       "(check your parentheses?)" % (sql_op, expected))
-                raise CharltonError(msg, child)
-            assert child._events is self._events
-        return QueryOperator(self._events, sql_op, children,
+        if any([isinstance(child, IndexQuery) for child in children]):
+            # Special case: in operations involving a LiteralQuery plus an
+            # IndexQuery, convert the LiteralQuery into a LiteralIndexQuery:
+            for i, child in enumerate(children):
+                if isinstance(child, LiteralQuery):
+                    children[i] = LiteralIndexQuery(child._events,
+                                                    child._value,
+                                                    child.origin)
+        else:
+            # Otherwise, do type checking.
+            types = []
+            for child in children:
+                type = child._value_type()
+                if expected_type is not None and type != expected_type:
+                    raise EventsError("%r operator expected %s, got %s "
+                                        "(check your parentheses?)"
+                                        % (op_name, expected_type, type),
+                                      child)
+                types.append(type)
+            if len(set(types).difference([None])) > 1:
+                raise EventsError("mismatched types: %s" % (" vs ".join(types)),
                                   Origin.combine(children))
+        return QueryOperator(self._events, sql_op, children,
+                             Origin.combine(children))
 
     def __eq__(self, other):
-        return self._make_op("==", [self, other], False)
+        # NB: IS is like == except that it treats NULL as just another
+        # value. Which is what we want, since we use NULL to encode None, and
+        # None == None should be True, not NULL.
+        return self._make_op("==", "IS", [self, other])
 
     def __ne__(self, other):
-        return self._make_op("!=", [self, other], False)
+        # And IS NOT is the NULL-handling equivalent to !=.
+        return self._make_op("!=", "IS NOT", [self, other])
 
     def __lt__(self, other):
-        return self._make_op("<", [self, other], False)
+        return self._make_op("<", "<", [self, other])
 
     def __gt__(self, other):
-        return self._make_op(">", [self, other], False)
+        return self._make_op(">", ">", [self, other])
 
     def __le__(self, other):
-        return self._make_op("<=", [self, other], False)
+        return self._make_op("<=", "<=", [self, other])
 
     def __ge__(self, other):
-        return self._make_op(">=", [self, other], False)
+        return self._make_op(">=", ">=", [self, other])
 
     def __and__(self, other):
-        return self._make_op("AND", [self, other], True)
+        return self._make_op("and", "AND", [self, other], Events.BOOL)
 
     def __or__(self, other):
-        return self._make_op("OR", [self, other], True)
+        return self._make_op("or", "OR", [self, other], Events.BOOL)
 
-    def __invert__(self, other):
-        return self._make_op("NOT", [self], True)
+    def __invert__(self):
+        return self._make_op("not", "NOT", [self], Events.BOOL)
 
-    def _is_bool(self):
+    def _value_type(self):
         assert False
 
     def _sql_expr(self):
@@ -403,25 +514,27 @@ class LiteralQuery(Query):
         Query.__init__(self, events, origin)
         self._value = value
 
-    # So that "10 == index" will get processed by Index._make_op instead of
-    # us:
-    def _make_op(self, sql_op, children, children_bool):
-        for child in children:
-            if isinstance(child, Index):
-                return NotImplemented
-        return Query._make_op(self, sql_op, children, children_bool)
-
     def _sql_expr(self):
-        if not isinstance(self._value, (bool, basestring, int, float)):
-            raise CharltonError("literals must be boolean, strings, or numbers",
-                                self)
+        if (self._value is not None
+            and not isinstance(self._value, (bool, basestring, int, float))):
+            raise EventsError("literals must be boolean, string, numeric, "
+                                "or None",
+                              self)
         return SqlExpr("?", set(), [self._value])
 
-    def _is_bool(self):
-        return isinstance(self._value, bool)
+    def _value_type(self):
+        return self._events._value_type(self._value)
 
     def __repr__(self):
-        return "<%s %r>" % (self.__class__.__name__, self._value)
+        return "<%s: %r>" % (self.__class__.__name__, self._value)
+
+class LiteralIndexQuery(LiteralQuery):
+    def _sql_expr(self):
+        return SqlExpr("?", set(),
+                       [self._events._encode_index(self._value, self.origin)])
+
+    def _value_type(self):
+        return None
 
 class AttrQuery(Query):
     def __init__(self, events, name, origin=None):
@@ -432,61 +545,23 @@ class AttrQuery(Query):
         table_id = _table_name(self._name)
         return SqlExpr(table_id + ".value", set([table_id]), [])
 
-    def _is_bool(self):
-        known_type = self._events._value_type_for_key(self._name)
-        if known_type is None:
-            raise CharltonError("unknown attribute %r" % (self._name), self)
-        return known_type == Events.BOOL
+    def _value_type(self):
+        return self._events._value_type_for_key(self._name)
 
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self._name)
 
-class SysFieldQuery(Query):
+class IndexQuery(Query):
     def _sql_expr(self):
-        return SqlExpr("sys_events.%s" % (self._sys_field), set(), [])
+        # sys_events is always included in the join, so no need to add it to
+        # the tables.
+        return SqlExpr("sys_events.event_index", set(), [])
 
-    def _is_bool(self):
-        return False
+    def _value_type(self):
+        return None
 
     def __repr__(self):
         return "<%s>" % (self.__class__.__name__,)
-
-class EraQuery(SysFieldQuery):
-    _sys_field = "era"
-
-class OffsetQuery(SysFieldQuery):
-    _sys_field = "offset"
-
-class IndexQuery(Query):
-    def _make_op(self, sql_op, children, children_bool):
-        if children[0] is self:
-            other_idx = 1
-        else:
-            assert children[1] is self
-            other_idx = 0
-        other = self._as_constraint(children[other_idx])
-        if not isinstance(other, LiteralQuery):
-            raise CharltonError("index can only be compared with literal "
-                                "values", other)
-        index = _index(other._value, other.origin)
-        era = EraQuery(self._events, self.origin)
-        era_args = [era, index[0]]
-        if sql_op == "<":
-            era_op = "<="
-        elif sql_op == ">":
-            era_op = ">="
-        else:
-            era_op = sql_op
-        offset = OffsetQuery(self._events, self.origin)
-        offset_args = [offset, index[1]]
-        if other_idx == 0:
-            era_args = era_args[::-1]
-            offset_args = offset_args[::-1]
-        return (era._make_op(era_op, era_args, children_bool)
-                & offset._make_op(sql_op, offset_args, children_bool))
-
-    def _is_bool(self):
-        return False
 
 class QueryOperator(Query):
     def __init__(self, events, sql_op, children, origin=None):
@@ -496,18 +571,20 @@ class QueryOperator(Query):
         self._children = children
         
     def _sql_expr(self):
+        lhs_sqlexpr = self._children[0]._sql_expr()
         if len(self._children) == 1:
+            # Special case for NOT
+            rhs_sqlexpr = lhs_sqlexpr
             lhs_sqlexpr = SqlExpr("", set(), [])
         else:
-            lhs_sqlexpr = self._children[0]._sql_expr()
-        rhs_sqlexpr = self._children[1]._sql_expr()
+            rhs_sqlexpr = self._children[1]._sql_expr()
         return SqlExpr("(%s %s %s)"
                        % (lhs_sqlexpr.code, self._sql_op, rhs_sqlexpr.code),
                        lhs_sqlexpr.tables.union(rhs_sqlexpr.tables),
                        lhs_sqlexpr.args + rhs_sqlexpr.args)
 
-    def _is_bool(self):
-        return True
+    def _value_type(self):
+        return Events.BOOL
 
     def __repr__(self):
         return "<%s (%s %r)>" % (self.__class__.__name__,
@@ -536,7 +613,7 @@ _text_ops = [
     ]
 _ops = _punct_ops + _text_ops
 
-_atomic = ["ATTR", "LITERAL"]
+_atomic = ["ATTR", "LITERAL", "INDEX"]
 
 def _read_quoted_string(string, i):
     start = i
@@ -557,15 +634,15 @@ def _read_quoted_string(string, i):
             if escaped_char in "\"'`\\":
                 chars.append(escaped_char)
             else:
-                raise CharltonError("unrecognized escape sequence \\%s"
-                                    % (escaped_char,),
-                                    Origin(string, i - 1, i))
+                raise EventsError("unrecognized escape sequence \\%s"
+                                  % (escaped_char,),
+                                  Origin(string, i - 1, i))
         else:
             chars.append(string[i])
         i += 1
     if i >= len(string):
-        raise CharltonError("unclosed string",
-                            Origin(string, start, i))
+        raise EventsError("unclosed string",
+                          Origin(string, start, i))
     assert string[i] == quote_type
     i += 1
     if quote_type == "`":
@@ -620,6 +697,8 @@ def _tokenize(string):
                 yield Token("LITERAL", origin, True)
             elif token.lower() == "false":
                 yield Token("LITERAL", origin, False)
+            elif token == "INDEX":
+                yield Token("INDEX", origin)
             else:
                 yield Token("ATTR", origin, token)
             i = match.end()
@@ -635,8 +714,8 @@ def _tokenize(string):
                 i += len(punct_token)
                 break
         else:
-            raise CharltonError("unrecognized token",
-                                Origin(string, i, i + 1))
+            raise EventsError("unrecognized token",
+                              Origin(string, i, i + 1))
 
 _op_to_pymethod = {"==": "__eq__",
                  "!=": "__ne__",
@@ -655,17 +734,21 @@ def _eval(events, tree):
     elif tree.type == "LITERAL":
         return LiteralQuery(events, tree.token.extra, tree.origin)
     elif tree.type == "ATTR":
-        if tree.token.extra == "INDEX":
-            return IndexQuery(events, tree.origin)
-        else:
-            return AttrQuery(events, tree.token.extra, tree.origin)
+        return AttrQuery(events, tree.token.extra, tree.origin)
+    elif tree.type == "INDEX":
+        return IndexQuery(events, tree.origin)
     elif tree.type == ",":
         eval_args = [_eval(events, arg) for arg in tree.args]
         for arg in eval_args:
             if not isinstance(arg, LiteralQuery):
-                raise CharltonError("comma operator can only be applied "
-                                    "to literals, not %s" % (arg,), arg)
-        twople = (eval_args[0]._value, eval_args[1]._value)
+                raise EventsError("comma operator can only be applied "
+                                  "to literals, not %s" % (arg,), arg)
+        # Flatten out nested calls like "1, 2, 3":
+        def tuplify(v):
+            if isinstance(v, tuple):
+                return v
+            return (v,)
+        twople = tuplify(eval_args[0]._value) + tuplify(eval_args[1]._value)
         return LiteralQuery(events, twople)
     else:
         assert False
