@@ -1,0 +1,19 @@
+have a special "cals" command that (1) arranges for the given events
+to be included in a special bin in all output files, (2) eliminates
+the given events from consideration for other stuff (maybe even just
+deletes their code and condition entries)
+
+or another way to do this, scoped restrictions?
+select <query>
+  # indented block
+  # <query> is automatically ANDed with any queries within this
+  # section
+
+define "groups" as short-hands for certain queries? maybe better to
+just add fields.
+
+match code == 12 and condition == 0 as BASE
+next with code == 13 within 200-800
+
+
+wacky idea, just make the input file python code?

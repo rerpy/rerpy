@@ -5,6 +5,8 @@
 htmlcov/
 .tox
 
+pyrerp/_kutaslab.c
+
 # Cribbed from numpy's .gitignore:
 
 # Editor temporary/working/backup files #
