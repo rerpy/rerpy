@@ -1,11 +1,12 @@
-import events
+import cPickle
+from pyrerp.events import Events, EventsError
 from nose.tools import assert_raises
 
 def test_Events_basic():
     # load/store of different types
     # errors on type mismatches
     # storing None
-    e = events.Events(int)
+    e = Events(int)
     ev1 = e.add_event(10, {"a": 1, "b": "hello", "c": True})
     assert ev1.index == 10
     assert ev1["a"] == 1
@@ -28,10 +29,32 @@ def test_Events_basic():
     assert ev2.index == 11
     assert ev1["xxx"] is None
 
+    e_pick = cPickle.loads(cPickle.dumps(e))
+    ev1_pick, ev2_pick = list(e_pick)
+    assert ev1_pick.index == ev1.index
+    assert ev1_pick.items() == ev1.items()
+    assert ev2_pick.index == ev2.index
+    assert ev2_pick.items() == ev2.items()
+
+def test_index_encoding():
+    e = Events((int, int))
+    tests = [(0, 0), (10, 10), (0, 1000), (1000, 0), (2**31, 2**30)]
+    for t in tests:
+        assert e._decode_index(e._encode_index(t)) == t
+    encoded_tests = [e._encode_index(t) for t in tests]
+    assert [e._decode_index(t) for t in sorted(encoded_tests)] == sorted(tests)
+
+    e2 = Events((str, int))
+    tests = [("a", 0), ("aa", 10), ("ba", 1000), ("bb", 0), ("zz", 2**30)]
+    for t in tests:
+        assert e2._decode_index(e2._encode_index(t)) == t
+    encoded_tests = [e2._encode_index(t) for t in tests]
+    assert [e2._decode_index(t) for t in sorted(encoded_tests)] == sorted(tests)
+
 def test_Event():
     # set/get/del, index
     # dict methods
-    e = events.Events(int)
+    e = Events(int)
     d = {"a": 1, "b": "hello", "c": True}
     ev1 = e.add_event(10, d)
     assert ev1.index == 10
@@ -68,7 +91,7 @@ def test_Event():
 
 def test_misc_queries():
     # ANY, at, __iter__, __len__
-    e = events.Events(int)
+    e = Events(int)
     e.add_event(20, {"a": -1})
     e.add_event(10, {"a": 1})
     e.add_event(30, {"a": 100})
@@ -84,7 +107,7 @@ def test_misc_queries():
 
 def test_find():
     # all the different calling conventions
-    e = events.Events(int)
+    e = Events(int)
     e.add_event(10, {"a": 1, "b": True})
     e.add_event(20, {"a": -1, "b": True})
 
@@ -103,7 +126,7 @@ def test_python_query():
     # all operators
     # types (esp. including None)
     # index
-    e = events.Events(int)
+    e = Events(int)
     e.add_event(10, {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
     e.add_event(-10, {"a": -1, "b": "fdsa", "c": False, "d": -3.14, "e": None})
     e.add_event(20, {"a": 1, "b": "asdf", "c": False, "d": -3.14, "e": 123,
@@ -188,7 +211,7 @@ def test_python_query():
     t(~((p.index < 20) | (p["a"] == 1)), [])
 
 def test_python_query_typechecking():
-    e = events.Events(int)
+    e = Events(int)
     e.add_event(10, {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
     
     p = e.placeholder
@@ -197,17 +220,17 @@ def test_python_query_typechecking():
     assert len(list(e.find(p["e"] == None))) == 1
 
     for bad in (True, "asdf"):
-        assert_raises(events.EventsError, p["a"].__eq__, bad)
-        assert_raises(events.EventsError, p["a"].__gt__, bad)
-        assert_raises(events.EventsError, p["a"].__lt__, bad)
-        assert_raises(events.EventsError, p["a"].__le__, bad)
-        assert_raises(events.EventsError, p["a"].__ge__, bad)
+        assert_raises(EventsError, p["a"].__eq__, bad)
+        assert_raises(EventsError, p["a"].__gt__, bad)
+        assert_raises(EventsError, p["a"].__lt__, bad)
+        assert_raises(EventsError, p["a"].__le__, bad)
+        assert_raises(EventsError, p["a"].__ge__, bad)
 
-    assert_raises(events.EventsError, p["a"].__and__, p["c"])
-    assert_raises(events.EventsError, p["a"].__and__, p["c"])
-    assert_raises(events.EventsError, p["a"].__invert__)
+    assert_raises(EventsError, p["a"].__and__, p["c"])
+    assert_raises(EventsError, p["a"].__and__, p["c"])
+    assert_raises(EventsError, p["a"].__invert__)
 
-    assert_raises(events.EventsError, list, e.find(p["e"]))
+    assert_raises(EventsError, list, e.find(p["e"]))
 
 # def test_string_query():
 #     # all operators
@@ -219,12 +242,12 @@ def test_python_query_typechecking():
 
 def test_index():
     def t(type, good_value, bad_value):
-        e = events.Events(type)
+        e = Events(type)
         ev = e.add_event(good_value, {"a": 1})
         assert ev.index == good_value
         assert len(list(e.find(e.placeholder.index == good_value))) == 1
-        assert_raises(events.EventsError, e.add_event, bad_value, {"a": 1})
-        assert_raises(events.EventsError,
+        assert_raises(EventsError, e.add_event, bad_value, {"a": 1})
+        assert_raises(EventsError,
                       list, e.find(e.placeholder.index == bad_value))
     t(int, 10, "asdf")
     t((int,), (10,), 10)

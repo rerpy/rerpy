@@ -1,3 +1,20 @@
+pandas memory overhead:
+created some pickle files containing a full multiindex+colnames data
+set, the same as a raw ndarray, and the same with colname
+only. Loaded the pickle files one at time into a new python process
+and checked RSS in top:
+  python -c 'import cPickle; import resource; d = cPickle.load(open("df-colnames-only.pickle", "rb")); import time; time.sleep(100)'
+results:
+  ndarray: 253 megabytes
+  colnames: 265 megabytes
+  multiindex: 416 megabytes
+    with pandas 0.8: 296. Okay, that's more like it.
+df is 981504 x 32. So the theoretical cost for row indexes is:
+  32 bit integer: 3.7 MiB
+  64 bit integer: 7.5 MiB
+
+
+
 have a special "cals" command that (1) arranges for the given events
 to be included in a special bin in all output files, (2) eliminates
 the given events from consideration for other stuff (maybe even just

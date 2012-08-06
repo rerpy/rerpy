@@ -5,9 +5,14 @@ import gzip
 import os
 import string
 
-from njs.eeg._kutaslab import _decompress_crw_chunk
+import pandas
 
-class Error(Exception):
+from pyrerp.events import Events
+from pyrerp._kutaslab import _decompress_crw_chunk
+
+PAUSE_CODE = 49152
+
+class KutaslabError(Exception):
     pass
 
 # Derived from erp/include/64header.h:
@@ -87,7 +92,7 @@ def _read_header(magic, stream):
         assert False, "Unrecognized file type"
     hz = 1 / (header["10usec_per_tick"] / 100000.0)
     if abs(hz - int(hz)) > 1e-6:
-        raise Error, "file claims weird non-integer sample rate %shz" % hz
+        raise KutaslabError, "file claims weird non-integer sample rate %shz" % hz
     hz = int(hz)
 
     if header["nchans"] <= 16:
@@ -288,13 +293,61 @@ def compare_raw_to_crw(raw_stream, crw_stream):
             assert False
 
 def read_log(fo):
+    ticks = []
+    events = []
     while True:
         event = fo.read(8)
         if not event:
-            return
+            break
         (code, tick_hi, tick_lo, condition, flag) \
                = struct.unpack("<HHHBB", event)
-        yield (code, tick_hi << 16 | tick_lo, condition, flag)
+        ticks.append(tick_hi << 16 | tick_lo)
+        events.append((code, condition, flag))
+    return pandas.DataFrame(events, columns=["code", "condition", "flag"],
+                            index=ticks)
+
+def load_kutaslab(f_raw, f_log, name=None, dtype=np.float64):
+    (hz, channel_names, raw_codes, data, info) = read_raw(f_raw, dtype)
+    raw_log_events = read_log(f_log)
+    expanded_log_codes = np.zeros(raw_codes.shape, dtype=int)
+    expanded_log_codes[raw_log_events.index] = raw_log_events["code"]
+    discrepancies = (expanded_log_codes != raw_codes)
+    if (not (expanded_log_codes[discrepancies] == 0).all()
+        or not (raw_codes[discrepancies] == 65535).all()):
+        raise KutaslabError, "raw and log files have mismatched codes"
+    del raw_codes
+    del expanded_log_codes
+    sample_period_ms = int(1. / hz * 1000)
+    if (1000. / sample_period_ms) != hz:
+        raise KutaslabError, "sampling period in milliseconds is not an integer"
+    pause_ticks = raw_log_events.index[raw_log_events["code"] == PAUSE_CODE]
+    # I *think* the pause code appears at the last sample of the era, rather
+    # than the first sample of the new era. Convert them to the Python-style
+    # [start, end) convention:
+    pause_ticks += 1
+    name_index = [name] * data.shape[0]
+    era_index = np.empty(data.shape[0], dtype=np.int16)
+    time_index = np.empty(data.shape[0], dtype=np.int32)
+    era_starts = np.concatenate(([0], pause_ticks))
+    era_ends = np.concatenate((pause_ticks, [data.shape[0]]))
+    for i, (era_start, era_end) in enumerate(zip(era_starts, era_ends)):
+        era_index[era_start:era_end] = i
+        times = np.arange(era_end - era_start) * sample_period_ms
+        time_index[era_start:era_end] = times
+    index_arrays = [name_index, era_index, time_index]
+    index_names = ["name", "era", "time"]
+    data_index = pandas.MultiIndex.from_arrays(index_arrays,
+                                               names=index_names)
+    ev = Events((str, int, int))
+    for i in xrange(raw_log_events.shape[0]):
+        tick = raw_log_events.index[i]
+        ev.add_event(data_index[tick],
+                     dict(zip(raw_log_events.columns,
+                              raw_log_events.xs(tick))))
+    return (pandas.DataFrame(data,
+                             columns=channel_names,
+                             index=data_index),
+            ev)
 
 def load(f_raw, f_log, dtype=np.float64,
          delete_channels=[], calibrate=True, **kwargs):

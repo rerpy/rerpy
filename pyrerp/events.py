@@ -3,6 +3,7 @@ import string
 import re
 import struct
 from cStringIO import StringIO
+import numpy as np
 from patsy import PatsyError
 from patsy.origin import Origin
 from patsy.parse_core import Token, Operator, parse
@@ -121,10 +122,16 @@ class Events(object):
     # Convert str's to buffer objects before passing them into sqlite, because
     # that is how you tell the sqlite3 module to store them as
     # BLOBs. (sqlite3.Binary is an alias for 'buffer'.) This encoding/decoding
-    # is layered *on top* of index encoding/decoding, if that is in use.
+    # is layered *on top* of index encoding/decoding, if that is in use. This
+    # function also handles converting numpy scalars into equivalents that are
+    # acceptable to sqlite.
     def _encode_value(self, val):
-        if isinstance(val, str):
+        if np.issubsctype(type(val), np.str_):
             return sqlite3.Binary(val)
+        elif np.issubsctype(type(val), np.integer):
+            return int(val)
+        elif np.issubsctype(type(val), np.floating):
+            return float(val)
         else:
             return val
 
@@ -326,10 +333,29 @@ class Events(object):
         return "<%s object with %s entries>" % (self.__class__.__name__,
                                                 len(self))
 
+    # Pickling
+    def __getstate__(self):
+        events = []
+        for ev in self:
+            events.append((ev.index, dict(ev)))
+        # 0 as an ad-hoc version number in case we need to change this later
+        return (0, self._index_type, events)
+
+    def __setstate__(self, state):
+        if state[0] != 0:
+            raise ValueError, "unrecognized pickle data version for Events object"
+        _, index_type, events = state
+        self.__init__(index_type)
+        for index, attrs in events:
+            self.add_event(index, attrs)
+
 class Event(object):
     def __init__(self, events, id):
         self._events = events
         self._id = id
+
+    def __getstate__(self):
+        raise ValueError, "Event objects are not pickleable"
 
     @property
     def index(self):
@@ -403,13 +429,6 @@ class Event(object):
         p.pretty(dict(self.iteritems()))
         p.end_group(2, ">")
             
-
-def test_index_encoding():
-    tests = [(0, 0), (10, 10), (0, 1000), (1000, 0), (2**54, 2**63)]
-    for t in tests:
-        assert _decode_index(_encode_index(t)) == t
-    encoded_tests = [_encode_index(t) for t in tests]
-    assert sorted(encoded_tests) == sorted(tests)
 
 ###############################################
 #
