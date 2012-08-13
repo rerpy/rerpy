@@ -1,9 +1,14 @@
+# This file is part of pyrerp
+# Copyright (C) 2012 Nathaniel Smith <njs@pobox.com>
+# See file COPYING for license information.
+
 import sqlite3
 import string
 import re
 import struct
 from cStringIO import StringIO
 import numpy as np
+import pandas
 from patsy import PatsyError
 from patsy.origin import Origin
 from patsy.parse_core import Token, Operator, parse
@@ -277,7 +282,7 @@ class Events(object):
         return LiteralQuery(self, True)
 
     def find(self, *args, **kwargs):
-        "Usage: find(a=1, b=2) or find(query_obj) or find(\"string\") or find()"
+        "find(a=1, b=2) or find(query_obj) or find(\"string\") or find()"
         if not args and not kwargs:
             args = (self.ANY,)
         if len(args) == 0 and kwargs:
@@ -298,31 +303,33 @@ class Events(object):
             query = query_from_string(self, query)
         if not isinstance(query, Query):
             raise ValueError, "expected a query object, not %r" % (query,)
-        if query._value_type() != self.BOOL:
-            raise EventsError("query object must be boolean", query)
         if query._events is not self:
             raise ValueError("query object does not refer to this Events "
                              "object")
-        sql_expr = query._sql_expr()
-        sql_expr.tables.add("sys_events")
+        return EventSet(self, list(query._db_ids()))
+
+    def _query(self, sql_where, tables, query_vals):
+        tables = set(sql_where.tables)
+        tables.add("sys_events")
+        tables.update(tables)
         joins = ["%s.event_id == sys_events.id" % (table,)
-                 for table in sql_expr.tables if table != "sys_events"]
-        c = self._connection.cursor()
-        code = ("SELECT sys_events.id FROM %s WHERE (%s) "
-                % (", ".join(sql_expr.tables), sql_expr.code))
+                 for table in tables if table != "sys_events"]
+        code = ("SELECT %s FROM %s WHERE (%s) "
+                % (", ".join(query_vals),
+                   ", ".join(sql_where.tables),
+                   sql_where.code))
         if joins:
-            code += " AND (%s)" % (" AND ".join(joins))
+            code += " AND (%s)" % (" AND ".join(joins),)
         code += "ORDER BY sys_events.event_index"
-        #print code, sql_expr.args
-        self._execute(c, code, sql_expr.args)
-        for (db_id,) in c:
-            yield Event(self, self._decode_value(db_id))
+        c = self._events._connection.cursor()
+        self._execute(c, code, sql_where.args)
+        return c
 
     def at(self, index):
-        return list(self.find(INDEX=index))
+        return self.find(INDEX=index)
 
     def __iter__(self):
-        return self.find(self.ANY)
+        return iter(self.ANY)
 
     def __len__(self):
         c = self._connection.cursor()
@@ -348,6 +355,44 @@ class Events(object):
         self.__init__(index_type)
         for index, attrs in events:
             self.add_event(index, attrs)
+
+class EventSet(object):
+    def __init__(self, events, event_ids):
+        self._events = events
+        self._event_ids = event_ids
+
+    def remove(self, event):
+        if event._events is not self._events:
+            raise KeyError, event
+        try:
+            self._event_ids.remove(event.id)
+        except ValueError:
+            raise KeyError, event
+
+    def __iter__(self):
+        for db_id in self._event_ids:
+            yield Event(self._events, db_id)
+
+    def __getitem__(self, key):
+        # In principle there is a cleverer way to do this using _query
+        # directly but it gets complicated to properly handle indexes, missing
+        # values, and detecting KeyErrors. So for now we'll just use brute
+        # force.
+        indexes = []
+        values = []
+        have_any_values = False
+        for ev in self:
+            indexes.append(ev.index)
+            if not have_any_values and key in ev:
+                have_any_values = True
+            values.append(ev.get(key, np.nan))
+        if not have_any_values:
+            raise KeyError, key
+        return pandas.Series(values, index=indexes)
+
+    def update(self, d):
+        for ev in self:
+            ev.update(d)
 
 class Event(object):
     def __init__(self, events, id):
@@ -381,6 +426,10 @@ class Event(object):
                 continue
             
     # Everything else is defined in terms of the above methods.
+
+    def update(self, d):
+        for k, v in d.iteritems():
+            self[k] = v
 
     def get(self, key, default=None):
         try:
@@ -447,7 +496,7 @@ class PlaceholderEvent(object):
     def index(self):
         return IndexQuery(self._events)
 
-class SqlExpr(object):
+class SqlWhere(object):
     def __init__(self, code, tables, args):
         self.code = code
         self.tables = tables
@@ -457,6 +506,8 @@ class Query(object):
     def __init__(self, events, origin=None):
         self._events = events
         self.origin = origin
+
+    # Building queries:
 
     def _as_constraint(self, other):
         if isinstance(other, Query):
@@ -525,21 +576,34 @@ class Query(object):
     def _value_type(self):
         assert False
 
-    def _sql_expr(self):
+    def _sql_where(self):
         assert False
+
+    def __iter__(self):
+        for db_id in self._db_ids():
+            yield Event(self, db_id)
+
+    def _db_ids(self):
+        if self._value_type() != Events.BOOL:
+            raise EventsError("query must be boolean", query)
+        c = self._events._query(self._sql_where(),
+                                "sys_events",
+                                ["sys_events.id"])
+        for (db_id,) in c:
+            yield self._events._decode_value(db_id)
 
 class LiteralQuery(Query):
     def __init__(self, events, value, origin=None):
         Query.__init__(self, events, origin)
         self._value = value
 
-    def _sql_expr(self):
+    def _sql_where(self):
         if (self._value is not None
             and not isinstance(self._value, (bool, basestring, int, float))):
             raise EventsError("literals must be boolean, string, numeric, "
                                 "or None",
                               self)
-        return SqlExpr("?", set(), [self._value])
+        return SqlWhere("?", set(), [self._value])
 
     def _value_type(self):
         return self._events._value_type(self._value)
@@ -548,8 +612,8 @@ class LiteralQuery(Query):
         return "<%s: %r>" % (self.__class__.__name__, self._value)
 
 class LiteralIndexQuery(LiteralQuery):
-    def _sql_expr(self):
-        return SqlExpr("?", set(),
+    def _sql_where(self):
+        return SqlWhere("?", set(),
                        [self._events._encode_index(self._value, self.origin)])
 
     def _value_type(self):
@@ -560,9 +624,9 @@ class AttrQuery(Query):
         Query.__init__(self, events, origin)
         self._name = name
 
-    def _sql_expr(self):
+    def _sql_where(self):
         table_id = _table_name(self._name)
-        return SqlExpr(table_id + ".value", set([table_id]), [])
+        return SqlWhere(table_id + ".value", set([table_id]), [])
 
     def _value_type(self):
         return self._events._value_type_for_key(self._name)
@@ -571,16 +635,23 @@ class AttrQuery(Query):
         return "<%s %r>" % (self.__class__.__name__, self._name)
 
 class IndexQuery(Query):
-    def _sql_expr(self):
+    def _sql_where(self):
         # sys_events is always included in the join, so no need to add it to
         # the tables.
-        return SqlExpr("sys_events.event_index", set(), [])
+        return SqlWhere("sys_events.event_index", set(), [])
 
     def _value_type(self):
         return None
 
     def __repr__(self):
         return "<%s>" % (self.__class__.__name__,)
+
+# This is only used internally
+class IdQuery(Query):
+    def _sql_where(self):
+        # sys_events is always included in the join, so no need to add it to
+        # the tables.
+        return SqlWhere("sys_events.id", set(), [])
 
 class QueryOperator(Query):
     def __init__(self, events, sql_op, children, origin=None):
@@ -589,18 +660,18 @@ class QueryOperator(Query):
         assert 1 <= len(children) <= 2
         self._children = children
         
-    def _sql_expr(self):
-        lhs_sqlexpr = self._children[0]._sql_expr()
+    def _sql_where(self):
+        lhs_sqlwhere = self._children[0]._sql_where()
         if len(self._children) == 1:
             # Special case for NOT
-            rhs_sqlexpr = lhs_sqlexpr
-            lhs_sqlexpr = SqlExpr("", set(), [])
+            rhs_sqlwhere = lhs_sqlwhere
+            lhs_sqlwhere = SqlWhere("", set(), [])
         else:
-            rhs_sqlexpr = self._children[1]._sql_expr()
-        return SqlExpr("(%s %s %s)"
-                       % (lhs_sqlexpr.code, self._sql_op, rhs_sqlexpr.code),
-                       lhs_sqlexpr.tables.union(rhs_sqlexpr.tables),
-                       lhs_sqlexpr.args + rhs_sqlexpr.args)
+            rhs_sqlwhere = self._children[1]._sql_where()
+        return SqlWhere("(%s %s %s)"
+                       % (lhs_sqlwhere.code, self._sql_op, rhs_sqlwhere.code),
+                       lhs_sqlwhere.tables.union(rhs_sqlwhere.tables),
+                       lhs_sqlwhere.args + rhs_sqlwhere.args)
 
     def _value_type(self):
         return Events.BOOL

@@ -1,16 +1,27 @@
+# This file is part of pyrerp
+# Copyright (C) 2012 Nathaniel Smith <njs@pobox.com>
+# See file COPYING for license information.
+
+import os.path
 import struct
-import numpy as np
 from cStringIO import StringIO
 import gzip
 import os
 import string
 
+import numpy as np
 import pandas
 
+from pyrerp.data import ElectrodeInfo, RecordingInfo, ContinuousData
+from pyrerp.util import maybe_open
 from pyrerp.events import Events
 from pyrerp._kutaslab import _decompress_crw_chunk
 
 PAUSE_CODE = 49152
+
+# There are also read_avg and write_erp_as_avg functions in here, but their
+# API probably needs another look before using them.
+__all__ = ["KutaslabError", "load_kutaslab"]
 
 class KutaslabError(Exception):
     pass
@@ -129,7 +140,7 @@ def _read_header(magic, stream):
     info = {}
     info["subject"] = header["subdes"]
     info["experiment"] = header["expdes"]
-    info["raw_header"] = header
+    info["kutaslab_raw_header"] = header
 
     return (reader, header["nchans"], hz, channel_names, info, header)
 
@@ -292,7 +303,8 @@ def compare_raw_to_crw(raw_stream, crw_stream):
                    % (problems, raw_start, raw_end, crw_start, crw_end))
             assert False
 
-def read_log(fo):
+def read_log(file_like):
+    fo = maybe_open(file_like)
     ticks = []
     events = []
     while True:
@@ -306,8 +318,31 @@ def read_log(fo):
     return pandas.DataFrame(events, columns=["code", "condition", "flag"],
                             index=ticks)
 
-def load_kutaslab(f_raw, f_log, name=None, dtype=np.float64):
-    (hz, channel_names, raw_codes, data, info) = read_raw(f_raw, dtype)
+def read_loc(file_like):
+    fo = maybe_open(file_like)
+    names = []
+    thetas = []
+    rs = []
+    for line in fo:
+        if not line.strip():
+            continue
+        (_, theta, r, name) = line.split()
+        # Strip trailing periods
+        while name.endswith("."):
+            name = name[:-1]
+        names.append(name)
+        thetas.append(theta)
+        rs.append(r)
+    return ElectrodeInfo(names, thetas, rs)
+
+def load_kutaslab(f_raw, f_log, name=None, f_loc=None, dtype=np.float64):
+    if isinstance(f_raw, basestring) and name is None:
+        name = os.path.basename(f_raw)
+    if name is None:
+        raise ValueError, "name must be supplied when loading from file object"
+    f_raw = maybe_open(f_raw)
+    f_log = maybe_open(f_log)
+    (hz, channel_names, raw_codes, data, metadata) = read_raw(f_raw, dtype)
     raw_log_events = read_log(f_log)
     expanded_log_codes = np.zeros(raw_codes.shape, dtype=int)
     expanded_log_codes[raw_log_events.index] = raw_log_events["code"]
@@ -323,7 +358,7 @@ def load_kutaslab(f_raw, f_log, name=None, dtype=np.float64):
     pause_ticks = raw_log_events.index[raw_log_events["code"] == PAUSE_CODE]
     # I *think* the pause code appears at the last sample of the era, rather
     # than the first sample of the new era. Convert them to the Python-style
-    # [start, end) convention:
+    # [start, end) convention by adding 1 to each tick number:
     pause_ticks += 1
     name_index = [name] * data.shape[0]
     era_index = np.empty(data.shape[0], dtype=np.int16)
@@ -338,47 +373,33 @@ def load_kutaslab(f_raw, f_log, name=None, dtype=np.float64):
     index_names = ["name", "era", "time"]
     data_index = pandas.MultiIndex.from_arrays(index_arrays,
                                                names=index_names)
+    df = pandas.DataFrame(data, columns=channel_names, index=data_index)
     ev = Events((str, int, int))
     for i in xrange(raw_log_events.shape[0]):
         tick = raw_log_events.index[i]
         ev.add_event(data_index[tick],
                      dict(zip(raw_log_events.columns,
                               raw_log_events.xs(tick))))
-    return (pandas.DataFrame(data,
-                             columns=channel_names,
-                             index=data_index),
-            ev)
+    electrodes = None
+    if f_loc is not None:
+        electrodes = read_loc(f_loc)
+    info = RecordingInfo("RAW", electrodes=electrodes, metadata=metadata)
+    return ContinuousData(name, df, ev, info)
 
-def load(f_raw, f_log, dtype=np.float64,
-         delete_channels=[], calibrate=True, **kwargs):
-    (hz, channel_names, raw_codes, data, info) = read_raw(f_raw, dtype)
-    codes_from_log = np.zeros(raw_codes.shape, dtype=raw_codes.dtype)
-    for (code, tick, condition, flag) in read_log(f_log):
-        codes_from_log[tick] = code
-    discrepancies = (codes_from_log != raw_codes)
-    assert (codes_from_log[discrepancies] == 0).all()
-    assert (raw_codes[discrepancies] == 65535).all()
-    if delete_channels: # fast-path: no need to do a copy if nothing to delete
-        keep_channels = []
-        for i in xrange(len(channel_names)):
-            if channel_names[i] not in delete_channels:
-                keep_channels.append(i)
-        assert len(keep_channels) + len(delete_channels) == len(channel_names)
-        data = data[:, keep_channels]
-        channel_names = channel_names[keep_channels]
-    if calibrate:
-        calibrate_in_place(data, raw_codes, **kwargs)
-    return (hz, channel_names, raw_codes, data, info)
+def save_kutaslab_avg(epoched_data, file_like, allow_resample=False):
+    f = maybe_open(file_like, "wb")
+    
 
 # To write multiple "bins" to the same file, just call this function
 # repeatedly on the same stream.
-def write_erp_as_avg(erp, stream):
+def write_epoched_as_avg(epoched_data, stream, allow_resample=False):
+    stream = maybe_open(stream, "ab")
     header = np.zeros(1, dtype=_header_dtype)[0]
     header["magic"] = 0x97a5
     header["verpos"] = 1
     # One avg record is always exactly 256 * cprecis samples long, with
     # cprecis = 1, 2, 3 (limitation of the data format).  So we pick the
-    # smallest cprecis that is <= our actual number of samples (maximum 3),
+    # smallest cprecis that is >= our actual number of samples (maximum 3),
     # and then we resample to have that many samples exactly.  (I.e., we try
     # to resample up when possible.)  The kutaslab tools only do
     # integer-factor downsampling (decimation), and they write the decimation
@@ -386,16 +407,17 @@ def write_erp_as_avg(erp, stream):
     # retain the decimation information, and the file won't let us write down
     # upsampling (especially non-integer upsampling!), so we just set our
     # decimation factor to 1 and be done with it.
-    if erp.data.shape[0] <= 1 * 256:
+    if epoched_data.num_samples <= 1 * 256:
         cprecis = 1
-    elif erp.data.shape[0] <= 2 * 256:
+    elif epoched_data.num_samples <= 2 * 256:
         cprecis = 2
     else:
         cprecis = 3
     samples = cprecis * 256
-    if erp.data.shape[0] != samples:
-        import scipy.signal
-        resampled_data = scipy.signal.resample(erp.data, samples)
+    if epoched_data.num_samples != samples:
+        if allow_resample:
+            import scipy.signal
+            resampled_data = scipy.signal.resample(erp.data, samples)
     else:
         resampled_data = erp.data
     assert resampled_data.shape == (samples, erp.data.shape[1])
@@ -462,29 +484,29 @@ def write_erp_as_avg(erp, stream):
 # It looks like the high part of the cal is about code_idx+15:code_idx+45, and
 # the low part is -60:-10
 
-class BadChannels(Exception):
-    pass
+# class BadChannels(Exception):
+#     pass
 
-def calibrate_in_place(data, codes,
-                       before=np.arange(-40, -10), after=np.arange(15, 45),
-                       pulse_size=10, # true pulse size measured in uV
-                       stddev_limit=3,
-                       cal_code=1):
-    assert len(before) == len(after)
-    cal_codes = (codes == cal_code).nonzero()[0]
-    # Trim off the first and last few cals, because there may be truncation
-    # effects:
-    cal_codes = cal_codes[2:-2]
-    before_cals = data[np.add.outer(cal_codes, before).ravel(), :]
-    after_cals = data[np.add.outer(cal_codes, after).ravel(), :]
-    deltas = before_cals - after_cals
-    bad_channels = (deltas.std(axis=0) > stddev_limit)
-    if bad_channels.any():
-        raise BadChannels, bad_channels.nonzero()[0]
-    delta = deltas.mean(axis=0)
-    assert (delta > 0).all() or (delta < 0).all()
-    delta = np.abs(delta)
-    data *= pulse_size / delta
+# def calibrate_in_place(data, codes,
+#                        before=np.arange(-40, -10), after=np.arange(15, 45),
+#                        pulse_size=10, # true pulse size measured in uV
+#                        stddev_limit=3,
+#                        cal_code=1):
+#     assert len(before) == len(after)
+#     cal_codes = (codes == cal_code).nonzero()[0]
+#     # Trim off the first and last few cals, because there may be truncation
+#     # effects:
+#     cal_codes = cal_codes[2:-2]
+#     before_cals = data[np.add.outer(cal_codes, before).ravel(), :]
+#     after_cals = data[np.add.outer(cal_codes, after).ravel(), :]
+#     deltas = before_cals - after_cals
+#     bad_channels = (deltas.std(axis=0) > stddev_limit)
+#     if bad_channels.any():
+#         raise BadChannels, bad_channels.nonzero()[0]
+#     delta = deltas.mean(axis=0)
+#     assert (delta > 0).all() or (delta < 0).all()
+#     delta = np.abs(delta)
+#     data *= pulse_size / delta
 
 if __name__ == "__main__":
     import nose

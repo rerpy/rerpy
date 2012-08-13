@@ -1,3 +1,7 @@
+# This file is part of pyrerp
+# Copyright (C) 2012 Nathaniel Smith <njs@pobox.com>
+# See file COPYING for license information.
+
 import cPickle
 from pyrerp.events import Events, EventsError
 from nose.tools import assert_raises

@@ -1,3 +1,7 @@
+# This file is part of pyrerp
+# Copyright (C) 2012 Nathaniel Smith <njs@pobox.com>
+# See file COPYING for license information.
+
 import numpy as np
 from numpy.linalg import qr
 import scipy.linalg

@@ -1,3 +1,7 @@
+# This file is part of pyrerp
+# Copyright (C) 2012 Nathaniel Smith <njs@pobox.com>
+# See file COPYING for license information.
+
 # How to compute incremental std dev:
 #   http://mathcentral.uregina.ca/QQ/database/QQ.09.02/carlos1.html
 
