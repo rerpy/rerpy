@@ -8,7 +8,7 @@ from Cython.Distutils import build_ext
 try:
     import numpy as np
 except ImportError:
-    sys.exit("numpy must be installed before this package")
+    sys.exit("numpy must be installed before this package can be built")
 
 DESC = """XX"""
 
@@ -26,7 +26,7 @@ setup(
     license="XX None yet",
     packages=["pyrerp"],
     url="https://github.com/njsmith/pyrerp",
-    install_requires=["numpy", "scipy", "patsy"],
+    requires=["numpy", "scipy", "patsy"],
     classifiers =
       [ "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",

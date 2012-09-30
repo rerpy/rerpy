@@ -13,7 +13,7 @@ from scipy import stats, sparse
 # stats:::Pillai, stats:::Wilks, etc. They each return a 4-tuple
 #   (raw test value, approximate F, df1, df2)
 # NB: this means that they are GPLed and I don't have the power to change
-# that.
+# that except by rewriting them from scratch.
 _mv_tests = {}
 
 def _pillai(eig, q, df_res):
