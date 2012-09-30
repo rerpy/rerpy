@@ -2,15 +2,8 @@
 
 import os
 import sys
-# Add our fake Pyrex at the end of the Python search path
-# in order to fool setuptools into allowing compilation of
-# pyx files to C files. Importing Cython.Distutils then
-# makes Cython the tool of choice for this rather than
-# (the possibly nonexisting) Pyrex.
-project_path = os.path.split(__file__)[0]
-sys.path.append(os.path.join(project_path, 'fake_pyrex'))
 
-from setuptools import setup, Extension
+from distutils.core import setup, Extension
 from Cython.Distutils import build_ext
 try:
     import numpy as np
