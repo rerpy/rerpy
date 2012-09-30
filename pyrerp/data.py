@@ -212,9 +212,8 @@ class ContinuousData(DataBase):
     def num_samples(self):
         return self.data.shape[0]
 
-    # This does the error checking for on_incomplete="error", and otherwise
-    # acts as if on_incomplete="fill_NA" was set. on_incomplete="skip" needs
-    # post-processing.
+    # This does epochs_at_times, while returning a mask saying which items
+    # were deleted for incompleteness
     def _epochs_at_times(self, timelock_indices, start_latency, end_latency,
                          name, metadata, on_incomplete):
         if on_incomplete not in ("error", "skip", "fill_NA"):
@@ -246,48 +245,61 @@ class ContinuousData(DataBase):
         recording_info = self.recording_info.clone()
         recording_info.metadata.update(metadata)
         recording_info.metadata["epoched-orig-indices"] = timelock_indices
-        return truncated, EpochedData(name, data, None, recording_info)
+        reject_counts = {}
+        if on_incomplete == "skip" and np.any(truncated):
+            data = data.ix[~truncated, : ,:]
+            reject_counts["incomplete_epochs"] = np.sum(truncated)
+        return truncated, EpochedData(name, data, None,
+                                      recording_info, reject_counts)
 
     def epochs_at_times(self, timelock_indices, start_latency, end_latency,
                         name=None, metadata={}, on_incomplete="error"):
         res = self._epochs_at_times(timelock_indices, start_latency,
                                     end_latency, name, metadata)
         truncated, epoched = res
-        if on_incomplete == "skip" and np.any(truncated):
-            epoched.data = epoched.data.ix[~truncated, :, :]
         return epoched
 
     def epochs(self, which_events, start_latency, end_latency,
-               name=None, metadata={}, on_incomplete="error"):
+               reject=None, name=None, metadata={}, on_incomplete="error"):
         # FIXME: is name is None, make up a name from which_events. (This
         # requires a way to stringify Events queries.)
-        event_set = self._events.find(which_events)
+        query = self.events.as_query(which_events)
+        if reject is not None:
+            reject_query = self.events.as_query(reject)
+            num_rejected = len(query & reject_query)
+            query &= ~reject_query
+        else:
+            num_rejected = 0
+        event_set = self.events.find(query)
         events = list(event_set)
         timelock_indices = [ev.index for ev in events]
         res = self._epochs_at_times(timelock_indices, start_latency,
                                     end_latency, name, metadata)
         truncated, epoched = res
         if on_incomplete == "skip" and np.any(truncated):
-            epoched.data = epoched.data.ix[~truncated, :, :]
             for i in np.nonzero(truncated)[0]:
                 event_set.remove(events[i])
         epoched.event_set = event_set
+        assert len(event_set) == epoched.num_epochs
+        epoched.reject_counts["rejected_events"] = num_rejected
         return epoched
 
     def rerp(self, which_events, start_latency, end_latency, formula,
-             on_incomplete="error", name=None, correct_overlap=False):
+             reject=None, on_incomplete="error", name=None, correct_overlap=False):
         if correct_overlap:
             raise NotImplementedError
         else:
-            epoched = self.epochs(which_events, start_latency, end_latency)
+            epoched = self.epochs(which_events, start_latency, end_latency,
+                                  reject=reject)
             return epoched.rerp(formula, name=name, eval_env=1)
 
 class EpochedData(DataBase):
-    def __init__(self, name, data, event_set, recording_info):
+    def __init__(self, name, data, event_set, recording_info, reject_counts={}):
         self.name = name
         self.data = data
         self.event_set = event_set
         self.recording_info = recording_info
+        self.reject_counts = dict(reject_counts)
 
     def _get_channels(self):
         return self.data.minor_axis
@@ -326,7 +338,8 @@ class EpochedData(DataBase):
         metadata = {
             "ERP_combine_method": combine.__name__,
             "ERP_combine_fn": combine,
-            "ERP_num_trials": self.data.shape[0],
+            "ERP_num_used_trials": self.data.shape[0],
+            "rejected_counts": dict(self.rejected_counts),
             }
         recording_info = self.recording_info.clone()
         recording_info.metadata.update(metadata)
@@ -359,8 +372,9 @@ class EpochedData(DataBase):
                                 minor_axis=self.data.minor_axis)
         metadata = {
             "rERP_formula_like": formula_like,
-            "rERP_num_trials": X.shape[0],
             "rERP_design_info": X.design_info,
+            "rERP_num_used_trials": X.shape[0],
+            "rejected_counts": dict(self.rejected_counts),
             }
         recording_info = self.recording_info.clone()
         recording_info.metadata.update(metadata)

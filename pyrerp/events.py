@@ -281,32 +281,39 @@ class Events(object):
     def ANY(self):
         return LiteralQuery(self, True)
 
-    def find(self, *args, **kwargs):
-        "find(a=1, b=2) or find(query_obj) or find(\"string\") or find()"
-        if not args and not kwargs:
-            args = (self.ANY,)
-        if len(args) == 0 and kwargs:
+    def as_query(self, query_like):
+        if isinstance(query_like, dict):
             p = self.placeholder
+            query = self.ANY
             equalities = []
-            if "INDEX" in kwargs:
-                equalities.append(p.index == kwargs.pop("INDEX"))
-            for k, v in kwargs.iteritems():
-                equalities.append(p[k] == v)
-            query = reduce(lambda a, b: a & b, equalities)
-            args = [query]
-            kwargs = {}
-        if not (len(args) == 1 and not kwargs):
-            raise TypeError("Usage: find(a=1, b=2) or find(query_obj) "
-                            "or find(\"query string\")")
-        query = args[0]
-        if isinstance(query, basestring):
-            query = query_from_string(self, query)
+            if "INDEX" in query_like:
+                query &= (p.index == query_like.pop("INDEX"))
+            for k, v in query_like.iteritems():
+                query &= (p[k] == v)
+        elif isinstance(query_like, basestring):
+            query = query_from_string(self, arg)
+        else:
+            query = query_like
+
         if not isinstance(query, Query):
             raise ValueError, "expected a query object, not %r" % (query,)
         if query._events is not self:
             raise ValueError("query object does not refer to this Events "
                              "object")
-        return EventSet(self, list(query._db_ids()))
+        return query
+
+    def find(self, query_like={}):
+        """find({"a": 1, "b": 2}) or find(query_obj) or find(\"string\") or
+        find().
+        """
+        query = self.as_query(query_like)
+        if reject is not None:
+            reject_query = self.as_query(reject)
+            num_rejected = len(query & reject_query)
+            query = (query & ~rejected)
+        else:
+            num_rejected = 0
+        return EventSet(self, list(query._db_ids()), num_rejected)
 
     def _query(self, sql_where, tables, query_vals):
         tables = set(sql_where.tables)
@@ -327,6 +334,19 @@ class Events(object):
 
     def at(self, index):
         return self.find(INDEX=index)
+
+    def join_df(self, df, keys):
+        keys = set(keys)
+        p = self.placeholder
+        for row_idx in df.index:
+            row = df.xs(row_idx)
+            query = self.ANY
+            for key in keys:
+                query &= (p[key] == row[key])
+            for ev in query:
+                for other_key in row.index:
+                    if other_key not in keys:
+                        ev[other_key] = row[other_key]
 
     def __iter__(self):
         return iter(self.ANY)
@@ -357,7 +377,7 @@ class Events(object):
             self.add_event(index, attrs)
 
 class EventSet(object):
-    def __init__(self, events, event_ids):
+    def __init__(self, events, event_ids, num_rejected):
         self._events = events
         self._event_ids = event_ids
 
@@ -583,11 +603,18 @@ class Query(object):
         for db_id in self._db_ids():
             yield Event(self, db_id)
 
+    def __len__(self):
+        if self._value_type() != Events.BOOL:
+            raise EventsError("query must be boolean", query)
+        c = self._events._query(self._sql_where(), [], ["count(*)"])
+        for (count,) in c:
+            return count
+
     def _db_ids(self):
         if self._value_type() != Events.BOOL:
             raise EventsError("query must be boolean", query)
         c = self._events._query(self._sql_where(),
-                                "sys_events",
+                                ["sys_events"],
                                 ["sys_events.id"])
         for (db_id,) in c:
             yield self._events._decode_value(db_id)
