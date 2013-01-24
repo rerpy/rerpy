@@ -1,8 +1,14 @@
 language: python
+virtualenv:
+  # For scipy
+  - system_site_packages: true
 python:
-  - 2.6
+  # We rely on the Ubuntu python-scipy package, and that's only
+  # available for python 2.7 (and 3.something, but pyrerp doesn't
+  # support py3 yet)
   - 2.7
 before_install:
+  - sudo apt-get install -qq python-scipy
   - pip install coverage pandas patsy cython
   - python -V
   - pip freeze
