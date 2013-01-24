@@ -10,8 +10,8 @@ python:
 before_install:
   - # Pre-installed:
   - pip freeze
-  - sudo apt-get install -qq python-scipy python-pandas
-  - pip install coverage pandas patsy cython
+  - sudo apt-get install -qq python-scipy python-pandas python-cython
+  - pip install coverage pandas patsy
   - python -V
   - # What we'll run with:
   - pip freeze
