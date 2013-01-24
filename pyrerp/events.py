@@ -65,14 +65,16 @@ class Events(object):
     def __init__(self, index_type):
         self._index_type = index_type
         self._connection = sqlite3.connect(":memory:")
-        self._keys = set()
+        # Maps key names to value types (NUMERIC, BLOB, BOOL), or None if we
+        # have yet to see any values for the given key and so don't know what
+        # type it should have.
+        self._key_types = {}
 
         c = self._connection.cursor()
         c.execute("PRAGMA case_sensitive_like = true;")
         c.execute("CREATE TABLE sys_events "
                   "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
                   "event_index BLOB NOT NULL);")
-        c.execute("CREATE TABLE sys_key_types (key PRIMARY KEY, type)");
         c.execute("CREATE INDEX sys_events_index_idx "
                   "ON sys_events (event_index);")
 
@@ -156,13 +158,7 @@ class Events(object):
         return c.execute(sql, [self._encode_value(arg) for arg in args])
 
     def _value_type_for_key(self, key):
-        c = self._connection.cursor()
-        code = "SELECT type FROM sys_key_types WHERE key = ?;"
-        self._execute(c, code, (key,))
-        row = c.fetchone()
-        if row is None:
-            return None
-        return self._decode_value(row[0])
+        return self._key_types.get(key)
 
     def _value_type(self, value):
         # must come first, because issubclass(bool, int)
@@ -185,11 +181,7 @@ class Events(object):
             return
         wanted_type = self._value_type_for_key(key)
         if wanted_type is None:
-            c = self._connection.cursor()
-            self._execute(c,
-                          "INSERT INTO sys_key_types (key, type) "
-                            "VALUES (?, ?);",
-                          (key, value_type))
+            self._key_types[key] = value_type
         else:
             if wanted_type != value_type:
                 err = ("Invalid value %r for key %s: wanted %s"
@@ -205,7 +197,7 @@ class Events(object):
                                    "value);" % (table,))
         self._connection.execute("CREATE INDEX IF NOT EXISTS %s_idx "
                                    "ON %s (value);" % (table, table))
-        self._keys.add(key)
+        self._key_types.setdefault(key, None)
 
     def add_event(self, index, info):
         # Create tables up front before entering transaction:
@@ -228,7 +220,7 @@ class Events(object):
         with self._connection:
             c = self._connection.cursor()
             self._execute(c, "DELETE FROM sys_events WHERE id = ?;", (id,))
-            for key in self._keys:
+            for key in self._key_types:
                 self._execute(c,
                               "DELETE FROM %s WHERE event_id = ?;"
                                 % (_table_name(key),),
@@ -435,7 +427,7 @@ class Event(object):
         self._events._delete_event(self._id)
 
     def iteritems(self):
-        for key in self._events._keys:
+        for key in self._events._key_types:
             try:
                 yield key, self[key]
             except KeyError:
