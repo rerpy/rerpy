@@ -247,12 +247,11 @@ def assert_files_match(p1, p2):
         if k != "kutaslab_raw_header":
             assert info1[k] == info2[k]
 
-_test_dir = os.path.join(os.path.dirname(__file__), "test-data")
-
 def test_read_raw_on_test_data():
     import glob
+    from pyrerp.test import test_data_path
     tested = 0
-    for rawp in glob.glob(os.path.join(_test_dir, "*.raw")):
+    for rawp in glob.glob(test_data_path("*.raw")):
         crwp = rawp[:-3] + "crw"
         print rawp, crwp
         assert_files_match(rawp, crwp)
@@ -265,7 +264,8 @@ def test_read_raw_on_test_data():
     assert tested == 4
 
 def test_64bit_channel_names():
-    stream = open(os.path.join(_test_dir, "two-chunks-64chan.raw"))
+    from pyrerp.test import test_data_path
+    stream = open(test_data_path("two-chunks-64chan.raw"))
     (hz, channel_names, codes, data, info) = read_raw(stream, int)
     # "Correct" channel names as listed by headinfo(1):
     assert (channel_names ==

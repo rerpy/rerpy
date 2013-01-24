@@ -13,6 +13,7 @@ install:
 script:
   # We change directories to make sure that python won't find the copy
   # of the package inside the source directory.
+  - export PYRERP_TEST_DATA=$PWD/test-data
   - mkdir empty
   - cd empty
   - INSTALLDIR=$(python -c "import os; import pyrerp; print(os.path.dirname(pyrerp.__file__))")

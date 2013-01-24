@@ -11,4 +11,3 @@ if os.environ.get("PYRERP_FORCE_NO_WARNINGS"):
     warnings.filterwarnings("error", module="^pyrerp")
     del warnings
 del os
-
