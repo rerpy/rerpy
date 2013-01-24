@@ -8,9 +8,12 @@ python:
   # support py3 yet)
   - 2.7
 before_install:
-  - sudo apt-get install -qq python-scipy
+  - # Pre-installed:
+  - pip freeze
+  - sudo apt-get install -qq python-scipy python-pandas
   - pip install coverage pandas patsy cython
   - python -V
+  - # What we'll run with:
   - pip freeze
   - which nosetests
   - python -c 'import numpy; print(numpy.__version__)'
