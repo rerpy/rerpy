@@ -247,11 +247,10 @@ def assert_files_match(p1, p2):
         if k != "raw_header":
             assert info1[k] == info2[k]
 
-import os.path
 _test_dir = os.path.join(os.path.dirname(__file__), "test-data")
 
 def test_read_raw_on_test_data():
-    import os.path, glob
+    import glob
     tested = 0
     for rawp in glob.glob(os.path.join(_test_dir, "*.raw")):
         crwp = rawp[:-3] + "crw"
@@ -327,16 +326,20 @@ def read_log(file_like):
     df = pandas.DataFrame(events, columns=["code", "condition", "flag"],
                           index=ticks)
     df["flag_data_error"] = np.asarray(df["flag"] & 0o100, dtype=bool)
-    df["flag_rejected"] = np.asarray(df["flag"] & 0o40, dtype=bol)
-    df["flag_polinv"] = np.asarray(df["flag"] & 0o20, dtype=bol)
+    df["flag_rejected"] = np.asarray(df["flag"] & 0o40, dtype=bool)
+    df["flag_polinv"] = np.asarray(df["flag"] & 0o20, dtype=bool)
+    return df
 
+# XX no idea what this is
+# really should learn to read a topofile (see topofiles(5) and lib/topo)
 def read_loc(file_like):
     fo = maybe_open(file_like)
     names = []
     thetas = []
     rs = []
     for line in fo:
-        if not line.strip():
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
         (_, theta, r, name) = line.split()
         # Strip trailing periods
@@ -364,9 +367,11 @@ def load_kutaslab(f_raw, f_log, name=None, f_loc=None, dtype=np.float64):
         raise KutaslabError, "raw and log files have mismatched codes"
     del raw_codes
     del expanded_log_codes
-    sample_period_ms = int(1. / hz * 1000)
-    if (1000. / sample_period_ms) != hz:
-        raise KutaslabError, "sampling period in milliseconds is not an integer"
+    # XX FIXME: build in the 26 and 64 channel cap info
+    electrodes = None
+    if f_loc is not None:
+        electrodes = read_loc(f_loc)
+    info = RecordingInfo(hz, "RAW", electrodes=electrodes, metadata=metadata)
     pause_ticks = raw_log_events.index[raw_log_events["code"] == PAUSE_CODE]
     # I *think* the pause code appears at the last sample of the era, rather
     # than the first sample of the new era. Convert them to the Python-style
@@ -379,7 +384,7 @@ def load_kutaslab(f_raw, f_log, name=None, f_loc=None, dtype=np.float64):
     era_ends = np.concatenate((pause_ticks, [data.shape[0]]))
     for i, (era_start, era_end) in enumerate(zip(era_starts, era_ends)):
         era_index[era_start:era_end] = i
-        times = np.arange(era_end - era_start) * sample_period_ms
+        times = np.arange(era_end - era_start) * info.approx_sample_period_ms
         time_index[era_start:era_end] = times
     index_arrays = [name_index, era_index, time_index]
     index_names = ["name", "era", "time"]
@@ -392,10 +397,6 @@ def load_kutaslab(f_raw, f_log, name=None, f_loc=None, dtype=np.float64):
         ev.add_event(data_index[tick],
                      dict(zip(raw_log_events.columns,
                               raw_log_events.xs(tick))))
-    electrodes = None
-    if f_loc is not None:
-        electrodes = read_loc(f_loc)
-    info = RecordingInfo("RAW", electrodes=electrodes, metadata=metadata)
     return ContinuousData(name, df, ev, info)
 
 # To read multiple bins, call this repeatedly on the same stream

@@ -35,3 +35,11 @@ next with code == 13 within 200-800
 
 wacky idea, just make the input file python code?
   (py2 or py3?)
+
+
+importing events from eeglab: this page says how to import events
+*into* eeglab, and has sample files to do this with, plus points to
+the function that lets you export data to csv... so it should have the
+right leads for figuring out how this information is stored in the
+eeglab structure:
+http://sccn.ucsd.edu/wiki/A02:_Importing_Event_Epoch_Info

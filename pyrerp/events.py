@@ -133,6 +133,8 @@ class Events(object):
     def _encode_value(self, val):
         if np.issubsctype(type(val), np.str_):
             return sqlite3.Binary(val)
+        elif np.issubsctype(type(val), np.bool_):
+            return bool(val)
         elif np.issubsctype(type(val), np.integer):
             return int(val)
         elif np.issubsctype(type(val), np.floating):
@@ -161,11 +163,11 @@ class Events(object):
 
     def _value_type(self, value):
         # must come first, because issubclass(bool, int)
-        if isinstance(value, bool):
+        if isinstance(value, (bool, np.bool_)):
             return self.BOOL
-        elif isinstance(value, (int, long, float)):
+        elif isinstance(value, (int, long, float, np.number)):
             return self.NUMERIC
-        elif isinstance(value, (str, unicode)):
+        elif isinstance(value, (str, unicode, np.character)):
             return self.BLOB
         elif value is None:
             return None

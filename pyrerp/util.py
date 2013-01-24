@@ -43,3 +43,4 @@ def pack_pandas(array, metadata):
         return pandas.PanelData(array, **info)
     else:
         raise ValueError, "invalid pandas metadata"
+

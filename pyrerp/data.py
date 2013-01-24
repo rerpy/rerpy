@@ -52,8 +52,15 @@ class ElectrodeInfo(object):
         return ((0, 0), 0.5, (0, 1))
 
 class RecordingInfo(object):
-    # Remember to update .copy() below if changing this:
-    def __init__(self, units, electrodes=None, metadata={}):
+    # Remember to update .clone() below if changing this:
+    def __init__(self, exact_srate_hz, units, electrodes=None, metadata={}):
+        self.exact_sample_rate_hz = exact_srate_hz
+        sample_period_ms = 1. / exact_srate_hz * 1000
+        # If sample period is exactly an integer, use an integer type to store
+        # it
+        if 1000. / int(sample_period_ms) == exact_srate_hz:
+            sample_period_ms = int(sample_period_ms)
+        self.approx_sample_period_ms = sample_period_ms
         self.units = units
         if electrodes is None:
             electrodes = ElectrodeInfo([], [], [])
@@ -61,7 +68,8 @@ class RecordingInfo(object):
         self.metadata = dict(metadata)
 
     def clone(self):
-        return self.__class__(self.units, self.electrodes, self.metadata)
+        return self.__class__(self.exact_srate_hz,
+                              self.units, self.electrodes, self.metadata)
 
 class DataBase(object):
     def __init__(self, *args, **kwargs):
@@ -181,13 +189,18 @@ class DataBase(object):
         self.data = pack_pandas(arr, metadata)
         self.data.columns = channel_names
 
-def index_plus_latency(index, latency):
+def index_plus_latency(index, latency, direction):
     return index[:-1] + (index[-1] + latency,)
 
 def index_sub(index1, index2):
     if index1[:-1] != index2[:-1]:
         raise ValueError, "incomparable indices"
     return index1[-1] - index2[-1]
+
+def latency_normalize(approx_latency, sample_period):
+    # Aligns approx_latency exactly to a value of the form int * sample_period
+    count = int(round(approx_latency * 1.0 / sample_period))
+    return count * sample_period
 
 class ContinuousData(DataBase):
     def __init__(self, name, data, events, recording_info):
@@ -216,26 +229,53 @@ class ContinuousData(DataBase):
     # were deleted for incompleteness
     def _epochs_at_times(self, timelock_indices, start_latency, end_latency,
                          name, metadata, on_incomplete):
+        timelock_indices = np.asarray(timelock_indices,
+                                      dtype=self.data.index.dtype)
         if on_incomplete not in ("error", "skip", "fill_NA"):
             raise ValueError("on_incomplete must be one of "
                              "\"error\", \"skip\", or \"fill_NA\"")
-        timelock_indices = np.asarray(timelock_indices,
-                                      dtype=self.data.index.dtype)
+
+        start_offset = int(round(start_latency
+                                 * self.recording_info.exact_srate_hz))
+        end_offset = int(round(end_latency
+                               * self.recording_info.exact_srate_hz))
+        epoch_npoints = end_offset + 1 - start_offset
+        sample_period = self.recording_info.approx_sample_period_ms
+        epoch_index = pandas.Series(np.arange(start_offset, end_offset + 1)
+                                    * sample_period)
+        # We put the index bounds mid-way between sample points, to avoid any
+        # issues of inconsistent floating-point rounding. (The actual bounds
+        # of each epoch may vary by +/- 1 ulp.)
+        start_latency_bound = ((start_offset - 0.5)
+                               * self.recording_info.approx_sample_period_ms)
+        end_latency_bound = ((end_offset + 0.5)
+                             * self.recording_info.approx_sample_period_ms)
+
         truncated = np.zeros(timelock_indices.shape, dtype=bool)
         epochs = []
         for i, timelock_idx in enumerate(timelock_indices):
-            start_idx = index_plus_latency(timelock_idx, start_latency)
-            end_idx = index_plus_latency(timelock_idx, end_latency)
+            # By using pandas range-based indexing, we can straightforwardly
+            # isolate the portion of the data that falls into this epoch, even
+            # if it is incomplete.
+            start_idx = index_plus_latency(timelock_idx, start_latency_bound)
+            end_idx = index_plus_latency(timelock_idx, end_latency_bound)
             epoch = self.data[start_idx:end_idx]
-            if epoch.index[0] != start_idx or epoch.index[-1] != end_idx:
+            if len(epoch) != epoch_npoints:
                 if on_incomplete == "error":
                     raise ValueError("truncated epoch at %s "
                                      "with on_incomplete=\"error\""
                                      % (timelock_idx,))
                 truncated[i] = True
-            latencies = [index_sub(idx, timelock_idx)
-                         for idx in epoch.index]
-            epoch.index = latencies
+            # The indices in our "ideal" epoch are all of the form:
+            #   integer * sample period
+            # we'll match each offset in our data to an index of this form
+            # (thus making sure that the indices from different epochs match,
+            # even in the presence of floating point rounding)
+            approx_latencies = [index_sub(idx, timelock_idx)
+                                for idx in epoch.index]
+            exact_latencies = [latency_normalize(approx_latency, sample_period)
+                               for approx_latency in approx_latencies]
+            epoch.index = exact_latencies
             epochs.append(epoch)
         # pandas.Panel will align our single-epoch DataFrames, filling in NAs
         # where necessary (and re-sort them into time order after dict()
