@@ -88,7 +88,10 @@ class Events(object):
         if not isinstance(idx, tuple) or len(idx) != len(index_type):
             raise EventsError("wrong length index %r" % (idx,), origin)
         for (obj, type) in zip(idx, index_type):
-            if not isinstance(obj, type):
+            required_type = type
+            if type is int:
+                required_type = (int, long)
+            if not isinstance(obj, required_type):
                 raise EventsError("index object %r not of type %s"
                                   % (obj, type), origin)
             try:

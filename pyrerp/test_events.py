@@ -42,7 +42,8 @@ def test_Events_basic():
 
 def test_index_encoding():
     e = Events((int, int))
-    tests = [(0, 0), (10, 10), (0, 1000), (1000, 0), (2**31, 2**30)]
+    tests = [(0, 0), (10, 10), (0, -1), (-1, 10),
+             (0, 1000), (1000, 0), (2**32, 2**31)]
     for t in tests:
         assert e._decode_index(e._encode_index(t)) == t
     encoded_tests = [e._encode_index(t) for t in tests]
