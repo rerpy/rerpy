@@ -1,0 +1,26 @@
+language: python
+python:
+  - 2.6
+  - 2.7
+before_install:
+  - pip install coverage pandas patsy cython
+  - python -V
+  - which nosetests
+  - python -c 'import numpy; print(numpy.__version__)'
+install:
+  - python setup.py install
+script:
+  # We change directories to make sure that python won't find the copy
+  # of the package inside the source directory.
+  - mkdir empty
+  - cd empty
+  - INSTALLDIR=$(python -c "import os; import pyrerp; print(os.path.dirname(pyrerp.__file__))")
+  - export PYTHONWARNINGS=default PYRERP_FORCE_NO_WARNINGS=1
+  # The --exe is because python sometimes marks all installed modules
+  # as executable, so without --exe nosetests will just ignore
+  # everything. Baffling, but so it goes.
+  - coverage run --source=$INSTALLDIR --rcfile=../.coveragerc $(which nosetests) --exe --failure-detail --all-modules $INSTALLDIR
+  - coverage report --rcfile=../.coveragerc --show-missing
+notifications:
+  email:
+    - njs@pobox.com
