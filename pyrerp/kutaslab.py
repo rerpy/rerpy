@@ -244,7 +244,7 @@ def assert_files_match(p1, p2):
     assert (codes1 == codes2).all()
     assert (data1 == data2).all()
     for k in set(info1.keys() + info2.keys()):
-        if k != "raw_header":
+        if k != "kutaslab_raw_header":
             assert info1[k] == info2[k]
 
 _test_dir = os.path.join(os.path.dirname(__file__), "test-data")
@@ -350,7 +350,8 @@ def read_loc(file_like):
         rs.append(r)
     return ElectrodeInfo(names, thetas, rs)
 
-def load_kutaslab(f_raw, f_log, name=None, f_loc=None, dtype=np.float64):
+def load_kutaslab(f_raw, f_log, name=None, f_loc=None, dtype=np.float64,
+                  calibration_condition=0):
     if isinstance(f_raw, basestring) and name is None:
         name = os.path.basename(f_raw)
     if name is None:
@@ -392,11 +393,11 @@ def load_kutaslab(f_raw, f_log, name=None, f_loc=None, dtype=np.float64):
                                                names=index_names)
     df = pandas.DataFrame(data, columns=channel_names, index=data_index)
     ev = Events((str, int, int))
-    for i in xrange(raw_log_events.shape[0]):
-        tick = raw_log_events.index[i]
-        ev.add_event(data_index[tick],
-                     dict(zip(raw_log_events.columns,
-                              raw_log_events.xs(tick))))
+    for tick, row in raw_log_events.iterrows():
+        if row["condition"] == calibration_condition:
+            ev.add_event(data_index[tick], {"calibration_pulse": True})
+        else:
+            ev.add_event(data_index[tick], row.to_dict())
     return ContinuousData(name, df, ev, info)
 
 # To read multiple bins, call this repeatedly on the same stream

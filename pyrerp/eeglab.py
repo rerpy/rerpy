@@ -183,14 +183,16 @@ def load_eeglab(set_filename, dtype=np.float64):
     
     name_index = [metadata["setname"]] * num_samples
     era_index = np.empty(num_samples, dtype=int)
-    time_index = np.empty(num_samples, dtype=
+    #time_index = np.empty(num_samples, dtype=
     ev = Events((str, int, int))
 
     if num_epochs == 1:
         # Continuous data
+        # XX
+        pass
     else:
         # Epoched data
         # EEG.xmin, EEG.xmax = start/end latency of epoch in seconds
         # EEG.epoch == ?
-
-
+        # XX
+        pass

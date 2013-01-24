@@ -293,7 +293,7 @@ class Events(object):
             for k, v in query_like.iteritems():
                 query &= (p[k] == v)
         elif isinstance(query_like, basestring):
-            query = query_from_string(self, arg)
+            query = query_from_string(self, query_like)
         else:
             query = query_like
 
@@ -309,46 +309,26 @@ class Events(object):
         find().
         """
         query = self.as_query(query_like)
-        if reject is not None:
-            reject_query = self.as_query(reject)
-            num_rejected = len(query & reject_query)
-            query = (query & ~rejected)
-        else:
-            num_rejected = 0
-        return EventSet(self, list(query._db_ids()), num_rejected)
+        return EventSet(self, list(query._db_ids()))
 
     def _query(self, sql_where, tables, query_vals):
         tables = set(sql_where.tables)
         tables.add("sys_events")
-        tables.update(tables)
         joins = ["%s.event_id == sys_events.id" % (table,)
                  for table in tables if table != "sys_events"]
         code = ("SELECT %s FROM %s WHERE (%s) "
                 % (", ".join(query_vals),
-                   ", ".join(sql_where.tables),
+                   ", ".join(tables),
                    sql_where.code))
         if joins:
             code += " AND (%s)" % (" AND ".join(joins),)
         code += "ORDER BY sys_events.event_index"
-        c = self._events._connection.cursor()
+        c = self._connection.cursor()
         self._execute(c, code, sql_where.args)
         return c
 
     def at(self, index):
-        return self.find(INDEX=index)
-
-    def join_df(self, df, keys):
-        keys = set(keys)
-        p = self.placeholder
-        for row_idx in df.index:
-            row = df.xs(row_idx)
-            query = self.ANY
-            for key in keys:
-                query &= (p[key] == row[key])
-            for ev in query:
-                for other_key in row.index:
-                    if other_key not in keys:
-                        ev[other_key] = row[other_key]
+        return list(self.as_query({"INDEX": index}))
 
     def __iter__(self):
         return iter(self.ANY)
@@ -361,6 +341,9 @@ class Events(object):
     def __repr__(self):
         return "<%s object with %s entries>" % (self.__class__.__name__,
                                                 len(self))
+
+    def join_df(self, df, match_on):
+        return self.ANY.join_df(df, match_on)
 
     # Pickling
     def __getstate__(self):
@@ -378,8 +361,13 @@ class Events(object):
         for index, attrs in events:
             self.add_event(index, attrs)
 
+# This is like a "frozen" query -- it always refers to the same events even if
+# the original set changes (though the values in those events may change!),
+# can be mutated in place, and, crucially, it supports __getitem__ to get a
+# Series of values. So you can pass it as a 'data' object to dmatrix and
+# friends!
 class EventSet(object):
-    def __init__(self, events, event_ids, num_rejected):
+    def __init__(self, events, event_ids):
         self._events = events
         self._event_ids = event_ids
 
@@ -390,6 +378,9 @@ class EventSet(object):
             self._event_ids.remove(event.id)
         except ValueError:
             raise KeyError, event
+
+    def __len__(self):
+        return len(self._event_ids)
 
     def __iter__(self):
         for db_id in self._event_ids:
@@ -603,7 +594,7 @@ class Query(object):
 
     def __iter__(self):
         for db_id in self._db_ids():
-            yield Event(self, db_id)
+            yield Event(self._events, db_id)
 
     def __len__(self):
         if self._value_type() != Events.BOOL:
@@ -614,12 +605,28 @@ class Query(object):
 
     def _db_ids(self):
         if self._value_type() != Events.BOOL:
-            raise EventsError("query must be boolean", query)
+            raise EventsError("top-level query must be boolean", self)
         c = self._events._query(self._sql_where(),
                                 ["sys_events"],
                                 ["sys_events.id"])
         for (db_id,) in c:
             yield self._events._decode_value(db_id)
+
+    def join_df(self, df, match_on):
+        # match is like {df_colname: event_key}
+        # or just [colname]
+        if not isinstance(match_on, dict):
+            match_on = dict([(key, key) for key in match_on])
+        p = self._events.placeholder
+        for row_idx in df.index:
+            row = df.xs(row_idx)
+            query = self
+            for df_key, db_key in match_on.iteritems():
+                query &= (p[db_key] == row[df_key])
+            for ev in query:
+                for df_key in row.index:
+                    if df_key not in match_on:
+                        ev[df_key] = row[df_key]
 
 class LiteralQuery(Query):
     def __init__(self, events, value, origin=None):

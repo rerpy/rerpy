@@ -117,14 +117,14 @@ def test_find():
 
     assert [ev.index for ev in e.find()] == [10, 20]
 
-    assert [ev.index for ev in e.find(a=1)] == [10]
-    assert [ev.index for ev in e.find(a=1, b=True)] == [10]
-    assert [ev.index for ev in e.find(a=1, b=False)] == []
-    assert [ev.index for ev in e.find(b=True)] == [10, 20]
+    assert [ev.index for ev in e.find({"a": 1})] == [10]
+    assert [ev.index for ev in e.find({"a": 1, "b": True})] == [10]
+    assert [ev.index for ev in e.find({"a": 1, "b": False})] == []
+    assert [ev.index for ev in e.find({"b": True})] == [10, 20]
     
-    assert [ev["a"] for ev in e.find(INDEX=10)] == [1]
-    assert [ev["a"] for ev in e.find(INDEX=20)] == [-1]
-    assert [ev["a"] for ev in e.find(INDEX=20, b=False)] == []
+    assert [ev["a"] for ev in e.find({"INDEX": 10})] == [1]
+    assert [ev["a"] for ev in e.find({"INDEX": 20})] == [-1]
+    assert [ev["a"] for ev in e.find({"INDEX": 20, "b": False})] == []
 
 def test_python_query():
     # all operators
@@ -234,7 +234,7 @@ def test_python_query_typechecking():
     assert_raises(EventsError, p["a"].__and__, p["c"])
     assert_raises(EventsError, p["a"].__invert__)
 
-    assert_raises(EventsError, list, e.find(p["e"]))
+    assert_raises(EventsError, e.find, p["e"])
 
 # def test_string_query():
 #     # all operators
@@ -252,7 +252,7 @@ def test_index():
         assert len(list(e.find(e.placeholder.index == good_value))) == 1
         assert_raises(EventsError, e.add_event, bad_value, {"a": 1})
         assert_raises(EventsError,
-                      list, e.find(e.placeholder.index == bad_value))
+                      e.find, e.placeholder.index == bad_value)
     t(int, 10, "asdf")
     t((int,), (10,), 10)
     t(str, "asdf", 10)
