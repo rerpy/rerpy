@@ -1,5 +1,5 @@
 # This file is part of pyrerp
-# Copyright (C) 2012 Nathaniel Smith <njs@pobox.com>
+# Copyright (C) 2012-2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
 import sqlite3
@@ -303,8 +303,7 @@ class Events(object):
         """find({"a": 1, "b": 2}) or find(query_obj) or find(\"string\") or
         find().
         """
-        query = self.as_query(query_like)
-        return EventSet(self, list(query._db_ids()))
+        return self.as_query(query_like).run()
 
     def _query(self, sql_where, tables, query_vals):
         tables = set(sql_where.tables)
@@ -323,10 +322,10 @@ class Events(object):
         return c
 
     def at(self, index):
-        return list(self.as_query({"INDEX": index}))
+        return list(self.find({"INDEX": index}))
 
     def __iter__(self):
-        return iter(self.ANY)
+        return iter(self.ANY.run())
 
     def __len__(self):
         c = self._connection.cursor()
@@ -337,8 +336,27 @@ class Events(object):
         return "<%s object with %s entries>" % (self.__class__.__name__,
                                                 len(self))
 
-    def join_df(self, df, match_on):
-        return self.ANY.join_df(df, match_on)
+    def merge_df(self, df, on, subset=None):
+        # 'on' is like {df_colname: event_key}
+        # or just [colname]
+        # or just colname
+        if isinstance(on, basestring):
+            on = [on]
+        if not isinstance(on, dict):
+            on = dict([(key, key) for key in on])
+        p = self.placeholder
+        query = subset
+        if query is None:
+            query = self.ANY
+        for row_idx in df.index:
+            row = df.xs(row_idx)
+            query = self
+            for df_key, db_key in on.iteritems():
+                query &= (p[db_key] == row[df_key])
+            for ev in query:
+                for df_key in row.index:
+                    if df_key not in on:
+                        ev[df_key] = row[df_key]
 
     # Pickling
     def __getstate__(self):
@@ -397,6 +415,15 @@ class EventSet(object):
         if not have_any_values:
             raise KeyError, key
         return pandas.Series(values, index=indexes)
+
+    def __setitem__(self, key, value):
+        # XX we should probably support Series and ndarrays and stuff here,
+        # but for now we only allow scalar assignment
+        # XX we REALLY SHOULD support aligned assignment so we can write
+        # things like
+        #   my_set["foo"] = my_set.next(query)["foo"]
+        # and make sure that nan gets mapped to deleting the value
+        xx
 
     def update(self, d):
         for ev in self:
@@ -587,10 +614,6 @@ class Query(object):
     def _sql_where(self):
         assert False
 
-    def __iter__(self):
-        for db_id in self._db_ids():
-            yield Event(self._events, db_id)
-
     def __len__(self):
         if self._value_type() != Events.BOOL:
             raise EventsError("query must be boolean", query)
@@ -607,21 +630,8 @@ class Query(object):
         for (db_id,) in c:
             yield self._events._decode_value(db_id)
 
-    def join_df(self, df, match_on):
-        # match is like {df_colname: event_key}
-        # or just [colname]
-        if not isinstance(match_on, dict):
-            match_on = dict([(key, key) for key in match_on])
-        p = self._events.placeholder
-        for row_idx in df.index:
-            row = df.xs(row_idx)
-            query = self
-            for df_key, db_key in match_on.iteritems():
-                query &= (p[db_key] == row[df_key])
-            for ev in query:
-                for df_key in row.index:
-                    if df_key not in match_on:
-                        ev[df_key] = row[df_key]
+    def run(self):
+        return EventSet(self._events, list(self._db_ids()))
 
 class LiteralQuery(Query):
     def __init__(self, events, value, origin=None):
