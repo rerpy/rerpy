@@ -399,31 +399,33 @@ class EventSet(object):
         for db_id in self._event_ids:
             yield Event(self._events, db_id)
 
-    def __getitem__(self, key):
-        # In principle there is a cleverer way to do this using _query
-        # directly but it gets complicated to properly handle indexes, missing
-        # values, and detecting KeyErrors. So for now we'll just use brute
-        # force.
-        indexes = []
-        values = []
-        have_any_values = False
-        for ev in self:
-            indexes.append(ev.index)
-            if not have_any_values and key in ev:
-                have_any_values = True
-            values.append(ev.get(key, np.nan))
-        if not have_any_values:
-            raise KeyError, key
-        return pandas.Series(values, index=indexes)
+    def __getitem__(self, idx):
+        return Event(self._events, self._event_ids[idx])
 
-    def __setitem__(self, key, value):
-        # XX we should probably support Series and ndarrays and stuff here,
-        # but for now we only allow scalar assignment
-        # XX we REALLY SHOULD support aligned assignment so we can write
-        # things like
-        #   my_set["foo"] = my_set.next(query)["foo"]
-        # and make sure that nan gets mapped to deleting the value
-        xx
+    # def __getitem__(self, key):
+    #     # In principle there is a cleverer way to do this using _query
+    #     # directly but it gets complicated to properly handle indexes, missing
+    #     # values, and detecting KeyErrors. So for now we'll just use brute
+    #     # force.
+    #     indexes = []
+    #     values = []
+    #     have_any_values = False
+    #     for ev in self:
+    #         indexes.append(ev.index)
+    #         if not have_any_values and key in ev:
+    #             have_any_values = True
+    #         values.append(ev.get(key, np.nan))
+    #     if not have_any_values:
+    #         raise KeyError, key
+    #     return pandas.Series(values, index=indexes)
+
+    # def __setitem__(self, key, value):
+    #     # XX we should probably support Series and ndarrays and stuff here
+    #     # XX we REALLY SHOULD support aligned assignment so we can write
+    #     # things like
+    #     #   my_set["foo"] = my_set.next(query)["foo"]
+    #     # and make sure that nan gets mapped to deleting the value
+    #     xx
 
     def update(self, d):
         for ev in self:
@@ -513,6 +515,20 @@ class Event(object):
         p.pretty(dict(self.iteritems()))
         p.end_group(2, ">")
             
+    def relative(self, count, query={}):
+        """Counts 'count' events forward or back from the current event (or
+        optionally, only events that match 'query'), and returns that. Use
+        negative for backwards."""
+        if count == 0:
+            raise IndexError, "count must be non-zero"
+        query = self._events.as_query(query)
+        p = self._events.placeholder
+        if count > 0:
+            query &= (p.index > self.index)
+            return query.run()[count - 1]
+        else:
+            query &= (p.index < self.index)
+            return query.run()[count]
 
 ###############################################
 #

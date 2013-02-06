@@ -110,6 +110,24 @@ def test_misc_queries():
     assert e.at(20)[0]["a"] == -1
     assert e.at(15) == []
 
+def test_Event_relative():
+    e = Events(int)
+    e.add_event(20, {"a": 20, "extra": True})
+    e.add_event(10, {"a": 10})
+    e.add_event(30, {"a": 30})
+    e.add_event(40, {"a": 40, "extra": True})
+    
+    ev20 = e.at(20)[0]
+    assert ev20.relative(1)["a"] == 30
+    assert_raises(IndexError, ev20.relative, 0)
+    assert ev20.relative(-1)["a"] == 10
+    ev10 = e.at(10)[0]
+    assert ev10.relative(2)["a"] == 30
+    ev30 = e.at(30)[0]
+    assert ev30.relative(-2)["a"] == 10
+    assert ev10.relative(1, "extra")["a"] == 20
+    assert ev10.relative(2, "extra")["a"] == 40
+
 def test_find():
     # all the different calling conventions
     e = Events(int)
