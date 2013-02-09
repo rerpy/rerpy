@@ -350,10 +350,10 @@ class Events(object):
             query = self.ANY
         for row_idx in df.index:
             row = df.xs(row_idx)
-            query = self
+            this_query = query
             for df_key, db_key in on.iteritems():
-                query &= (p[db_key] == row[df_key])
-            for ev in query:
+                this_query &= (p[db_key] == row[df_key])
+            for ev in this_query.run():
                 for df_key in row.index:
                     if df_key not in on:
                         ev[df_key] = row[df_key]
@@ -547,6 +547,9 @@ class PlaceholderEvent(object):
     def index(self):
         return IndexQuery(self._events)
 
+    def has_key(self, key):
+        return self[key] != None
+
 class SqlWhere(object):
     def __init__(self, code, tables, args):
         self.code = code
@@ -623,6 +626,12 @@ class Query(object):
 
     def __invert__(self):
         return self._make_op("not", "NOT", [self], Events.BOOL)
+
+    def __nonzero__(self):
+        raise TypeError("can't convert query directly to bool "
+                        "(maybe you want a bitwise operator like & | ~ "
+                        "instead of a logical operator like "
+                        "'and' 'or' 'not')")
 
     def _value_type(self):
         assert False
@@ -755,6 +764,7 @@ _punct_ops = [
     ]
 _text_ops = [
     Operator("not", 1, 0),
+    Operator("has", 1, 0),
     Operator("and", 2, 0),
     Operator("or", 2, 0),
     ]
@@ -865,19 +875,22 @@ def _tokenize(string):
                               Origin(string, i, i + 1))
 
 _op_to_pymethod = {"==": "__eq__",
-                 "!=": "__ne__",
-                 "<": "__lt__",
-                 ">": "__gt__",
-                 "<=": "__le__",
-                 ">=": "__ge__",
-                 "and": "__and__",
-                 "or": "__or__",
-                 "not": "__invert__",
-                 }
+                   "!=": "__ne__",
+                   "<": "__lt__",
+                   ">": "__gt__",
+                   "<=": "__le__",
+                   ">=": "__ge__",
+                   "and": "__and__",
+                   "or": "__or__",
+                   "not": "__invert__",
+                   }
 def _eval(events, tree):
     if tree.type in _op_to_pymethod:
         eval_args = [_eval(events, arg) for arg in tree.args]
         return getattr(eval_args[0], _op_to_pymethod[tree.type])(*eval_args[1:])
+    elif tree.type == "has":
+        eval_args = [_eval(events, arg) for arg in tree.args]
+        return eval_args[0] != None
     elif tree.type == "LITERAL":
         return LiteralQuery(events, tree.token.extra, tree.origin)
     elif tree.type == "ATTR":

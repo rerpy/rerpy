@@ -222,6 +222,9 @@ def test_python_query():
     t(p["e"] == None, [-10, 10])
     t(p["e"] != None, [20])
 
+    t(p.has_key("e"), [20])
+    t(~p.has_key("e"), [-10, 10])
+
     t(p["INDEX"] == 10, [20])
     t(p["INDEX"] != 10, [])
 
