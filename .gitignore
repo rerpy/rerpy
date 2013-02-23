@@ -6,6 +6,7 @@ htmlcov/
 .tox
 
 pyrerp/_kutaslab.c
+pyrerp/_artifact.c
 
 # Cribbed from numpy's .gitignore:
 
