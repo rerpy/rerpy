@@ -1,8 +1,9 @@
 # This file is part of pyrerp
-# Copyright (C) 2012 Nathaniel Smith <njs@pobox.com>
+# Copyright (C) 2012-2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
 import cPickle
+import numpy as np
 from pyrerp.events import Events, EventsError
 from nose.tools import assert_raises
 
@@ -15,6 +16,10 @@ def test_Events_basic():
     assert ev1.index == 10
     assert ev1["a"] == 1
     assert ev1["b"] == "hello"
+    assert ev1["c"] == True
+    assert type(ev1["a"]) == int
+    assert type(ev1["b"]) == str
+    assert type(ev1["c"]) == bool
     ev1["a"] = 2
     assert ev1["a"] == 2
     assert_raises(ValueError, e.add_event, 20, {"a": "string"})
@@ -144,6 +149,27 @@ def test_find():
     assert [ev["a"] for ev in e.find({"INDEX": 10})] == [1]
     assert [ev["a"] for ev in e.find({"INDEX": 20})] == [-1]
     assert [ev["a"] for ev in e.find({"INDEX": 20, "b": False})] == []
+
+def test_EventSet():
+    e = Events(int)
+    e.add_event(10, {"a": 1, "b": True})
+    e.add_event(20, {"a": -1, "b": True})
+    e.add_event(15, {"a": -1, "b": False})
+    es = e.find()
+    assert es[0].index == 10
+    assert es[1].index == 15
+    assert es[2].index == 20
+    assert es[-1].index == 20
+    assert_raises(IndexError, es.__getitem__, 3)
+    a_series = es["a"]
+    assert np.all(a_series.index == [10, 15, 20])
+    assert np.all(a_series == [1, -1, -1])
+    assert a_series.dtype == np.dtype(int)
+    b_series = es["b"]
+    assert np.all(b_series.index == [10, 15, 20])
+    assert np.all(b_series == [True, False, True])
+    assert b_series.dtype == np.dtype(bool)
+    assert_raises(KeyError, es.__getitem__, "c")
 
 def test_python_query():
     # all operators

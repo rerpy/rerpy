@@ -135,7 +135,7 @@ class Events(object):
     # is layered *on top* of index encoding/decoding, if that is in use. This
     # function also handles converting numpy scalars into equivalents that are
     # acceptable to sqlite.
-    def _encode_value(self, val):
+    def _encode_sql_value(self, val):
         if np.issubsctype(type(val), np.str_):
             return sqlite3.Binary(val)
         elif np.issubsctype(type(val), np.bool_):
@@ -148,14 +148,14 @@ class Events(object):
             return val
 
     # And reverse the transformation on the way out.
-    def _decode_value(self, val):
+    def _decode_sql_value(self, val):
         if isinstance(val, sqlite3.Binary):
             return str(val)
         else:
             return val
 
     def _execute(self, c, sql, args):
-        return c.execute(sql, [self._encode_value(arg) for arg in args])
+        return c.execute(sql, [self._encode_sql_value(arg) for arg in args])
 
     def _value_type_for_key(self, key):
         return self._key_types.get(key)
@@ -174,6 +174,14 @@ class Events(object):
             raise ValueError, ("Invalid value %r: "
                                "must be a string, number, bool, or None"
                                % (value,))
+
+    def _sql_value_to_value_type(self, sql_value, value_type):
+        # SQLite's type system discards the distinction between bools and
+        # ints, so we have to recover it on the way out.
+        if value_type == self.BOOL:
+            return bool(sql_value)
+        else:
+            return sql_value
 
     def _observe_value_for_key(self, key, value):
         value_type = self._value_type(value)
@@ -230,7 +238,7 @@ class Events(object):
         c = self._connection.cursor()
         code = "SELECT event_index FROM sys_events WHERE id = ?;"
         self._execute(c, code, (id,))
-        return self._decode_index(self._decode_value(c.fetchone()[0]))
+        return self._decode_index(self._decode_sql_value(c.fetchone()[0]))
 
     def _event_getitem(self, id, key):
         c = self._connection.cursor()
@@ -243,7 +251,8 @@ class Events(object):
             raise KeyError, key
         if row is None:
             raise KeyError, key
-        return self._decode_value(row[0])
+        return self._sql_value_to_value_type(self._decode_sql_value(row[0]),
+                                             self._key_types[key])
 
     def _event_setitem(self, id, key, value):
         self._ensure_table(key)
@@ -330,7 +339,7 @@ class Events(object):
     def __len__(self):
         c = self._connection.cursor()
         self._execute(c, "SELECT count(*) FROM sys_events;", [])
-        return self._decode_value(c.fetchone()[0])
+        return self._decode_sql_value(c.fetchone()[0])
 
     def __repr__(self):
         return "<%s object with %s entries>" % (self.__class__.__name__,
@@ -400,24 +409,26 @@ class EventSet(object):
             yield Event(self._events, db_id)
 
     def __getitem__(self, idx):
-        return Event(self._events, self._event_ids[idx])
-
-    # def __getitem__(self, key):
-    #     # In principle there is a cleverer way to do this using _query
-    #     # directly but it gets complicated to properly handle indexes, missing
-    #     # values, and detecting KeyErrors. So for now we'll just use brute
-    #     # force.
-    #     indexes = []
-    #     values = []
-    #     have_any_values = False
-    #     for ev in self:
-    #         indexes.append(ev.index)
-    #         if not have_any_values and key in ev:
-    #             have_any_values = True
-    #         values.append(ev.get(key, np.nan))
-    #     if not have_any_values:
-    #         raise KeyError, key
-    #     return pandas.Series(values, index=indexes)
+        if hasattr(idx, "__index__"):
+            return Event(self._events, self._event_ids[idx])
+        elif isinstance(idx, basestring):
+            # In principle there is a cleverer way to do this using _query
+            # directly but it gets complicated to properly handle indexes,
+            # missing values, and detecting KeyErrors. So for now we'll just
+            # use brute force.
+            indexes = []
+            values = []
+            have_any_values = False
+            for ev in self:
+                indexes.append(ev.index)
+                if not have_any_values and idx in ev:
+                    have_any_values = True
+                values.append(ev.get(idx, np.nan))
+            if not have_any_values:
+                raise KeyError, idx
+            return pandas.Series(values, index=indexes)
+        else:
+            raise TypeError, "don't know what to do with index"
 
     # def __setitem__(self, key, value):
     #     # XX we should probably support Series and ndarrays and stuff here
@@ -653,7 +664,7 @@ class Query(object):
                                 ["sys_events"],
                                 ["sys_events.id"])
         for (db_id,) in c:
-            yield self._events._decode_value(db_id)
+            yield self._events._decode_sql_value(db_id)
 
     def run(self):
         return EventSet(self._events, list(self._db_ids()))
