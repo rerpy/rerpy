@@ -38,6 +38,11 @@ setup(
                   ["pyrerp/_kutaslab.pyx"],
                   include_dirs=[np.get_include()],
                   ),
+        Extension("pyrerp._artifact",
+                  ["pyrerp/_artifact.pyx"],
+                  include_dirs=[np.get_include()],
+                  libraries=["m"],
+                  ),
         ],
     cmdclass={"build_ext": build_ext},
     )
