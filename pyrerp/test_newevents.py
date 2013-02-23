@@ -9,7 +9,8 @@ from pyrerp.newdata import Recording
 from nose.tools import assert_raises
 
 class MockRecording(object):
-    pass
+    def __init__(self, name=None):
+        self.name = name
 Recording.register(MockRecording)
 
 def test_Events_basic():
@@ -158,7 +159,7 @@ def test_Event_relative():
 def test_find():
     # all the different calling conventions
     e = Events()
-    r = MockRecording()
+    r = MockRecording("asdf")
     e.add_event(r, 0, 10, 11, {"a": 1, "b": True})
     e.add_event(r, 0, 20, 21, {"a": -1, "b": True})
 
@@ -169,10 +170,13 @@ def test_find():
     assert [ev.start_idx for ev in e.find({"a": 1, "b": False})] == []
     assert [ev.start_idx for ev in e.find({"b": True})] == [10, 20]
     assert [ev.start_idx for ev in e.find({"RECORDING": MockRecording()})] == []
+    assert [ev.start_idx for ev in e.find({"RECORDING": r})] == [10, 20]
     assert [ev.start_idx for ev in e.find({"SPAN_ID": 0})] == [10, 20]
     assert [ev.start_idx for ev in e.find({"SPAN_ID": 1})] == []
     assert [ev.start_idx for ev in e.find({"START_IDX": 10})] == [10]
     assert [ev.start_idx for ev in e.find({"STOP_IDX": 11})] == [10]
+    assert [ev.start_idx for ev in e.find({"RECORDING_NAME": "asdf"})] == [10, 20]
+    assert [ev.start_idx for ev in e.find({"RECORDING_NAME": "fdsa"})] == []
 
     assert [ev.start_idx for ev in e.find(e.placeholder["a"] == 1)] == [10]
 
@@ -346,5 +350,10 @@ def test_python_query_typechecking():
 #     # `and`
 #     # comma operator
 #     assert False
+
+def test_string_query():
+    e = Events()
+    r = MockRecording()
+    
 
 # recording_name

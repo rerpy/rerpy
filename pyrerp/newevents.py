@@ -91,6 +91,7 @@ _special_field_names = {
     "SPAN_ID": "span_id",
     "START_IDX": "start_idx",
     "STOP_IDX": "stop_idx",
+    "RECORDING_NAME": "_recording_name",
     }
 
 class Events(object):
@@ -254,9 +255,11 @@ class Events(object):
             c = self._connection.cursor()
             self._execute(c,
               "INSERT INTO sys_events "
-              "  (recording_id, span_id, start_idx, stop_idx, interval_magnitude) "
-              "values (?, ?, ?, ?, ?)",
-              [recording_id, span_id, start_idx, stop_idx, interval_magnitude])
+              "  (recording_id, span_id, start_idx, stop_idx,"
+              "   interval_magnitude, recording_name) "
+              "values (?, ?, ?, ?, ?, ?)",
+              [recording_id, span_id, start_idx, stop_idx, interval_magnitude,
+               recording.name])
             event_id = c.lastrowid
             for key, value in attributes.iteritems():
                 self._observe_value_for_key(key, value)
@@ -639,6 +642,10 @@ class PlaceholderEvent(object):
         return RecordingQuery(self._events)
 
     @property
+    def _recording_name(self):
+        return IndexFieldQuery(self._events, "recording_name")
+
+    @property
     def span_id(self):
         return IndexFieldQuery(self._events, "span_id")
 
@@ -854,7 +861,10 @@ class IndexFieldQuery(Query):
         return SqlWhere("sys_events.%s" % (self._field,), set(), [])
 
     def _value_type(self):
-        return self._events.NUMERIC
+        if self._field == "recording_name":
+            return self._events.BLOB
+        else:
+            return self._events.NUMERIC
 
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self._field)
