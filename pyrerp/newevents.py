@@ -12,6 +12,8 @@ import pandas
 from patsy import PatsyError
 from patsy.origin import Origin
 from patsy.parse_core import Token, Operator, parse
+# We need isinstance(..., Recording), but we don't do 'from ... import
+# Recording' because that would create a circular import:
 import pyrerp.newdata
 
 __all__ = ["Events", "EventsError"]
@@ -81,18 +83,18 @@ def _table_name(key):
     return "attr_" + _munge_name(key)
 
 # Keys that have a special magical meaning in dict-queries and
-# string-queries (and the placeholder object attribute which they map to).
+# string-queries (plus the actual database field name they map to).
 # In string queries these can be de-magicalified by quoting them with
 # backquotes, i.e.,:
-#   "SPAN_ID == 1"   -> placeholder.span_id == 1
-#   "`SPAN_ID` == 1" -> placeholder["SPAN_ID"] == 1
-_special_field_names = {
-    "RECORDING": "recording",
-    "SPAN_ID": "span_id",
-    "START_IDX": "start_idx",
-    "STOP_IDX": "stop_idx",
-    "RECORDING_NAME": "_recording_name",
-    }
+#   "SPAN_ID == 1"   <-> placeholder.span_id == 1
+#   "`SPAN_ID` == 1" <-> placeholder["SPAN_ID"] == 1
+_magic_query_strings = set(["RECORDING", "SPAN_ID", "START_IDX",
+                            "STOP_IDX", "RECORDING_NAME"])
+def _magic_query_string_to_query(events, name, origin=None):
+    if name == "RECORDING":
+        return RecordingQuery(events, origin)
+    else:
+        return IndexFieldQuery(events, name.lower(), origin)
 
 class Events(object):
     NUMERIC = "numeric"
@@ -341,9 +343,9 @@ class Events(object):
             p = self.placeholder
             query = self.ANY
             equalities = []
-            for (query_name, attr_name) in _special_field_names.iteritems():
-                if query_name in query_like:
-                    query &= (getattr(p, attr_name) == query_like.pop(query_name))
+            for query_name in _magic_query_strings.intersection(query_like):
+                q = _magic_query_string_to_query(self, query_name)
+                query &= (q == query_like.pop(query_name))
             for k, v in query_like.iteritems():
                 query &= (p[k] == v)
         elif isinstance(query_like, basestring):
@@ -642,10 +644,6 @@ class PlaceholderEvent(object):
         return RecordingQuery(self._events)
 
     @property
-    def _recording_name(self):
-        return IndexFieldQuery(self._events, "recording_name")
-
-    @property
     def span_id(self):
         return IndexFieldQuery(self._events, "span_id")
 
@@ -850,6 +848,10 @@ class RecordingQuery(Query):
     def __repr__(self):
         return "<%s>" % (self.__class__.__name__,)
 
+    @property
+    def name(self):
+        return IndexFieldQuery(self._events, "recording_name")
+
 class IndexFieldQuery(Query):
     def __init__(self, events, field, origin=None):
         Query.__init__(self, events, origin)
@@ -961,7 +963,7 @@ _text_ops = [
     ]
 _ops = _punct_ops + _text_ops
 
-_atomic = ["ATTR", "LITERAL", "INDEX_FIELD"]
+_atomic = ["ATTR", "LITERAL", "MAGIC_FIELD"]
 
 def _read_quoted_string(string, i):
     start = i
@@ -1045,8 +1047,10 @@ def _tokenize(string):
                 yield Token("LITERAL", origin, True)
             elif token.lower() == "false":
                 yield Token("LITERAL", origin, False)
-            elif token in _special_field_names:
-                yield Token("INDEX_FIELD", origin, _special_field_names[token])
+            elif token.lower() == "none":
+                yield Token("LITERAL", origin, None)
+            elif token in _magic_query_strings:
+                yield Token("MAGIC_FIELD", origin, token)
             else:
                 yield Token("ATTR", origin, token)
             i = match.end()
@@ -1089,8 +1093,9 @@ def _eval(events, tree):
         return LiteralQuery(events, tree.token.extra, tree.origin)
     elif tree.type == "ATTR":
         return AttrQuery(events, tree.token.extra, tree.origin)
-    elif tree.type == "INDEX_FIELD":
-        return IndexFieldQuery(events, tree.token.extra, tree.origin)
+    elif tree.type == "MAGIC_FIELD":
+        return _magic_query_string_to_query(events, tree.token.extra,
+                                              tree.origin)
     else:
         assert False
 

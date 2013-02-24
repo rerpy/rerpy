@@ -343,17 +343,54 @@ def test_python_query_typechecking():
 
     assert_raises(EventsError, e.find, p["e"])
 
-# def test_string_query():
-#     # all operators
-#     # quoting
-#     # INDEX versus `INDEX`
-#     # `and`
-#     # comma operator
-#     assert False
-
 def test_string_query():
     e = Events()
-    r = MockRecording()
-    
+    r1 = MockRecording("r1")
+    r2 = MockRecording("r2")
+    e.add_event(r1, 0, 10, 12,
+                {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
+    e.add_event(r2, 1, 20, 25,
+                {"a": 2, "b": "fdsa", "c": False, "d": 5.1, "e": 22,
+                 "f": "stuff", "RECORDING_NAME": "r100", "START_IDX": 10,
+                 "and": 33})
 
-# recording_name
+    def t(s, expected_start_indices):
+        result = e.find(s)
+        start_indices = [ev.start_idx for ev in result]
+        assert start_indices == expected_start_indices
+
+    # all operators
+    t("a == 2", [20])
+    t("a != 2", [10])
+    t("a < 2", [10])
+    t("a > 1", [20])
+    t("a <= 2", [10, 20])
+    t("a >= 1", [10, 20])
+    t("not (a > 1)", [10])
+    t("c", [10])
+    t("not c", [20])
+    t("has f", [20])
+    t("a == 1 and d > 1", [10])
+    t("a == 1 and d > 2", [])
+    t("a == 1 or d > 2", [10, 20])
+    t("1 == 1", [10, 20])
+
+    # quoting
+    t("b == \"asdf\"", [10])
+    t("b == \'asdf\'", [10])
+    t("`a` == 1", [10])
+    assert_raises(EventsError, e.find, "a == \"1\"")
+
+    # RECORDING_NAME and friends
+    t("RECORDING_NAME == 'r1'", [10])
+    t("RECORDING_NAME == 'r2'", [20])
+    t("SPAN_ID == 1", [20])
+    t("START_IDX < 15", [10])
+    t("STOP_IDX > 22", [20])
+
+    # backquotes 
+    t("has `RECORDING_NAME`", [20])
+    t("`RECORDING_NAME` == 'r100'", [20])
+    t("`START_IDX` == 10", [20])
+    t("`and` == 33", [20])
+    t("not has `and`", [10])
