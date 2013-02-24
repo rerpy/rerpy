@@ -86,15 +86,15 @@ def _table_name(key):
 # string-queries (plus the actual database field name they map to).
 # In string queries these can be de-magicalified by quoting them with
 # backquotes, i.e.,:
-#   "SPAN_ID == 1"   <-> placeholder.span_id == 1
-#   "`SPAN_ID` == 1" <-> placeholder["SPAN_ID"] == 1
-_magic_query_strings = set(["RECORDING", "SPAN_ID", "START_IDX",
-                            "STOP_IDX", "RECORDING_NAME"])
+#   "_SPAN_ID == 1"   <-> placeholder.span_id == 1
+#   "`_SPAN_ID` == 1" <-> placeholder["_SPAN_ID"] == 1
+_magic_query_strings = set(["_RECORDING", "_SPAN_ID", "_START_IDX",
+                            "_STOP_IDX", "_RECORDING_NAME"])
 def _magic_query_string_to_query(events, name, origin=None):
-    if name == "RECORDING":
+    if name == "_RECORDING":
         return RecordingQuery(events, origin)
     else:
-        return IndexFieldQuery(events, name.lower(), origin)
+        return IndexFieldQuery(events, name[1:].lower(), origin)
 
 class Events(object):
     NUMERIC = "numeric"

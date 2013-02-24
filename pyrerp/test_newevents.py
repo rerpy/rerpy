@@ -169,14 +169,14 @@ def test_find():
     assert [ev.start_idx for ev in e.find({"a": 1, "b": True})] == [10]
     assert [ev.start_idx for ev in e.find({"a": 1, "b": False})] == []
     assert [ev.start_idx for ev in e.find({"b": True})] == [10, 20]
-    assert [ev.start_idx for ev in e.find({"RECORDING": MockRecording()})] == []
-    assert [ev.start_idx for ev in e.find({"RECORDING": r})] == [10, 20]
-    assert [ev.start_idx for ev in e.find({"SPAN_ID": 0})] == [10, 20]
-    assert [ev.start_idx for ev in e.find({"SPAN_ID": 1})] == []
-    assert [ev.start_idx for ev in e.find({"START_IDX": 10})] == [10]
-    assert [ev.start_idx for ev in e.find({"STOP_IDX": 11})] == [10]
-    assert [ev.start_idx for ev in e.find({"RECORDING_NAME": "asdf"})] == [10, 20]
-    assert [ev.start_idx for ev in e.find({"RECORDING_NAME": "fdsa"})] == []
+    assert [ev.start_idx for ev in e.find({"_RECORDING": MockRecording()})] == []
+    assert [ev.start_idx for ev in e.find({"_RECORDING": r})] == [10, 20]
+    assert [ev.start_idx for ev in e.find({"_SPAN_ID": 0})] == [10, 20]
+    assert [ev.start_idx for ev in e.find({"_SPAN_ID": 1})] == []
+    assert [ev.start_idx for ev in e.find({"_START_IDX": 10})] == [10]
+    assert [ev.start_idx for ev in e.find({"_STOP_IDX": 11})] == [10]
+    assert [ev.start_idx for ev in e.find({"_RECORDING_NAME": "asdf"})] == [10, 20]
+    assert [ev.start_idx for ev in e.find({"_RECORDING_NAME": "fdsa"})] == []
 
     assert [ev.start_idx for ev in e.find(e.placeholder["a"] == 1)] == [10]
 
@@ -351,7 +351,7 @@ def test_string_query():
                 {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
     e.add_event(r2, 1, 20, 25,
                 {"a": 2, "b": "fdsa", "c": False, "d": 5.1, "e": 22,
-                 "f": "stuff", "RECORDING_NAME": "r100", "START_IDX": 10,
+                 "f": "stuff", "_RECORDING_NAME": "r100", "_START_IDX": 10,
                  "and": 33})
 
     def t(s, expected_start_indices):
@@ -382,15 +382,15 @@ def test_string_query():
     assert_raises(EventsError, e.find, "a == \"1\"")
 
     # RECORDING_NAME and friends
-    t("RECORDING_NAME == 'r1'", [10])
-    t("RECORDING_NAME == 'r2'", [20])
-    t("SPAN_ID == 1", [20])
-    t("START_IDX < 15", [10])
-    t("STOP_IDX > 22", [20])
+    t("_RECORDING_NAME == 'r1'", [10])
+    t("_RECORDING_NAME == 'r2'", [20])
+    t("_SPAN_ID == 1", [20])
+    t("_START_IDX < 15", [10])
+    t("_STOP_IDX > 22", [20])
 
     # backquotes 
-    t("has `RECORDING_NAME`", [20])
-    t("`RECORDING_NAME` == 'r100'", [20])
-    t("`START_IDX` == 10", [20])
+    t("has `_RECORDING_NAME`", [20])
+    t("`_RECORDING_NAME` == 'r100'", [20])
+    t("`_START_IDX` == 10", [20])
     t("`and` == 33", [20])
     t("not has `and`", [10])
