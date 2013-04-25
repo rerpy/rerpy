@@ -66,18 +66,13 @@ def approx_interval_magnitude(span):
         return 0
     magnitude = 1
     while magnitude * 2 < span:
-        magnitude *= 2 
+        magnitude *= 2
     return magnitude
 
 def test_approx_interval_magnitude():
-    assert approx_interval_magnitude(0) == 0
-    assert approx_interval_magnitude(1) == 1
-    assert approx_interval_magnitude(2) == 2
-    assert approx_interval_magnitude(3) == 2
-    assert approx_interval_magnitude(10) == 8
-    assert approx_interval_magnitude(100) == 64
-    assert approx_interval_magnitude(127) == 64
-    assert approx_interval_magnitude(128) == 128
+    for span in [0, 1, 2, 3, 10, 100, 127, 128, 129, 5000, 65536]:
+        M = approx_interval_magnitude(span)
+        assert M <= span <= 2 * M
 
 def _table_name(key):
     return "attr_" + _munge_name(key)
@@ -160,10 +155,9 @@ class Events(object):
 
     # Convert str's to buffer objects before passing them into sqlite, because
     # that is how you tell the sqlite3 module to store them as
-    # BLOBs. (sqlite3.Binary is an alias for 'buffer'.) This encoding/decoding
-    # is layered *on top* of index encoding/decoding, if that is in use. This
-    # function also handles converting numpy scalars into equivalents that are
-    # acceptable to sqlite.
+    # BLOBs. (sqlite3.Binary is an alias for 'buffer'.) This function also
+    # handles converting numpy scalars into equivalents that are acceptable to
+    # sqlite.
     def _encode_sql_value(self, val):
         if np.issubsctype(type(val), np.str_):
             return sqlite3.Binary(val)
@@ -272,6 +266,20 @@ class Events(object):
         self._incr_op_count()
         return Event(self, event_id)
 
+    def _move_event(self, id, offset):
+        # Fortunately, this operation doesn't change the magnitude of the
+        # span, so it's relatively simple to implement -- we can just update
+        # the start_idx and stop_idx directly without having to worry about
+        # the complexities of interval_magnitudes.
+        with self._connection:
+            c = self._connection.cursor()
+            self._execute(c,
+                          "UPDATE sys_events "
+                          "SET start_idx = start_idx + ?, "
+                          "    stop_idx = stop_idx + ? "
+                          "WHERE id = ?",
+                          [offset, offset, id])
+
     def _delete_event(self, id):
         with self._connection:
             c = self._connection.cursor()
@@ -308,7 +316,7 @@ class Events(object):
         with self._connection:
             c = self._connection.cursor()
             table = _table_name(key)
-            self._observe_value_for_key(key, value)        
+            self._observe_value_for_key(key, value)
             self._execute(c,
                           "UPDATE %s SET value = ? WHERE event_id = ?;"
                             % (table,),
@@ -468,23 +476,21 @@ class EventSet(object):
         if hasattr(idx, "__index__"):
             return Event(self._events, self._event_ids[idx])
         elif isinstance(idx, basestring):
-            # In principle there is a cleverer way to do this using _query
-            # directly but it gets complicated to properly handle indexes,
-            # missing values, and detecting KeyErrors. So for now we'll just
-            # use brute force.
-            indexes = []
-            values = []
-            have_any_values = False
-            for ev in self:
-                indexes.append((ev.recording, ev.span_id, ev.start_idx))
-                if not have_any_values and idx in ev:
-                    have_any_values = True
-                values.append(ev.get(idx, np.nan))
-            if not have_any_values:
-                raise KeyError, idx
-            return pandas.Series(values, index=indexes)
+            # This will raise a KeyError for any events where the field is
+            # just undefined, and will return None otherwise. This could be
+            # done more efficiently by querying the database directly, but
+            # let's not fret about that until it matters.
+            values = [ev[idx] for ev in self]
+            # We use pandas.Series here because it has much more sensible
+            # NaN/None handling than raw numpy.
+            #   np.asarray([None, 1, 2]) -> object (!) array
+            #   np.asarray([np.nan, "a", "b"]) -> ["nan", "a", "b"] (!)
+            # but
+            #   pandas.Series([None, 1, 2]) -> [nan, 1, 2]
+            #   pandas.Series([None, "a", "b"]) -> [None, "a", "b"]
+            return pandas.Series(values)
         else:
-            raise TypeError, "don't know what to do with index"
+            raise TypeError, "index must be an integer or string"
 
     # def __setitem__(self, key, value):
     #     # XX we should probably support Series and ndarrays and stuff here
@@ -492,11 +498,26 @@ class EventSet(object):
     #     # things like
     #     #   my_set["foo"] = my_set.next(query)["foo"]
     #     # and make sure that nan gets mapped to deleting the value
+    #     # ...though this would require that my_set.next() be indexed by the
+    #     # same events in my_set, not the events in my_set.next(). Is that
+    #     # good or bad?
     #     xx
 
     def update(self, d):
         for ev in self:
             ev.update(d)
+
+    def __repr__(self):
+        return "<%s with %s events>" % (self.__class__.__name__,
+                                        len(self._db_ids))
+
+    def _repr_pretty_(self, p, cycle):
+        assert not cycle
+        p.begin_group(2, "<%s with %s events:" % (self.__class__.__name__,
+                                                  len(self._db_ids)))
+        p.breakable()
+        p.pretty(list(self))
+        p.end_group(2, ">")
 
 class Event(object):
     def __init__(self, events, id):
@@ -553,7 +574,7 @@ class Event(object):
                 yield key, self[key]
             except KeyError:
                 continue
-            
+
     # Everything else is defined in terms of the above methods.
 
     def update(self, d):
@@ -608,7 +629,7 @@ class Event(object):
         p.breakable()
         p.pretty(dict(self.iteritems()))
         p.end_group(2, ">")
-            
+
     def relative(self, count, query={}):
         """Counts 'count' events forward or back from the current event (or
         optionally, only events that match 'query'), and returns that. Use
@@ -625,6 +646,11 @@ class Event(object):
         else:
             query &= (p.start_idx < self.start_idx)
             return query.run()[count]
+
+    def move(self, offset):
+        """Shifts this event's timestamp by 'offset' samples (positive for
+        forward, negative for backward)."""
+        self._events._move_event(self._id, offset)
 
 ###############################################
 #
@@ -785,7 +811,7 @@ class LiteralQuery(Query):
                 raise EventsError("literals must be boolean, string, numeric, "
                                   "or None",
                                   self)
-            
+
     def _sql_where(self):
         return SqlWhere("?", set(), [self._value])
 
@@ -822,7 +848,7 @@ class HasKeyQuery(Query):
         # makes a typo then this will create an empty table, but creating a
         # table by itself is a total no-op at the data level, so whatever.
         self._events._ensure_table_for_key(self._key)
-        
+
     def _sql_where(self):
         table_id = _table_name(self._key)
         return SqlWhere("EXISTS (SELECT 1 FROM %s inner_table "
@@ -919,7 +945,7 @@ class QueryOperator(Query):
         self._sql_op = sql_op
         assert 1 <= len(children) <= 2
         self._children = children
-        
+
     def _sql_where(self):
         lhs_sqlwhere = self._children[0]._sql_where()
         if len(self._children) == 1:

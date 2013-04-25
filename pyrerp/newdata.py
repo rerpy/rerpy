@@ -108,6 +108,7 @@ class DataFormat(object):
         return transform
 
 class Recording(object):
+    # This is an abstract base class
     __metaclass__ = abc.ABCMeta
 
     # It's expected that implementations of this interface will provide
@@ -218,13 +219,29 @@ class DataSet(object):
     def span_items(self):
         for recording in self._recordings:
             for (span_id, in_data) in recording.span_items():
-                yield (recording, span_id), data
+                yield (recording, span_id), self._transform_data(data)
 
     def span_values(self):
         for _, data in self.span_items():
             yield data
 
-    def rerp(self,
+    # For each event type, need:
+    #   name/tag
+    #   query
+    #   formula
+    #   start time, stop time
+    def rerp(self, event_query, start_time, stop_time, formula,
              artifact_query="has _ARTIFACT_TYPE",
-             artifact_type_field="_ARTIFACT_TYPE"):
+             artifact_type_field="_ARTIFACT_TYPE",
+             overlap_correction="if-needed"):
+        rerp_specs = [("", event_query, start_time, stop_time, formula)]
+        return self.multi_rerp(rerp_specs,
+                               artifact_query=artifact_query,
+                               artifact_type_field=artifact_type_field,
+                               overlap_correction=overlap_correction)
+
+    def multi_rerp(self, rerp_specs,
+                   artifact_query="has _ARTIFACT_TYPE",
+                   artifact_type_field="_ARTIFACT_TYPE",
+                   overlap_correction="if-needed"):
         pass

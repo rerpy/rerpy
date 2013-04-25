@@ -259,7 +259,7 @@ class Events(object):
         with self._connection:
             c = self._connection.cursor()
             table = _table_name(key)
-            self._observe_value_for_key(key, value)        
+            self._observe_value_for_key(key, value)
             self._execute(c,
                           "UPDATE %s SET value = ? WHERE event_id = ?;"
                             % (table,),
@@ -442,6 +442,18 @@ class EventSet(object):
         for ev in self:
             ev.update(d)
 
+    def __repr__(self):
+        return "<%s with %s events>" % (self.__class__.__name__,
+                                        len(self._db_ids))
+
+    def _repr_pretty_(self, p, cycle):
+        assert not cycle
+        p.begin_group(2, "<%s with %s events:" % (self.__class__.__name__,
+                                                  len(self._db_ids)))
+        p.breakable()
+        p.pretty(list(self))
+        p.end_group(2, ">")
+
 class Event(object):
     def __init__(self, events, id):
         self._events = events
@@ -472,7 +484,7 @@ class Event(object):
                 yield key, self[key]
             except KeyError:
                 continue
-            
+
     # Everything else is defined in terms of the above methods.
 
     def update(self, d):
@@ -525,7 +537,7 @@ class Event(object):
         p.breakable()
         p.pretty(dict(self.iteritems()))
         p.end_group(2, ">")
-            
+
     def relative(self, count, query={}):
         """Counts 'count' events forward or back from the current event (or
         optionally, only events that match 'query'), and returns that. Use
@@ -736,7 +748,7 @@ class QueryOperator(Query):
         self._sql_op = sql_op
         assert 1 <= len(children) <= 2
         self._children = children
-        
+
     def _sql_where(self):
         lhs_sqlwhere = self._children[0]._sql_where()
         if len(self._children) == 1:

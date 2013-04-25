@@ -147,7 +147,7 @@ def test_Event_relative():
     ev10 = e.add_event(r, 0, 10, 11, {"a": 10})
     ev30 = e.add_event(r, 0, 30, 31, {"a": 30})
     ev40 = e.add_event(r, 0, 40, 41, {"a": 40, "extra": True})
-    
+
     assert ev20.relative(1)["a"] == 30
     assert_raises(IndexError, ev20.relative, 0)
     assert ev20.relative(-1)["a"] == 10
@@ -155,6 +155,25 @@ def test_Event_relative():
     assert ev30.relative(-2)["a"] == 10
     assert ev10.relative(1, "extra")["a"] == 20
     assert ev10.relative(2, "extra")["a"] == 40
+
+def test_Event_move():
+    e = Events()
+    r = MockRecording()
+    ev20 = e.add_event(r, 0, 20, 21, {"a": 20, "extra": True})
+    ev10 = e.add_event(r, 0, 10, 15, {"a": 10})
+    assert ev20.start_idx == 20
+    assert ev20.stop_idx == 21
+    assert ev20.relative(-1)["a"] == 10
+    ev20.move(-15)
+    assert ev20.start_idx == 5
+    assert ev20.stop_idx == 6
+    assert ev20.relative(1)["a"] == 10
+
+    assert ev10.start_idx == 10
+    assert ev10.stop_idx == 15
+    ev10.move(5)
+    assert ev10.start_idx == 15
+    assert ev10.stop_idx == 20
 
 def test_find():
     # all the different calling conventions
@@ -183,9 +202,9 @@ def test_find():
 def test_EventSet():
     e = Events()
     r = MockRecording()
-    e.add_event(r, 0, 10, 11, {"a": 1, "b": True})
+    e.add_event(r, 0, 10, 11, {"a": 1, "b": True, "c": None})
     e.add_event(r, 0, 20, 21, {"a": -1, "b": True})
-    e.add_event(r, 0, 15, 16, {"a": -1, "b": False})
+    e.add_event(r, 0, 15, 16, {"a": -1, "b": False, "c": 1})
     es = e.find()
     assert es[0].start_idx == 10
     assert es[1].start_idx == 15
@@ -193,18 +212,14 @@ def test_EventSet():
     assert es[-1].start_idx == 20
     assert_raises(IndexError, es.__getitem__, 3)
     a_series = es["a"]
-    assert a_series.index[0] == (r, 0, 10)
-    assert a_series.index[1] == (r, 0, 15)
-    assert a_series.index[2] == (r, 0, 20)
     assert np.all(a_series == [1, -1, -1])
     assert a_series.dtype == np.dtype(int)
     b_series = es["b"]
-    assert b_series.index[0] == (r, 0, 10)
-    assert b_series.index[1] == (r, 0, 15)
-    assert b_series.index[2] == (r, 0, 20)
     assert np.all(b_series == [True, False, True])
     assert b_series.dtype == np.dtype(bool)
     assert_raises(KeyError, es.__getitem__, "c")
+    # Make sure that both None and flat-out missing values are handled
+    # correctly:
 
 def test_python_query():
     # all operators
@@ -324,7 +339,7 @@ def test_python_query_typechecking():
     r = MockRecording()
     e.add_event(r, 0, 10, 11,
                 {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
-    
+
     p = e.placeholder
 
     assert list(e.find(p["e"] == 1)) == []
@@ -388,7 +403,7 @@ def test_string_query():
     t("_START_IDX < 15", [10])
     t("_STOP_IDX > 22", [20])
 
-    # backquotes 
+    # backquotes
     t("has `_RECORDING_NAME`", [20])
     t("`_RECORDING_NAME` == 'r100'", [20])
     t("`_START_IDX` == 10", [20])
