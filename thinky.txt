@@ -1,3 +1,26 @@
+formats:
+  Python code for reading .cnt (NeuroScan) files (no license but could
+  easily rewrite or email about):
+    https://github.com/UMDLinguistics/eeg-cnt/blob/master/cnt2h5.py
+  EDF/BDF (C code, BSD):
+    http://www.teuniz.net/edflib/
+  ERPLAB (b/c it would be an excellent first demo to import these and
+  let people reproduce their previous analysis):
+    http://erpinfo.org/erplab/erplab-documentation/manual/Binlister.html
+    http://erpinfo.org/erplab/erplab-documentation/manual/Epoching_Bins.html
+      (this has a description at the bottom of how artifacts are
+      recorded etc.)
+    http://erpinfo.org/erplab/erplab-documentation/manual/Background_and_Structures.html
+
+  ERPLAB is also a useful *export* target for rERP waveforms, for
+    plotting etc.
+
+  Some MEG format reader (whatever they use at UMD) (GPL):
+    https://github.com/pealco/Cephalo
+
+  Channel location files (with samples!):
+    http://sccn.ucsd.edu/eeglab/channellocation.html
+
 pandas memory overhead:
 created some pickle files containing a full multiindex+colnames data
 set, the same as a raw ndarray, and the same with colname

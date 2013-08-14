@@ -6,6 +6,16 @@
 
 # mxflat is done
 
+# Though according to
+#   http://erpinfo.org/erplab/erplab-documentation/manual/Artifact_Detection.html
+# the best way to detect blocking is by counting total values within some
+#   range of the max/min (ignoring contiguity)
+
+# cheap sliding window calculation of max/min:
+#   http://stackoverflow.com/questions/12190184/can-min-max-of-moving-window-achieve-in-on
+# useful for ppa, also there may be some trick to compute the count of items
+# within a threshold of the max/min... not sure
+
 # for ppa, this can be done with scipy.ndimage.maximum_filter1d,
 # minimum_filter1d (with mode="nearest")
 

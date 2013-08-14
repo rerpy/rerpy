@@ -5,69 +5,74 @@
 import cPickle
 import numpy as np
 from pyrerp.events import Events, EventsError
+from pyrerp.data import Recording
 from nose.tools import assert_raises
+
+class MockRecording(object):
+    def __init__(self, name=None):
+        self.name = name
+Recording.register(MockRecording)
 
 def test_Events_basic():
     # load/store of different types
     # errors on type mismatches
     # storing None
-    e = Events(int)
-    ev1 = e.add_event(10, {"a": 1, "b": "hello", "c": True})
-    assert ev1.index == 10
+    e = Events()
+    r = MockRecording()
+    ev1 = e.add_event(r, 0, 10, 11, {"a": 1, "b": "hello", "c": True})
+    assert ev1.recording is r
+    assert ev1.span_id == 0
+    assert ev1.start_idx == 10
+    assert ev1.stop_idx == 11
     assert ev1["a"] == 1
     assert ev1["b"] == "hello"
     assert ev1["c"] == True
     assert type(ev1["a"]) == int
     assert type(ev1["b"]) == str
     assert type(ev1["c"]) == bool
+    assert dict(ev1) == {"a": 1, "b": "hello", "c": True}
     ev1["a"] = 2
     assert ev1["a"] == 2
-    assert_raises(ValueError, e.add_event, 20, {"a": "string"})
-    assert_raises(ValueError, e.add_event, 20, {"a": True})
-    assert_raises(ValueError, e.add_event, 20, {"b": 10})
-    assert_raises(ValueError, e.add_event, 20, {"b": True})
-    assert_raises(ValueError, e.add_event, 20, {"c": 10})
-    assert_raises(ValueError, e.add_event, 20, {"c": "string"})
+    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"a": "string"})
+    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"a": True})
+    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"b": 10})
+    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"b": True})
+    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"c": 10})
+    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"c": "string"})
     ev1["a"] = None
     assert ev1["a"] is None
     ev1["xxx"] = None
-    ev2 = e.add_event(11, {"xxx": 3})
-    assert_raises(ValueError, e.add_event, 20, {"xxx": "string"})
-    assert_raises(ValueError, e.add_event, 20, {"xxx": True})
+    ev2 = e.add_event(r, 0, 11, 12, {"xxx": 3})
+    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"xxx": "string"})
+    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"xxx": True})
     assert ev2["xxx"] == 3
-    assert ev2.index == 11
+    assert ev2.start_idx == 11
     assert ev1["xxx"] is None
 
     e_pick = cPickle.loads(cPickle.dumps(e))
     ev1_pick, ev2_pick = list(e_pick)
-    assert ev1_pick.index == ev1.index
+    assert isinstance(ev1_pick.recording, MockRecording)
+    assert ev1_pick.span_id == 0
+    assert ev1_pick.start_idx == 10
+    assert ev1_pick.stop_idx == 11
     assert ev1_pick.items() == ev1.items()
-    assert ev2_pick.index == ev2.index
+    assert isinstance(ev2_pick.recording, MockRecording)
+    assert ev2_pick.span_id == 0
+    assert ev2_pick.start_idx == 11
+    assert ev2_pick.stop_idx == 12
     assert ev2_pick.items() == ev2.items()
-
-def test_index_encoding():
-    e = Events((int, int))
-    tests = [(0, 0), (10, 10), (0, -1), (-1, 10),
-             (0, 1000), (1000, 0), (2**32, 2**31)]
-    for t in tests:
-        assert e._decode_index(e._encode_index(t)) == t
-    encoded_tests = [e._encode_index(t) for t in tests]
-    assert [e._decode_index(t) for t in sorted(encoded_tests)] == sorted(tests)
-
-    e2 = Events((str, int))
-    tests = [("a", 0), ("aa", 10), ("ba", 1000), ("bb", 0), ("zz", 2**30)]
-    for t in tests:
-        assert e2._decode_index(e2._encode_index(t)) == t
-    encoded_tests = [e2._encode_index(t) for t in tests]
-    assert [e2._decode_index(t) for t in sorted(encoded_tests)] == sorted(tests)
 
 def test_Event():
     # set/get/del, index
     # dict methods
-    e = Events(int)
+    e = Events()
+    r = MockRecording()
     d = {"a": 1, "b": "hello", "c": True}
-    ev1 = e.add_event(10, d)
-    assert ev1.index == 10
+    ev1 = e.add_event(r, 1, 10, 12, d)
+    assert ev1.recording is r
+    assert ev1.span_id == 1
+    assert ev1.start_idx == 10
+    assert ev1.stop_idx == 12
     assert dict(ev1.iteritems()) == d
     ev1["added"] = True
     assert ev1["added"] == True
@@ -91,6 +96,24 @@ def test_Event():
     assert list(ev1.itervalues()) == ev1.values()
     assert list(ev1.iteritems()) == ev1.items()
 
+    assert ev1.has_key("a")
+    assert not ev1.has_key("z")
+
+    assert ev1.overlaps(ev1)
+    assert not ev1.overlaps(MockRecording(), 1, 9, 11)
+    assert not ev1.overlaps(r, 0, 9, 11)
+    assert ev1.overlaps(r, 1, 9, 11)
+    assert ev1.overlaps(r, 1, 10, 12)
+    assert ev1.overlaps(r, 1, 10, 11)
+    assert ev1.overlaps(r, 1, 11, 12)
+    assert not ev1.overlaps(r, 1, 0, 2)
+    assert not ev1.overlaps(r, 1, 100, 102)
+    # Check half-openness
+    assert not ev1.overlaps(r, 0, 9, 10)
+    assert not ev1.overlaps(r, 0, 12, 15)
+    # Nothing overlaps an empty interval
+    assert not ev1.overlaps(r, 0, 11, 11)
+
     assert len(e) == 1
     ev1.delete()
     assert len(e) == 0
@@ -101,177 +124,228 @@ def test_Event():
 
 def test_misc_queries():
     # ANY, at, __iter__, __len__
-    e = Events(int)
-    e.add_event(20, {"a": -1})
-    e.add_event(10, {"a": 1})
-    e.add_event(30, {"a": 100})
+    e = Events()
+    r = MockRecording()
+    e.add_event(r, 0, 20, 21, {"a": -1})
+    e.add_event(r, 0, 10, 11, {"a": 1})
+    e.add_event(r, 0, 30, 31, {"a": 100})
     assert len(e) == 3
     # Always sorted by index:
-    assert [ev.index for ev in e] == [10, 20, 30]
-    assert [ev.index for ev in e.find(e.ANY)] == [10, 20, 30]
-    assert len(e.at(10)) == 1
-    assert e.at(10)[0]["a"] == 1
-    assert len(e.at(20)) == 1
-    assert e.at(20)[0]["a"] == -1
-    assert e.at(15) == []
+    assert [ev.start_idx for ev in e] == [10, 20, 30]
+    assert [ev.start_idx for ev in e.find(e.ANY)] == [10, 20, 30]
+    assert len(e.at(r, 0, 10)) == 1
+    assert e.at(r, 0, 10)[0]["a"] == 1
+    assert len(e.at(r, 0, 20)) == 1
+    assert e.at(r, 0, 20)[0]["a"] == -1
+    assert len(e.at(r, 0, 15)) == 0
+    assert len(e.at(r, 0, 15, 40)) == 2
 
 def test_Event_relative():
-    e = Events(int)
-    e.add_event(20, {"a": 20, "extra": True})
-    e.add_event(10, {"a": 10})
-    e.add_event(30, {"a": 30})
-    e.add_event(40, {"a": 40, "extra": True})
-    
-    ev20 = e.at(20)[0]
+    e = Events()
+    r = MockRecording()
+    ev20 = e.add_event(r, 0, 20, 21, {"a": 20, "extra": True})
+    ev10 = e.add_event(r, 0, 10, 11, {"a": 10})
+    ev30 = e.add_event(r, 0, 30, 31, {"a": 30})
+    ev40 = e.add_event(r, 0, 40, 41, {"a": 40, "extra": True})
+
     assert ev20.relative(1)["a"] == 30
     assert_raises(IndexError, ev20.relative, 0)
     assert ev20.relative(-1)["a"] == 10
-    ev10 = e.at(10)[0]
     assert ev10.relative(2)["a"] == 30
-    ev30 = e.at(30)[0]
     assert ev30.relative(-2)["a"] == 10
     assert ev10.relative(1, "extra")["a"] == 20
     assert ev10.relative(2, "extra")["a"] == 40
 
+def test_Event_move():
+    e = Events()
+    r = MockRecording()
+    ev20 = e.add_event(r, 0, 20, 21, {"a": 20, "extra": True})
+    ev10 = e.add_event(r, 0, 10, 15, {"a": 10})
+    assert ev20.start_idx == 20
+    assert ev20.stop_idx == 21
+    assert ev20.relative(-1)["a"] == 10
+    ev20.move(-15)
+    assert ev20.start_idx == 5
+    assert ev20.stop_idx == 6
+    assert ev20.relative(1)["a"] == 10
+
+    assert ev10.start_idx == 10
+    assert ev10.stop_idx == 15
+    ev10.move(5)
+    assert ev10.start_idx == 15
+    assert ev10.stop_idx == 20
+
 def test_find():
     # all the different calling conventions
-    e = Events(int)
-    e.add_event(10, {"a": 1, "b": True})
-    e.add_event(20, {"a": -1, "b": True})
+    e = Events()
+    r = MockRecording("asdf")
+    e.add_event(r, 0, 10, 11, {"a": 1, "b": True})
+    e.add_event(r, 0, 20, 21, {"a": -1, "b": True})
 
-    assert [ev.index for ev in e.find()] == [10, 20]
+    assert [ev.start_idx for ev in e.find()] == [10, 20]
 
-    assert [ev.index for ev in e.find({"a": 1})] == [10]
-    assert [ev.index for ev in e.find({"a": 1, "b": True})] == [10]
-    assert [ev.index for ev in e.find({"a": 1, "b": False})] == []
-    assert [ev.index for ev in e.find({"b": True})] == [10, 20]
-    
-    assert [ev["a"] for ev in e.find({"INDEX": 10})] == [1]
-    assert [ev["a"] for ev in e.find({"INDEX": 20})] == [-1]
-    assert [ev["a"] for ev in e.find({"INDEX": 20, "b": False})] == []
+    assert [ev.start_idx for ev in e.find({"a": 1})] == [10]
+    assert [ev.start_idx for ev in e.find({"a": 1, "b": True})] == [10]
+    assert [ev.start_idx for ev in e.find({"a": 1, "b": False})] == []
+    assert [ev.start_idx for ev in e.find({"b": True})] == [10, 20]
+    assert [ev.start_idx for ev in e.find({"_RECORDING": MockRecording()})] == []
+    assert [ev.start_idx for ev in e.find({"_RECORDING": r})] == [10, 20]
+    assert [ev.start_idx for ev in e.find({"_SPAN_ID": 0})] == [10, 20]
+    assert [ev.start_idx for ev in e.find({"_SPAN_ID": 1})] == []
+    assert [ev.start_idx for ev in e.find({"_START_IDX": 10})] == [10]
+    assert [ev.start_idx for ev in e.find({"_STOP_IDX": 11})] == [10]
+    assert [ev.start_idx for ev in e.find({"_RECORDING_NAME": "asdf"})] == [10, 20]
+    assert [ev.start_idx for ev in e.find({"_RECORDING_NAME": "fdsa"})] == []
+
+    assert [ev.start_idx for ev in e.find(e.placeholder["a"] == 1)] == [10]
 
 def test_EventSet():
-    e = Events(int)
-    e.add_event(10, {"a": 1, "b": True})
-    e.add_event(20, {"a": -1, "b": True})
-    e.add_event(15, {"a": -1, "b": False})
+    e = Events()
+    r = MockRecording()
+    e.add_event(r, 0, 10, 11, {"a": 1, "b": True, "c": None})
+    e.add_event(r, 0, 20, 21, {"a": -1, "b": True})
+    e.add_event(r, 0, 15, 16, {"a": -1, "b": False, "c": 1})
     es = e.find()
-    assert es[0].index == 10
-    assert es[1].index == 15
-    assert es[2].index == 20
-    assert es[-1].index == 20
+    assert es[0].start_idx == 10
+    assert es[1].start_idx == 15
+    assert es[2].start_idx == 20
+    assert es[-1].start_idx == 20
     assert_raises(IndexError, es.__getitem__, 3)
     a_series = es["a"]
-    assert np.all(a_series.index == [10, 15, 20])
     assert np.all(a_series == [1, -1, -1])
     assert a_series.dtype == np.dtype(int)
     b_series = es["b"]
-    assert np.all(b_series.index == [10, 15, 20])
     assert np.all(b_series == [True, False, True])
     assert b_series.dtype == np.dtype(bool)
     assert_raises(KeyError, es.__getitem__, "c")
+    # Make sure that both None and flat-out missing values are handled
+    # correctly:
 
 def test_python_query():
     # all operators
     # types (esp. including None)
     # index
-    e = Events(int)
-    e.add_event(10, {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
-    e.add_event(-10, {"a": -1, "b": "fdsa", "c": False, "d": -3.14, "e": None})
-    e.add_event(20, {"a": 1, "b": "asdf", "c": False, "d": -3.14, "e": 123,
-                     "INDEX": 10})
+    e = Events()
+    r1 = MockRecording()
+    r2 = MockRecording()
+    ev10 = e.add_event(r1, 0, 10, 11,
+                       {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
+    ev20 = e.add_event(r1, 1, 20, 25,
+                       {"a": -1, "b": "fdsa", "c": False, "d": -3.14, "e": None})
+    ev21 = e.add_event(r2, 0, 21, 26,
+                       {"a": 1, "b": "asdf", "c": False, "d": -3.14, "e": 123})
 
     p = e.placeholder
     def t(q, expected):
-        assert [ev.index for ev in e.find(q)] == expected
+        assert [ev.start_idx for ev in e.find(q)] == expected
 
-    t(p.index == 10, [10])
-    t(p.index != 10, [-10, 20])
-    t(p.index < 10, [-10])
-    t(p.index > 10, [20])
-    t(p.index >= 10, [10, 20])
-    t(p.index <= 10, [-10, 10])
-    t(~(p.index == 10), [-10, 20])
-    t(~(p.index != 10), [10])
+    t(p.start_idx == 10, [10])
+    t(p.start_idx != 10, [20, 21])
+    t(p.start_idx < 10, [])
+    t(p.start_idx > 10, [20, 21])
+    t(p.start_idx >= 20, [20, 21])
+    t(p.start_idx <= 20, [10, 20])
+    t(~(p.start_idx == 20), [10, 21])
+    t(~(p.start_idx != 20), [20])
 
-    t(p["a"] == 1, [10, 20])
-    t(p["a"] != 1, [-10])
-    t(p["a"] < 1, [-10])
+    t(p.recording == r1, [10, 20])
+    t(p.recording == r2, [21])
+    assert_raises(EventsError, p.recording.__eq__, 1)
+    assert_raises(EventsError, p.start_idx.__eq__, r1)
+
+    t(p["a"] == 1, [10, 21])
+    t(p["a"] != 1, [20])
+    t(p["a"] < 1, [20])
     t(p["a"] > 1, [])
-    t(p["a"] >= 1, [10, 20])
-    t(p["a"] <= 1, [-10, 10, 20])
-    t(~(p["a"] == 1), [-10])
-    t(~(p["a"] != 1), [10, 20])
+    t(p["a"] >= 1, [10, 21])
+    t(p["a"] <= 1, [10, 20, 21])
+    t(~(p["a"] == 1), [20])
+    t(~(p["a"] != 1), [10, 21])
     t(p["a"] == 1.5, [])
-    t(p["a"] < 1.5, [-10, 10, 20])
-    t(p["a"] < 0.5, [-10])
-    t(p["a"] > 0.5, [10, 20])
+    t(p["a"] < 1.5, [10, 20, 21])
+    t(p["a"] < 0.5, [20])
+    t(p["a"] > 0.5, [10, 21])
 
-    t(p["b"] == "asdf", [10, 20])
-    t(p["b"] != "asdf", [-10])
+    t(p["b"] == "asdf", [10, 21])
+    t(p["b"] != "asdf", [20])
     t(p["b"] < "asdf", [])
-    t(p["b"] > "asdf", [-10])
-    t(p["b"] >= "asdf", [-10, 10, 20])
-    t(p["b"] <= "asdf", [10, 20])
-    t(p["b"] <= "b", [10, 20])
-    t(p["b"] >= "b", [-10])
-    t(~(p["b"] == "asdf"), [-10])
-    t(~(p["b"] != "asdf"), [10, 20])
+    t(p["b"] > "asdf", [20])
+    t(p["b"] >= "asdf", [10, 20, 21])
+    t(p["b"] <= "asdf", [10, 21])
+    t(p["b"] <= "b", [10, 21])
+    t(p["b"] >= "b", [20])
+    t(~(p["b"] == "asdf"), [20])
+    t(~(p["b"] != "asdf"), [10, 21])
 
     t(p["c"] == True, [10])
-    t(p["c"] != True, [-10, 20])
-    t(p["c"] == False, [-10, 20])
+    t(p["c"] != True, [20, 21])
+    t(p["c"] == False, [20, 21])
     t(p["c"] != False, [10])
     t(p["c"], [10])
-    t(~p["c"], [-10, 20])
-    t(p["c"] < True, [-10, 20])
-    t(p["c"] <= True, [-10, 10, 20])
+    t(~p["c"], [20, 21])
+    t(p["c"] < True, [20, 21])
+    t(p["c"] <= True, [10, 20, 21])
     t(p["c"] > True, [])
     t(p["c"] > False, [10])
-    t(p["c"] >= False, [-10, 10, 20])
-    t(~(p["c"] == True), [-10, 20])
+    t(p["c"] >= False, [10, 20, 21])
+    t(~(p["c"] == True), [20, 21])
     t(~(p["c"] != True), [10])
 
     t(p["d"] == 1.5, [10])
-    t(p["d"] != 1.5, [-10, 20])
-    t(p["d"] < 1.5, [-10, 20])
+    t(p["d"] != 1.5, [20, 21])
+    t(p["d"] < 1.5, [20, 21])
     t(p["d"] > 1.5, [])
     t(p["d"] >= 1.5, [10])
-    t(p["d"] <= 1.5, [-10, 10, 20])
-    t(~(p["d"] == 1.5), [-10, 20])
+    t(p["d"] <= 1.5, [10, 20, 21])
+    t(~(p["d"] == 1.5), [20, 21])
     t(~(p["d"] != 1.5), [10])
     t(p["d"] == 1, [])
-    t(p["d"] < 10, [-10, 10, 20])
-    t(p["d"] < 1, [-10, 20])
+    t(p["d"] < 10, [10, 20, 21])
+    t(p["d"] < 1, [20, 21])
     t(p["d"] > 1, [10])
 
-    t(p["e"] == None, [-10, 10])
-    t(p["e"] != None, [20])
+    t(p["e"] == None, [10, 20])
+    t(p["e"] != None, [21])
 
-    t(p.has_key("e"), [20])
-    t(~p.has_key("e"), [-10, 10])
+    t(p.has_key("e"), [10, 20, 21])
+    t(~p.has_key("e"), [])
 
-    t(p["INDEX"] == 10, [20])
-    t(p["INDEX"] != 10, [])
+    t(p["nonexistent"] == 10, [])
+    t(p["nonexistent"] != 10, [])
+    t(p["nonexistent"] == None, [])
+    t(p.has_key("nonexistent"), [])
+    t(~p.has_key("nonexistent"), [10, 20, 21])
 
-    t(p["a"] > p["d"], [-10, 20])
+    t(p["a"] > p["d"], [20, 21])
     t(p["a"] < p["d"], [10])
 
-    t((p.index < 20) & (p["a"] == 1), [10])
-    t((p.index < 20) | (p["a"] == 1), [-10, 10, 20])
-    t(~((p.index < 20) & (p["a"] == 1)), [-10, 20])
-    t(~((p.index < 20) | (p["a"] == 1)), [])
+    t((p.start_idx < 21) & (p["a"] == 1), [10])
+    t((p.start_idx < 21) | (p["a"] == 1), [10, 20, 21])
+    t(~((p.start_idx < 21) & (p["a"] == 1)), [20, 21])
+    t(~((p.start_idx < 21) | (p["a"] == 1)), [])
+
+    t(p.overlaps(ev10), [10])
+    t(p.overlaps(ev20), [20])
+    t(p.overlaps(ev21), [21])
+    t(p.overlaps(r1, 0, 5, 10), [])
+    t(p.overlaps(r1, 0, 5, 11), [10])
+    t(p.overlaps(r1, 0, 11, 20), [])
+    t(p.overlaps(r1, 0, 11, 100), [])
+    for i in xrange(20, 25):
+        t(p.overlaps(r1, 1, i, i + 1), [20])
 
 def test_python_query_typechecking():
-    e = Events(int)
-    e.add_event(10, {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
-    
+    e = Events()
+    r = MockRecording()
+    e.add_event(r, 0, 10, 11,
+                {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
+
     p = e.placeholder
 
     assert list(e.find(p["e"] == 1)) == []
     assert len(list(e.find(p["e"] == None))) == 1
 
-    for bad in (True, "asdf"):
+    for bad in (True, "asdf", r):
         assert_raises(EventsError, p["a"].__eq__, bad)
         assert_raises(EventsError, p["a"].__gt__, bad)
         assert_raises(EventsError, p["a"].__lt__, bad)
@@ -284,29 +358,54 @@ def test_python_query_typechecking():
 
     assert_raises(EventsError, e.find, p["e"])
 
-# def test_string_query():
-#     # all operators
-#     # quoting
-#     # INDEX versus `INDEX`
-#     # `and`
-#     # comma operator
-#     assert False
+def test_string_query():
+    e = Events()
+    r1 = MockRecording("r1")
+    r2 = MockRecording("r2")
+    e.add_event(r1, 0, 10, 12,
+                {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
+    e.add_event(r2, 1, 20, 25,
+                {"a": 2, "b": "fdsa", "c": False, "d": 5.1, "e": 22,
+                 "f": "stuff", "_RECORDING_NAME": "r100", "_START_IDX": 10,
+                 "and": 33})
 
-def test_index():
-    def t(type, good_value, bad_value):
-        e = Events(type)
-        ev = e.add_event(good_value, {"a": 1})
-        assert ev.index == good_value
-        assert len(list(e.find(e.placeholder.index == good_value))) == 1
-        assert_raises(EventsError, e.add_event, bad_value, {"a": 1})
-        assert_raises(EventsError,
-                      e.find, e.placeholder.index == bad_value)
-    t(int, 10, "asdf")
-    t((int,), (10,), 10)
-    t(str, "asdf", 10)
-    t((int, int), (10, 20), ("10", 20))
-    t((int, int), (10, 20), (10, "20"))
-    t((int, int), (10, 20), 10)
-    t((str, int), ("subj1", 10), (10, "subj1"))
-    t((str, int, int), ("subj1", 1, 10), ("subj1", 10))
-    
+    def t(s, expected_start_indices):
+        result = e.find(s)
+        start_indices = [ev.start_idx for ev in result]
+        assert start_indices == expected_start_indices
+
+    # all operators
+    t("a == 2", [20])
+    t("a != 2", [10])
+    t("a < 2", [10])
+    t("a > 1", [20])
+    t("a <= 2", [10, 20])
+    t("a >= 1", [10, 20])
+    t("not (a > 1)", [10])
+    t("c", [10])
+    t("not c", [20])
+    t("has f", [20])
+    t("a == 1 and d > 1", [10])
+    t("a == 1 and d > 2", [])
+    t("a == 1 or d > 2", [10, 20])
+    t("1 == 1", [10, 20])
+
+    # quoting
+    t("b == \"asdf\"", [10])
+    t("b == \'asdf\'", [10])
+    t("`a` == 1", [10])
+    assert_raises(EventsError, e.find, "a == \"1\"")
+
+    # RECORDING_NAME and friends
+    t("_RECORDING_NAME == 'r1'", [10])
+    t("_RECORDING_NAME == 'r2'", [20])
+    t("_SPAN_ID == 1", [20])
+    t("_START_IDX < 15", [10])
+    t("_STOP_IDX > 22", [20])
+
+    # backquotes
+    t("has `_RECORDING_NAME`", [20])
+    t("`_RECORDING_NAME` == 'r100'", [20])
+    t("`_START_IDX` == 10", [20])
+    t("`and` == 33", [20])
+    t("not has `and`", [10])

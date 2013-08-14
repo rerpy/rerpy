@@ -1,27 +1,26 @@
 # This file is part of pyrerp
-# Copyright (C) 2012 Nathaniel Smith <njs@pobox.com>
+# Copyright (C) 2012-2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
 import os.path
 import struct
-from cStringIO import StringIO
-import gzip
 import os
 import string
+from collections import OrderedDict
+import bisect
 
 import numpy as np
 import pandas
 
-from pyrerp.data import ElectrodeInfo, RecordingInfo, ContinuousData
+from pyrerp.data import ElectrodeInfo, DataFormat, Recording
 from pyrerp.util import maybe_open
-from pyrerp.events import Events
 from pyrerp._kutaslab import _decompress_crw_chunk
 
 PAUSE_CODE = 49152
 
 # There are also read_avg and write_erp_as_avg functions in here, but their
-# API probably needs another look before using them.
-__all__ = ["KutaslabError", "load_kutaslab"]
+# API probably needs another look before anyone should use them.
+__all__ = ["KutaslabRecording", "KutaslabError"]
 
 class KutaslabError(Exception):
     pass
@@ -81,6 +80,8 @@ def _get_full_string(record, key):
     desired_len = record.dtype.fields[key][0].itemsize
     return val + (desired_len - len(val)) * "\x00"
 
+# Translation tables for the ad hoc 6-bit character encoding used to encode
+# electrode names in the 64-channel format:
 _char2code = {}
 for i, char in enumerate(string.lowercase):
     _char2code[char] = i + 1
@@ -90,8 +91,8 @@ for i, char in enumerate(string.digits):
     _char2code[char] = i + 53
 _code2char = dict([(v, k) for (k, v) in _char2code.iteritems()])
 
-def _read_header(magic, stream):
-    header_str = magic + stream.read(512 - 2)
+def _read_header(stream):
+    header_str = stream.read(512)
     header = np.fromstring(header_str, dtype=_header_dtype)[0]
     if header["magic"] == 0x17a5:
         # Raw file magic number:
@@ -103,7 +104,8 @@ def _read_header(magic, stream):
         assert False, "Unrecognized file type"
     hz = 1 / (header["10usec_per_tick"] / 100000.0)
     if abs(hz - int(hz)) > 1e-6:
-        raise KutaslabError, "file claims weird non-integer sample rate %shz" % hz
+        raise KutaslabError("file claims weird non-integer sample rate %shz"
+                            % hz)
     hz = int(hz)
 
     channel_names = _channel_names_from_header(header)
@@ -155,7 +157,7 @@ def _channel_names_to_header(channel_names, header):
         encoded_names = []
         for channel_name in channel_names:
             if len(channel_name) > 4:
-                raise ValueError, "can't store channel names with >4 chars"
+                raise KutaslabError("can't store channel names with >4 chars")
             codes = [_char2code[char] for char in channel_name]
             codes += [0 * (4 - len(codes))]
             assert len(codes) == 4
@@ -170,39 +172,35 @@ def _channel_names_to_header(channel_names, header):
     assert np.all(_channel_names_from_header(header) == channel_names)
 
 def read_raw(stream, dtype):
-    magic = stream.read(2)
-    if magic == "\037\213":
-        stream.seek(-2, os.SEEK_CUR)
-        stream = gzip.GzipFile(mode="r", fileobj=stream)
-        magic = stream.read(2)
-    (reader, nchans, hz, channel_names, info, header) = _read_header(magic, stream)
+    (reader, nchans, hz, channel_names, info, header) = _read_header(stream)
     # Data is stored in a series of "chunks" -- each chunk contains 256 s16
     # samples from each channel (the 32/64/whatever analog channels, plus 1
     # channel for codes -- that channel being first.).  The code channel
     # contains a "record number" as its first entry in each chunk, which
     # simply increments by 1 each time.
-    all_codes = []
-    data_chunks = []
-    chunk_bytes = (nchans + 1) * 512
     chunkno = 0
+    code_chunks = []
+    data_chunks = []
     while True:
         read = reader(stream, nchans)
         if read is None:
             break
-        (codes_chunk, data_chunk) = read
-        assert len(codes_chunk) == 256
+        (code_chunk, data_chunk) = read
+        assert len(code_chunk) == 256
         assert data_chunk.shape == (256 * nchans,)
-        assert codes_chunk[0] == chunkno
-        codes_chunk[0] = 65535
-        all_codes += codes_chunk
+        assert code_chunk[0] == chunkno
+        code_chunk[0] = 0
+        code_chunk = np.asarray(code_chunk, dtype=np.uint16)
         data_chunk.resize((256, nchans))
-        data_chunks.append(np.asarray(data_chunk, dtype=dtype))
+        data_chunk = np.asarray(data_chunk, dtype=dtype)
+        code_chunks.append(code_chunk)
+        data_chunks.append(data_chunk)
         chunkno += 1
-    final_data = np.vstack(data_chunks)
     return (hz, channel_names,
-            np.array(all_codes, dtype=np.uint16), final_data,
+            np.concatenate(code_chunks),
+            np.row_stack(data_chunks),
             info)
-    
+
 def _read_raw_chunk(stream, nchans):
     chunk_bytes = (nchans + 1) * 512
     buf = stream.read(chunk_bytes)
@@ -255,9 +253,6 @@ def test_read_raw_on_test_data():
         crwp = rawp[:-3] + "crw"
         print rawp, crwp
         assert_files_match(rawp, crwp)
-        if os.path.exists(rawp + ".gz"):
-            print rawp, rawp + ".gz"
-            assert_files_match(rawp, rawp + ".gz")
         tested += 1
     # Cross-check, to make sure is actually finding the files... (bump up this
     # number if you add more test files):
@@ -270,12 +265,12 @@ def test_64bit_channel_names():
     # "Correct" channel names as listed by headinfo(1):
     assert (channel_names ==
             ["LOPf", "ROPf", "LMPf", "RMPf", "LTPf", "RTPf", "LLPf", "RLPf",
-             "LPrA",  "RPrA", "LTFr", "RTFr", "LLFr", "RLFr", "LDPf", "RDPf", 
-             "LTOc", "RTOc", "LTCe", "RTCe", "LLCe", "RLCe", "LDFr", "RDFr", 
-             "LMFr", "RMFr", "MiFo", "MiPf", "MiFr", "A2",   "LHEy", "RHEy", 
-             "LIOc", "RIOc", "LLOc", "RLOc", "LLPP", "RLPP", "LLPa", "RLPa", 
-             "LDCe", "RDCe", "LMCe", "RMCe", "LDOc", "RDOc", "LDPP", "RDPP", 
-             "LDPa", "RDPa", "LCer", "RCer", "LMOc", "RMOc", "LMPP", "RMPP", 
+             "LPrA",  "RPrA", "LTFr", "RTFr", "LLFr", "RLFr", "LDPf", "RDPf",
+             "LTOc", "RTOc", "LTCe", "RTCe", "LLCe", "RLCe", "LDFr", "RDFr",
+             "LMFr", "RMFr", "MiFo", "MiPf", "MiFr", "A2",   "LHEy", "RHEy",
+             "LIOc", "RIOc", "LLOc", "RLOc", "LLPP", "RLPP", "LLPa", "RLPa",
+             "LDCe", "RDCe", "LMCe", "RMCe", "LDOc", "RDOc", "LDPP", "RDPP",
+             "LDPa", "RDPa", "LCer", "RCer", "LMOc", "RMOc", "LMPP", "RMPP",
              "LMPa", "RMPa", "MiCe", "MiPa", "MiPP", "MiOc", "LLEy", "RLEy"]
             ).all()
 
@@ -330,7 +325,7 @@ def read_log(file_like):
     df["flag_polinv"] = np.asarray(df["flag"] & 0o20, dtype=bool)
     return df
 
-# XX no idea what this is
+# XX no idea what this "loc" file thing is
 # really should learn to read a topofile (see topofiles(5) and lib/topo)
 def read_loc(file_like):
     fo = maybe_open(file_like)
@@ -350,63 +345,90 @@ def read_loc(file_like):
         rs.append(r)
     return ElectrodeInfo(names, thetas, rs)
 
-def load_kutaslab(f_raw, f_log, name=None, f_loc=None, dtype=np.float64,
-                  calibration_condition=0):
-    if isinstance(f_raw, basestring) and name is None:
-        name = os.path.basename(f_raw)
-    if name is None:
-        raise ValueError, "name must be supplied when loading from file object"
-    f_raw = maybe_open(f_raw)
-    f_log = maybe_open(f_log)
-    (hz, channel_names, raw_codes, data, metadata) = read_raw(f_raw, dtype)
-    raw_log_events = read_log(f_log)
-    expanded_log_codes = np.zeros(raw_codes.shape, dtype=int)
-    expanded_log_codes[raw_log_events.index] = raw_log_events["code"]
-    discrepancies = (expanded_log_codes != raw_codes)
-    if (not (expanded_log_codes[discrepancies] == 0).all()
-        or not (raw_codes[discrepancies] == 65535).all()):
-        raise KutaslabError, "raw and log files have mismatched codes"
-    del raw_codes
-    del expanded_log_codes
-    # XX FIXME: build in the 26 and 64 channel cap info
-    electrodes = None
-    if f_loc is not None:
-        electrodes = read_loc(f_loc)
-    info = RecordingInfo(hz, "RAW", electrodes=electrodes, metadata=metadata)
-    pause_ticks = raw_log_events.index[raw_log_events["code"] == PAUSE_CODE]
-    # I *think* the pause code appears at the last sample of the era, rather
-    # than the first sample of the new era. Convert them to the Python-style
-    # [start, end) convention by adding 1 to each tick number:
-    pause_ticks += 1
-    name_index = [name] * data.shape[0]
-    era_index = np.empty(data.shape[0], dtype=np.int16)
-    time_index = np.empty(data.shape[0], dtype=np.int32)
-    era_starts = np.concatenate(([0], pause_ticks))
-    era_ends = np.concatenate((pause_ticks, [data.shape[0]]))
-    for i, (era_start, era_end) in enumerate(zip(era_starts, era_ends)):
-        era_index[era_start:era_end] = i
-        times = np.arange(era_end - era_start) * info.approx_sample_period_ms
-        time_index[era_start:era_end] = times
-    index_arrays = [name_index, era_index, time_index]
-    index_names = ["name", "era", "time"]
-    data_index = pandas.MultiIndex.from_arrays(index_arrays,
-                                               names=index_names)
-    df = pandas.DataFrame(data, columns=channel_names, index=data_index)
-    ev = Events((str, int, int))
-    for tick, row in raw_log_events.iterrows():
-        if row["condition"] == calibration_condition:
-            ev.add_event(data_index[tick], {"calibration_pulse": True})
+# XX someday should fix this so that it delays reading the actual data until
+# needed (to avoid the giant memory overhead of loading in lots of data sets
+# together). It really wouldn't be hard -- the log file tells you where all
+# the events are, and the length of each span. (You can even tell how many
+# samples there are total, because the last event in the log file is always a
+# pause code placed at the last sample of the data.)
+class KutaslabRecording(Recording):
+    def __init__(self, f_raw, f_log, name=None, f_loc=None,
+                 dtype=np.float64, calibration_condition=0):
+        if isinstance(f_raw, basestring) and name is None:
+            name = os.path.basename(f_raw)
+        if name is None:
+            raise ValueError("recording name must be supplied when loading "
+                             "from file object")
+        self.name = name
+        f_raw = maybe_open(f_raw)
+        f_log = maybe_open(f_log)
+        (hz, channel_names, raw_codes, data, metadata) = read_raw(f_raw, dtype)
+        self.metadata = metadata
+        # XX FIXME: build in the 26 and 64 channel cap info
+        if f_loc is not None:
+            self.electrode_info = read_loc(f_loc)
         else:
-            ev.add_event(data_index[tick], row.to_dict())
-    return ContinuousData(name, df, ev, info)
+            self.electrode_info = ElectrodeInfo([], [], [])
+        self.data_format = DataFormat(hz, "RAW", channel_names)
+
+        raw_log_events = read_log(f_log)
+        expanded_log_codes = np.zeros(raw_codes.shape, dtype=int)
+        expanded_log_codes[raw_log_events.index] = raw_log_events["code"]
+        discrepancies = (expanded_log_codes != raw_codes)
+        if (not (expanded_log_codes[discrepancies] == 0).all()
+            or not (raw_codes[discrepancies] == 65535).all()):
+            raise KutaslabError("raw and log files have mismatched codes")
+        del raw_codes
+        del expanded_log_codes
+
+        pause_events = (raw_log_events["code"] == PAUSE_CODE)
+        pause_ticks = raw_log_events.index[pause_events]
+        # The pause code appears at the last sample of the old era, so if used
+        # directly, adjacent pause ticks give contiguous spans of recording as
+        # (pause1, pause2]. (Confirmed by checking by hand in a real recording
+        # that the data associated with the sample that has the pause code is
+        # contiguous with the sample before, but not the sample after.)
+        # Adding +1 to each of them then converts this to Python style
+        # [pause1, pause2) intervals. There is a pause code at the last record
+        # of the file, but not one at the first, so we add that in explicitly.
+        pause_ticks += 1
+        span_edges = np.concatenate(([0], pause_ticks))
+
+        self._span_slices = [(span_edges[i], span_edges[i + 1])
+                             for i in xrange(len(span_edges) - 1)]
+        self.span_lengths = [(stop - start)
+                             for (start, stop) in self._span_slices]
+
+        self._data = data
+        self._raw_log_events = raw_log_events
+        self._calibration_condition = calibration_condition
+
+    def span_data(self):
+        for (start, stop) in self._span_slices:
+            yield self._data[start:stop, :]
+
+    def event_iter(self):
+        span_starts = [start for (start, stop) in self._span_slices]
+        for tick, row in self._raw_log_events.iterrows():
+            if row["condition"] == self._calibration_condition:
+                attrs = {"calibration_pulse": True}
+            else:
+                attrs = row.to_dict()
+            attrs["subject"] = self.metadata["subject"]
+            attrs["experiment"] = self.metadata["experiment"]
+
+            span_id = bisect.bisect(span_starts, tick) - 1
+            span_start, span_stop = self._span_slices[span_id]
+            assert span_start <= tick < span_stop
+
+            yield (span_id, tick - span_start, tick - span_start + 1, attrs)
 
 # To read multiple bins, call this repeatedly on the same stream
 def read_avg(stream, dtype):
-    magic = stream.read(2)
     # Ignore the 'reader' field -- avg files always have the same magic number
     # as whatever type of raw file was used to create them -- and they're
     # always in their own format, regardless.
-    (_, nchans, hz, channel_names, info, header) = _read_header(magic, stream)
+    (_, nchans, hz, channel_names, info, header) = _read_header(stream)
     assert header["cprecis"] > 0
     data_chunks = []
     for i in xrange(header["cprecis"]):
@@ -419,6 +441,11 @@ def read_avg(stream, dtype):
 # You can write multiple bins to the same file by calling this function
 # repeatedly on the same open file handle.
 def write_epoched_as_avg(epoched_data, stream, allow_resample=False):
+
+    assert False, ("this code won't work; the data structures have been "
+                   "rewritten multiple times since it was last used. "
+                   "But it could be fixed up without too much work...")
+
     stream = maybe_open(stream, "ab")
     data_array = np.asarray(epoched_data.data)
     # One avg record is always exactly 256 * cprecis samples long, with
@@ -438,12 +465,12 @@ def write_epoched_as_avg(epoched_data, stream, allow_resample=False):
             import scipy.signal
             data_array = scipy.signal.resample(data_array, samples, axis=1)
         else:
-            raise ValueError("kutaslab avg files must contain exactly "
-                             "256, 512, or 768 samples, but your data "
-                             "has %s. Use allow_resample=True if you "
-                             "want me to automatically resample your "
-                             "data to %s samples"
-                             % (epoched_data.num_samples, samples,))
+            raise KutaslabError("kutaslab avg files must contain exactly "
+                                "256, 512, or 768 samples, but your data "
+                                "has %s. Use allow_resample=True if you "
+                                "want me to automatically resample your "
+                                "data to %s samples"
+                                % (epoched_data.num_samples, samples,))
     assert data_array.shape[1] == samples
     times = epoched_data.data.major_axis
     actual_length = times.max() - times.min()
@@ -482,8 +509,8 @@ def write_epoched_as_avg(epoched_data, stream, allow_resample=False):
         header["epoch_len"] = epoch_len_ms
         header["nchans"] = integer_data.shape[1]
         # "pf" = "processing function", i.e., something like "averaging" or
-        # "standard error" that describes how raw data was analyzed to create this
-        # curve.
+        # "standard error" that describes how raw data was analyzed to create
+        # this curve.
         header["tpfuncs"] = 1
         header["pftypes"] = "pyrERP"
         header["pp10uv"] = s16_per_10uV
@@ -525,9 +552,10 @@ def write_epoched_as_avg(epoched_data, stream, allow_resample=False):
         header["condes"] = str(epoched_data.data.entries[i])
 
         header.tofile(stream)
-        # avg files omit the mark track.  And, all the data for a single channel
-        # goes together in a single chunk, rather than interleaving all channels.
-        # THIS IS DIFFERENT FROM RAW FILES!
+        # avg files omit the mark track.  And, all the data for a single
+        # channel goes together in a single chunk, rather than interleaving
+        # all channels.  THIS IS TOTALLY DIFFERENT FROM RAW FILES, DON'T GET
+        # CONFUSED!
         for i in xrange(integer_data.shape[1]):
             integer_data[:, i].tofile(stream)
 

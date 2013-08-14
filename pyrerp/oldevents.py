@@ -12,9 +12,6 @@ import pandas
 from patsy import PatsyError
 from patsy.origin import Origin
 from patsy.parse_core import Token, Operator, parse
-# We need isinstance(..., Recording), but we don't do 'from ... import
-# Recording' because that would create a circular import:
-import pyrerp.newdata
 
 __all__ = ["Events", "EventsError"]
 
@@ -56,108 +53,88 @@ def test__munge_name():
     munged_names = set([_munge_name(n) for n in clean_names + unclean_names])
     assert len(munged_names) == len(clean_names) + len(unclean_names)
 
-# http://www.logarithmic.net/pfh/blog/01235197474
-def approx_interval_magnitude(span):
-    """Returns a number M such that:
-      M <= span <= 2*M
-    and so only a few distinct M values are used. In practice, M is chosen to
-    either be 0, or a power of 2."""
-    if span == 0:
-        return 0
-    magnitude = 1
-    while magnitude * 2 < span:
-        magnitude *= 2
-    return magnitude
-
-def test_approx_interval_magnitude():
-    for span in [0, 1, 2, 3, 10, 100, 127, 128, 129, 5000, 65536]:
-        M = approx_interval_magnitude(span)
-        assert M <= span <= 2 * M
-
 def _table_name(key):
     return "attr_" + _munge_name(key)
-
-# Keys that have a special magical meaning in dict-queries and
-# string-queries (plus the actual database field name they map to).
-# In string queries these can be de-magicalified by quoting them with
-# backquotes, i.e.,:
-#   "_SPAN_ID == 1"   <-> placeholder.span_id == 1
-#   "`_SPAN_ID` == 1" <-> placeholder["_SPAN_ID"] == 1
-_magic_query_strings = set(["_RECORDING", "_SPAN_ID", "_START_IDX",
-                            "_STOP_IDX", "_RECORDING_NAME"])
-def _magic_query_string_to_query(events, name, origin=None):
-    if name == "_RECORDING":
-        return RecordingQuery(events, origin)
-    else:
-        return IndexFieldQuery(events, name[1:].lower(), origin)
 
 class Events(object):
     NUMERIC = "numeric"
     BLOB = "text"
     BOOL = "bool"
 
-    def __init__(self):
-        # int -> Recording
-        self._recordings = []
-        # Recording -> int
-        self._recordings_map = {}
-        self._interval_magnitudes = set()
+    # Index type is like (int, int) or (str, int, int) or int, etc.
+    def __init__(self, index_type):
+        self._index_type = index_type
         self._connection = sqlite3.connect(":memory:")
         # Maps key names to value types (NUMERIC, BLOB, BOOL), or None if we
         # have yet to see any values for the given key and so don't know what
         # type it should have.
         self._key_types = {}
 
-        # Every time 'op_count' passes 'analyze_threshold', we run ANALYZE and
-        # double 'analyze_threshold'. Starting analyze_threshold as 256 or so
-        # would make more sense, but the extra cost of doing it this way is
-        # minimal, and this way we actually test this logic even on small
-        # examples.
-        self._op_count = 0
-        self._analyze_threshold = 1
-
         c = self._connection.cursor()
         c.execute("PRAGMA case_sensitive_like = true;")
         c.execute("CREATE TABLE sys_events "
                   "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                  "recording_id INTEGER NOT NULL, "
-                  "span_id INTEGER NOT NULL, "
-                  "start_idx NUMERIC NOT NULL, "
-                  "stop_idx NUMERIC NOT NULL, "
-                  "interval_magnitude INTEGER NOT NULL, "
-                  "recording_name);")
-        c.execute("CREATE INDEX sys_events_by_start_idx "
-                  "ON sys_events (recording_id, span_id, start_idx);")
-        c.execute("CREATE INDEX sys_events_by_stop_idx "
-                  "ON sys_events (recording_id, span_id, stop_idx);")
-        # The special indices used to make overlaps queries fast
-        c.execute("CREATE INDEX sys_events_interval_start_idx "
-                  "ON sys_events (recording_id, span_id, "
-                                 "interval_magnitude, start_idx);")
-        c.execute("CREATE INDEX sys_events_interval_stop_idx "
-                  "ON sys_events (recording_id, span_id, "
-                                 "interval_magnitude, stop_idx);")
+                  "event_index BLOB NOT NULL);")
+        c.execute("CREATE INDEX sys_events_index_idx "
+                  "ON sys_events (event_index);")
 
-    def _intern_recording(self, recording):
-        if recording in self._recordings_map:
-            return self._recordings_map[recording]
+    # The idea here is to encode/decode the index structures we care about
+    # (tuples of ints and strings) in a way that is (1) unique, (2) sorts
+    # properly in the database (so >, < comparisons work).
+    def _encode_index(self, idx, origin=None):
+        buf = StringIO()
+        index_type = self._index_type
+        if not isinstance(index_type, tuple):
+            index_type = (index_type,)
+            idx = (idx,)
+        if not isinstance(idx, tuple) or len(idx) != len(index_type):
+            raise EventsError("wrong length index %r" % (idx,), origin)
+        for (obj, type) in zip(idx, index_type):
+            required_type = type
+            if type is int:
+                required_type = (int, long)
+            if not isinstance(obj, required_type):
+                raise EventsError("index object %r not of type %s"
+                                  % (obj, type), origin)
+            try:
+                if type is int:
+                    # inverted sign bit goes first so that negatives will
+                    # compare smaller than positives
+                    buf.write(struct.pack(">Bq", obj >= 0, obj))
+                elif type is str:
+                    buf.write(struct.pack(">I", len(obj)))
+                    buf.write(obj)
+            except struct.error:
+                raise EventsError("bad index value: wanted %s, got %r"
+                                  % (type, obj), origin)
+        return buf.getvalue()
+
+    def _decode_index(self, idx_str):
+        idx = []
+        offset = 0
+        index_type = self._index_type
+        if not isinstance(index_type, tuple):
+            index_type = (index_type,)
+        for type in index_type:
+            if type is int:
+                idx.append(struct.unpack_from(">Bq", idx_str, offset)[1])
+                offset += struct.calcsize(">Bq")
+            elif type is str:
+                length = struct.unpack_from(">I", idx_str, offset)[0]
+                offset += struct.calcsize(">I")
+                idx.append(idx_str[offset:offset + length])
+                offset += length
+        if not isinstance(self._index_type, tuple):
+            return idx[0]
         else:
-            idx = len(self._recordings)
-            self._recordings.append(recording)
-            self._recordings_map[recording] = idx
-            return idx
-
-    def _try_intern_recording(self, recording):
-        return self._recordings_map.get(recording)
-
-    def _extern_recording(self, recording_idx):
-        return self._recordings[recording_idx]
+            return tuple(idx)
 
     # Convert str's to buffer objects before passing them into sqlite, because
     # that is how you tell the sqlite3 module to store them as
-    # BLOBs. (sqlite3.Binary is an alias for 'buffer'.) This function also
-    # handles converting numpy scalars into equivalents that are acceptable to
-    # sqlite.
+    # BLOBs. (sqlite3.Binary is an alias for 'buffer'.) This encoding/decoding
+    # is layered *on top* of index encoding/decoding, if that is in use. This
+    # function also handles converting numpy scalars into equivalents that are
+    # acceptable to sqlite.
     def _encode_sql_value(self, val):
         if np.issubsctype(type(val), np.str_):
             return sqlite3.Binary(val)
@@ -221,7 +198,7 @@ class Events(object):
 
     # NOTE: DDL statements like table creation cannot be performed inside a
     # transaction. So don't call this method inside a transaction.
-    def _ensure_table_for_key(self, key):
+    def _ensure_table(self, key):
         table = _table_name(key)
         self._connection.execute("CREATE TABLE IF NOT EXISTS %s ("
                                    "event_id INTEGER PRIMARY KEY, "
@@ -230,55 +207,22 @@ class Events(object):
                                    "ON %s (value);" % (table, table))
         self._key_types.setdefault(key, None)
 
-    def _incr_op_count(self):
-        self._op_count += 1
-        if self._op_count >= self._analyze_threshold:
-            self._connection.execute("ANALYZE;")
-        self._analyze_threshold *= 2
-
-    def add_event(self, recording, span_id, start_idx, stop_idx, attributes):
+    def add_event(self, index, info):
         # Create tables up front before entering transaction:
-        for key in attributes:
-            self._ensure_table_for_key(key)
-        recording_id = self._intern_recording(recording)
-        if not start_idx < stop_idx:
-            raise ValueError, "start_idx must be < stop_idx"
-        if not start_idx >= 0:
-            raise ValueError, "start_idx must be >= 0"
-        interval_magnitude = approx_interval_magnitude(stop_idx - start_idx)
-        self._interval_magnitudes.add(interval_magnitude)
+        for key in info:
+            self._ensure_table(key)
         with self._connection:
             c = self._connection.cursor()
-            self._execute(c,
-              "INSERT INTO sys_events "
-              "  (recording_id, span_id, start_idx, stop_idx,"
-              "   interval_magnitude, recording_name) "
-              "values (?, ?, ?, ?, ?, ?)",
-              [recording_id, span_id, start_idx, stop_idx, interval_magnitude,
-               recording.name])
+            self._execute(c, "INSERT INTO sys_events (event_index) values (?)",
+                          [self._encode_index(index)])
             event_id = c.lastrowid
-            for key, value in attributes.iteritems():
+            for key, value in info.iteritems():
                 self._observe_value_for_key(key, value)
                 self._execute(c,
                               "INSERT INTO %s (event_id, value) VALUES (?, ?);"
                                 % (_table_name(key),),
                               (event_id, value))
-        self._incr_op_count()
-        return Event(self, event_id)
-
-    def _move_event(self, id, offset):
-        # Fortunately, this operation doesn't change the magnitude of the
-        # span, so it's relatively simple to implement -- we can just update
-        # the start_idx and stop_idx directly without having to worry about
-        # the complexities of interval_magnitudes.
-        with self._connection:
-            c = self._connection.cursor()
-            self._execute(c,
-                          "UPDATE sys_events "
-                          "SET start_idx = start_idx + ?, "
-                          "    stop_idx = stop_idx + ? "
-                          "WHERE id = ?",
-                          [offset, offset, id])
+            return Event(self, event_id)
 
     def _delete_event(self, id):
         with self._connection:
@@ -289,13 +233,12 @@ class Events(object):
                               "DELETE FROM %s WHERE event_id = ?;"
                                 % (_table_name(key),),
                               (id,))
-        self._incr_op_count()
 
-    def _event_index_field(self, field, id):
+    def _event_index(self, id):
         c = self._connection.cursor()
-        code = "SELECT %s FROM sys_events WHERE id = ?;" % (field,)
+        code = "SELECT event_index FROM sys_events WHERE id = ?;"
         self._execute(c, code, (id,))
-        return self._decode_sql_value(c.fetchone()[0])
+        return self._decode_index(self._decode_sql_value(c.fetchone()[0]))
 
     def _event_getitem(self, id, key):
         c = self._connection.cursor()
@@ -312,7 +255,7 @@ class Events(object):
                                              self._key_types[key])
 
     def _event_setitem(self, id, key, value):
-        self._ensure_table_for_key(key)
+        self._ensure_table(key)
         with self._connection:
             c = self._connection.cursor()
             table = _table_name(key)
@@ -326,7 +269,6 @@ class Events(object):
                               "INSERT INTO %s (event_id, value) VALUES (?, ?);"
                                 % (table,),
                               (id, value))
-        self._incr_op_count()
 
     def _event_delitem(self, id, key):
         # Raise a KeyError if it doesn't exist:
@@ -336,7 +278,6 @@ class Events(object):
         table = _table_name(key)
         code = "DELETE FROM %s WHERE event_id = ?;" % (table,)
         self._execute(c, code, (id,))
-        self._incr_op_count()
 
     @property
     def placeholder(self):
@@ -351,9 +292,8 @@ class Events(object):
             p = self.placeholder
             query = self.ANY
             equalities = []
-            for query_name in _magic_query_strings.intersection(query_like):
-                q = _magic_query_string_to_query(self, query_name)
-                query &= (q == query_like.pop(query_name))
+            if "INDEX" in query_like:
+                query &= (p.index == query_like.pop("INDEX"))
             for k, v in query_like.iteritems():
                 query &= (p[k] == v)
         elif isinstance(query_like, basestring):
@@ -385,17 +325,13 @@ class Events(object):
                    sql_where.code))
         if joins:
             code += " AND (%s)" % (" AND ".join(joins),)
-        code += "ORDER BY sys_events.recording_id, sys_events.span_id, sys_events.start_idx"
+        code += "ORDER BY sys_events.event_index"
         c = self._connection.cursor()
         self._execute(c, code, sql_where.args)
         return c
 
-    def at(self, recording, span_id, start_idx, stop_idx=None):
-        if stop_idx is None:
-            stop_idx = start_idx + 1
-        p = self.placeholder
-        q = p.overlaps(recording, span_id, start_idx, stop_idx)
-        return self.find(q)
+    def at(self, index):
+        return list(self.find({"INDEX": index}))
 
     def __iter__(self):
         return iter(self.ANY.run())
@@ -435,17 +371,17 @@ class Events(object):
     def __getstate__(self):
         events = []
         for ev in self:
-            events.append((ev.recording, ev.span_id, ev.start_idx, ev.stop_idx, dict(ev)))
+            events.append((ev.index, dict(ev)))
         # 0 as an ad-hoc version number in case we need to change this later
-        return (0, events)
+        return (0, self._index_type, events)
 
     def __setstate__(self, state):
         if state[0] != 0:
             raise ValueError, "unrecognized pickle data version for Events object"
-        self.__init__()
-        _, events = state
-        for recording, span_id, start_idx, stop_idx, attrs in events:
-            self.add_event(recording, span_id, start_idx, stop_idx, attrs)
+        _, index_type, events = state
+        self.__init__(index_type)
+        for index, attrs in events:
+            self.add_event(index, attrs)
 
 # This is like a "frozen" query -- it always refers to the same events even if
 # the original set changes (though the values in those events may change!),
@@ -476,21 +412,23 @@ class EventSet(object):
         if hasattr(idx, "__index__"):
             return Event(self._events, self._event_ids[idx])
         elif isinstance(idx, basestring):
-            # This will raise a KeyError for any events where the field is
-            # just undefined, and will return None otherwise. This could be
-            # done more efficiently by querying the database directly, but
-            # let's not fret about that until it matters.
-            values = [ev[idx] for ev in self]
-            # We use pandas.Series here because it has much more sensible
-            # NaN/None handling than raw numpy.
-            #   np.asarray([None, 1, 2]) -> object (!) array
-            #   np.asarray([np.nan, "a", "b"]) -> ["nan", "a", "b"] (!)
-            # but
-            #   pandas.Series([None, 1, 2]) -> [nan, 1, 2]
-            #   pandas.Series([None, "a", "b"]) -> [None, "a", "b"]
-            return pandas.Series(values)
+            # In principle there is a cleverer way to do this using _query
+            # directly but it gets complicated to properly handle indexes,
+            # missing values, and detecting KeyErrors. So for now we'll just
+            # use brute force.
+            indexes = []
+            values = []
+            have_any_values = False
+            for ev in self:
+                indexes.append(ev.index)
+                if not have_any_values and idx in ev:
+                    have_any_values = True
+                values.append(ev.get(idx, np.nan))
+            if not have_any_values:
+                raise KeyError, idx
+            return pandas.Series(values, index=indexes)
         else:
-            raise TypeError, "index must be an integer or string"
+            raise TypeError, "don't know what to do with index"
 
     # def __setitem__(self, key, value):
     #     # XX we should probably support Series and ndarrays and stuff here
@@ -498,9 +436,6 @@ class EventSet(object):
     #     # things like
     #     #   my_set["foo"] = my_set.next(query)["foo"]
     #     # and make sure that nan gets mapped to deleting the value
-    #     # ...though this would require that my_set.next() be indexed by the
-    #     # same events in my_set, not the events in my_set.next(). Is that
-    #     # good or bad?
     #     xx
 
     def update(self, d):
@@ -528,33 +463,8 @@ class Event(object):
         raise ValueError, "Event objects are not pickleable"
 
     @property
-    def recording(self):
-        rid = self._events._event_index_field("recording_id", self._id)
-        return self._events._extern_recording(rid)
-
-    @property
-    def span_id(self):
-        return self._events._event_index_field("span_id", self._id)
-
-    @property
-    def start_idx(self):
-        return self._events._event_index_field("start_idx", self._id)
-
-    @property
-    def stop_idx(self):
-        return self._events._event_index_field("stop_idx", self._id)
-
-    def overlaps(self, *args):
-        if len(args) == 1:
-            ev = args[0]
-            return self.overlaps(ev.recording, ev.span_id,
-                                 ev.start_idx, ev.stop_idx)
-        else:
-            (recording, span_id, start_idx, stop_idx) = args
-            return (self.recording == recording
-                    and self.span_id == span_id
-                    and self.start_idx < stop_idx
-                    and start_idx < self.stop_idx)
+    def index(self):
+        return self._events._event_index(self._id)
 
     def __getitem__(self, key):
         return self._events._event_getitem(self._id, key)
@@ -614,8 +524,6 @@ class Event(object):
         else:
             return True
 
-    has_key = __contains__
-
     def __repr__(self):
         return "<%s %s at %s: %s>" % (
             self.__class__.__name__, self._id, self.index,
@@ -638,19 +546,12 @@ class Event(object):
             raise IndexError, "count must be non-zero"
         query = self._events.as_query(query)
         p = self._events.placeholder
-        query &= (p.recording == self.recording)
-        query &= (p.span_id == self.span_id)
         if count > 0:
-            query &= (p.start_idx > self.start_idx)
+            query &= (p.index > self.index)
             return query.run()[count - 1]
         else:
-            query &= (p.start_idx < self.start_idx)
+            query &= (p.index < self.index)
             return query.run()[count]
-
-    def move(self, offset):
-        """Shifts this event's timestamp by 'offset' samples (positive for
-        forward, negative for backward)."""
-        self._events._move_event(self._id, offset)
 
 ###############################################
 #
@@ -666,37 +567,11 @@ class PlaceholderEvent(object):
         return AttrQuery(self._events, key)
 
     @property
-    def recording(self):
-        return RecordingQuery(self._events)
-
-    @property
-    def span_id(self):
-        return IndexFieldQuery(self._events, "span_id")
-
-    @property
-    def start_idx(self):
-        return IndexFieldQuery(self._events, "start_idx")
-
-    @property
-    def stop_idx(self):
-        return IndexFieldQuery(self._events, "stop_idx")
+    def index(self):
+        return IndexQuery(self._events)
 
     def has_key(self, key):
-        return HasKeyQuery(self._events, key)
-
-    def overlaps(self, *args):
-        if len(args) == 1:
-            ev = args[0]
-            if isinstance(ev, PlaceholderEvent):
-                raise ValueError, "cannot test for overlap between two placeholders"
-            return self.overlaps(ev.recording, ev.span_id,
-                                 ev.start_idx, ev.stop_idx)
-        else:
-            (recording, span_id, start_idx, stop_idx) = args
-            return OverlapsQuery(self._events,
-                                 self._events._try_intern_recording(recording),
-                                 span_id,
-                                 start_idx, stop_idx)
+        return self[key] != None
 
 class SqlWhere(object):
     def __init__(self, code, tables, args):
@@ -711,27 +586,36 @@ class Query(object):
 
     # Building queries:
 
-    def _as_query(self, other):
+    def _as_constraint(self, other):
         if isinstance(other, Query):
             assert other._events is self._events
             return other
         return LiteralQuery(self._events, other)
 
     def _make_op(self, op_name, sql_op, children, expected_type=None):
-        children = [self._as_query(child) for child in children]
-        # Otherwise, do type checking.
-        types = []
-        for child in children:
-            type = child._value_type()
-            if expected_type is not None and type != expected_type:
-                raise EventsError("%r operator expected %s, got %s "
-                                    "(check your parentheses?)"
-                                    % (op_name, expected_type, type),
-                                  child)
-            types.append(type)
-        if len(set(types).difference([None])) > 1:
-            raise EventsError("mismatched types: %s" % (" vs ".join(types)),
-                              Origin.combine(children))
+        children = [self._as_constraint(child) for child in children]
+        if any([isinstance(child, IndexQuery) for child in children]):
+            # Special case: in operations involving a LiteralQuery plus an
+            # IndexQuery, convert the LiteralQuery into a LiteralIndexQuery:
+            for i, child in enumerate(children):
+                if isinstance(child, LiteralQuery):
+                    children[i] = LiteralIndexQuery(child._events,
+                                                    child._value,
+                                                    child.origin)
+        else:
+            # Otherwise, do type checking.
+            types = []
+            for child in children:
+                type = child._value_type()
+                if expected_type is not None and type != expected_type:
+                    raise EventsError("%r operator expected %s, got %s "
+                                        "(check your parentheses?)"
+                                        % (op_name, expected_type, type),
+                                      child)
+                types.append(type)
+            if len(set(types).difference([None])) > 1:
+                raise EventsError("mismatched types: %s" % (" vs ".join(types)),
+                                  Origin.combine(children))
         return QueryOperator(self._events, sql_op, children,
                              Origin.combine(children))
 
@@ -800,137 +684,56 @@ class Query(object):
 class LiteralQuery(Query):
     def __init__(self, events, value, origin=None):
         Query.__init__(self, events, origin)
-        if isinstance(value, pyrerp.newdata.Recording):
-            self._value = self._events._try_intern_recording(value)
-            self._saved_value_type = "RECORDING"
-        else:
-            self._value = value
-            try:
-                self._saved_value_type = self._events._value_type(self._value)
-            except ValueError:
-                raise EventsError("literals must be boolean, string, numeric, "
-                                  "or None",
-                                  self)
+        self._value = value
 
     def _sql_where(self):
+        if (self._value is not None
+            and not isinstance(self._value, (bool, basestring, int, float))):
+            raise EventsError("literals must be boolean, string, numeric, "
+                                "or None",
+                              self)
         return SqlWhere("?", set(), [self._value])
 
     def _value_type(self):
-        return self._saved_value_type
+        return self._events._value_type(self._value)
 
     def __repr__(self):
         return "<%s: %r>" % (self.__class__.__name__, self._value)
 
+class LiteralIndexQuery(LiteralQuery):
+    def _sql_where(self):
+        return SqlWhere("?", set(),
+                       [self._events._encode_index(self._value, self.origin)])
+
+    def _value_type(self):
+        return None
+
 class AttrQuery(Query):
-    def __init__(self, events, key, origin=None):
+    def __init__(self, events, name, origin=None):
         Query.__init__(self, events, origin)
-        self._key = key
-        # Go ahead and create any tables that are being queried -- if someone
-        # makes a typo then this will create an empty table, but creating a
-        # table by itself is a total no-op at the data level, so whatever.
-        self._events._ensure_table_for_key(self._key)
+        self._name = name
 
     def _sql_where(self):
-        table_id = _table_name(self._key)
+        table_id = _table_name(self._name)
         return SqlWhere(table_id + ".value", set([table_id]), [])
 
     def _value_type(self):
-        return self._events._value_type_for_key(self._key)
+        return self._events._value_type_for_key(self._name)
 
     def __repr__(self):
-        return "<%s %r>" % (self.__class__.__name__, self._key)
+        return "<%s %r>" % (self.__class__.__name__, self._name)
 
-class HasKeyQuery(Query):
-    def __init__(self, events, key, origin=None):
-        Query.__init__(self, events, origin)
-        self._key = key
-        # Go ahead and create any tables that are being queried -- if someone
-        # makes a typo then this will create an empty table, but creating a
-        # table by itself is a total no-op at the data level, so whatever.
-        self._events._ensure_table_for_key(self._key)
-
-    def _sql_where(self):
-        table_id = _table_name(self._key)
-        return SqlWhere("EXISTS (SELECT 1 FROM %s inner_table "
-                        "WHERE sys_events.id == inner_table.event_id)"
-                        % (table_id,),
-                        set(), [])
-
-    def _value_type(self):
-        return self._events.BOOL
-
-    def __repr__(self):
-        return "<%s %r>" % (self.__class__.__name__, self._key)
-
-class RecordingQuery(Query):
+class IndexQuery(Query):
     def _sql_where(self):
         # sys_events is always included in the join, so no need to add it to
         # the tables.
-        return SqlWhere("sys_events.recording_id", set(), [])
+        return SqlWhere("sys_events.event_index", set(), [])
 
     def _value_type(self):
-        return "RECORDING"
+        return None
 
     def __repr__(self):
         return "<%s>" % (self.__class__.__name__,)
-
-    @property
-    def name(self):
-        return IndexFieldQuery(self._events, "recording_name")
-
-class IndexFieldQuery(Query):
-    def __init__(self, events, field, origin=None):
-        Query.__init__(self, events, origin)
-        self._field = field
-
-    def _sql_where(self):
-        # sys_events is always included in the join, so no need to add it to
-        # the tables.
-        return SqlWhere("sys_events.%s" % (self._field,), set(), [])
-
-    def _value_type(self):
-        if self._field == "recording_name":
-            return self._events.BLOB
-        else:
-            return self._events.NUMERIC
-
-    def __repr__(self):
-        return "<%s %r>" % (self.__class__.__name__, self._field)
-
-class OverlapsQuery(Query):
-    def __init__(self, events,
-                 recording_id, span_id, start_idx, stop_idx, origin=None):
-        Query.__init__(self, events, origin)
-        self._recording_id = recording_id
-        self._span_id = span_id
-        self._start_idx = start_idx
-        self._stop_idx = stop_idx
-
-    def _sql_where(self):
-        args = []
-        possibilities = []
-        for magnitude in self._events._interval_magnitudes:
-            constraints = [
-                "sys_events.recording_id == ?",
-                "sys_events.span_id == ?",
-                "sys_events.interval_magnitude == ?",
-                "((sys_events.start_idx < ? AND (? - ?) < sys_events.start_idx)"
-                  " OR (sys_events.stop_idx < (? + ?) AND ? < sys_events.stop_idx))",
-                ]
-            args += [self._recording_id, self._span_id,
-                     magnitude,
-                     self._stop_idx, self._start_idx, magnitude,
-                     self._stop_idx, magnitude, self._start_idx]
-            possibilities.append(" AND ".join(constraints))
-        return SqlWhere(" OR ".join(possibilities), set(), args)
-
-    def _value_type(self):
-        return self._events.BOOL
-
-    def __repr__(self):
-        return ("<%s %r %r [%r, %r)>"
-                % (self.__class__.__name__, self._recording_id, self._span_id,
-                   self._start_idx, self._stop_idx))
 
 # This is only used internally
 class IdQuery(Query):
@@ -980,6 +783,7 @@ _punct_ops = [
     Operator(">", 2, 100),
     Operator("<=", 2, 100),
     Operator(">=", 2, 100),
+    Operator(",", 2, 200),
     ]
 _text_ops = [
     Operator("not", 1, 0),
@@ -989,7 +793,7 @@ _text_ops = [
     ]
 _ops = _punct_ops + _text_ops
 
-_atomic = ["ATTR", "LITERAL", "MAGIC_FIELD"]
+_atomic = ["ATTR", "LITERAL", "INDEX"]
 
 def _read_quoted_string(string, i):
     start = i
@@ -1073,10 +877,8 @@ def _tokenize(string):
                 yield Token("LITERAL", origin, True)
             elif token.lower() == "false":
                 yield Token("LITERAL", origin, False)
-            elif token.lower() == "none":
-                yield Token("LITERAL", origin, None)
-            elif token in _magic_query_strings:
-                yield Token("MAGIC_FIELD", origin, token)
+            elif token == "INDEX":
+                yield Token("INDEX", origin)
             else:
                 yield Token("ATTR", origin, token)
             i = match.end()
@@ -1110,18 +912,27 @@ def _eval(events, tree):
         eval_args = [_eval(events, arg) for arg in tree.args]
         return getattr(eval_args[0], _op_to_pymethod[tree.type])(*eval_args[1:])
     elif tree.type == "has":
-        assert len(tree.args) == 1
-        arg = tree.args[0]
-        if arg.type != "ATTR":
-            raise EventsError("'has' expects an attribute name", arg)
-        return HasKeyQuery(events, arg.token.extra, tree.origin)
+        eval_args = [_eval(events, arg) for arg in tree.args]
+        return eval_args[0] != None
     elif tree.type == "LITERAL":
         return LiteralQuery(events, tree.token.extra, tree.origin)
     elif tree.type == "ATTR":
         return AttrQuery(events, tree.token.extra, tree.origin)
-    elif tree.type == "MAGIC_FIELD":
-        return _magic_query_string_to_query(events, tree.token.extra,
-                                              tree.origin)
+    elif tree.type == "INDEX":
+        return IndexQuery(events, tree.origin)
+    elif tree.type == ",":
+        eval_args = [_eval(events, arg) for arg in tree.args]
+        for arg in eval_args:
+            if not isinstance(arg, LiteralQuery):
+                raise EventsError("comma operator can only be applied "
+                                  "to literals, not %s" % (arg,), arg)
+        # Flatten out nested calls like "1, 2, 3":
+        def tuplify(v):
+            if isinstance(v, tuple):
+                return v
+            return (v,)
+        twople = tuplify(eval_args[0]._value) + tuplify(eval_args[1]._value)
+        return LiteralQuery(events, twople)
     else:
         assert False
 
