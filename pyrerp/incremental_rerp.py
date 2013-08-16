@@ -33,7 +33,7 @@ def mp_wrap_array(arr):
 def mp_unwrap_array(box):
     shared_data, shape = box
     shared_ndarray = np.ctypeslib.as_array(shared_data)
-    shared_ndarray.shape = arr.shape
+    shared_ndarray.shape = shape
     return shared_ndarray
 
 # How many data points/rows of the expanded X matrix should we process in each

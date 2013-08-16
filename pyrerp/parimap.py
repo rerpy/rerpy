@@ -2,6 +2,23 @@
 # Copyright (C) 2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
+# support multiple iterables like imap (with same semantics: stop when first
+# one is exhausted)
+
+# proper design:
+#   object representing a worker, gets started and then jobs are queued to it
+#     directly. jobs come out into a single queue.
+#   (if too many finished jobs pile up, need backpressure -- keep track of
+#   which workers are idle)
+
+# if debugging and continue-on-error enabled, put the erroring worker to one
+# side and spawn a new one.
+# make debug-start an inline command
+# and have debug-input and debug-output as commands?
+# or if we have a tty to offer, debug-tty to run on it directly
+# handling qtconsole + windows + cross-machine debuggin is going to be a
+# hassle. spawning an ipython kernel may help?
+
 # unordered parallel imap
 # basically the same as multiprocessing.Pool.imap_unordered
 # but with some pain points removed.
@@ -35,7 +52,7 @@
 # support for other parallelization systems (ssh, slurm, sge, picloud)?
 # chunking?
 # passing numpy arrays through shared memory?
-# coordination between multiple upimaps, allowing you to have multiple
+# coordination between multiple parimaps, allowing you to have multiple
 #   instantiated at once (e.g., one feeding another), and coordinate the work
 #   using a shared process pool? (Deadlock avoidance becomes a bit tricky!)
 
@@ -44,10 +61,89 @@ import multiprocessing
 import itertools
 import traceback
 import sys
+try:
+    import numpy as np
+except ImportError:
+    have_numpy = False
+else:
+    have_numpy = True
+
+import pickle
+from cloud.serialization.cloudpickle import CloudPickler
+
+def _open_file(path, mode, offset, closed):
+    f = open(path, mode)
+    if closed:
+        f.close()
+    else:
+        f.seek(offset)
+    return f
+
+class ParimapPickler(CloudPickler):
+    dispatch = CloudPickler.dispatch.copy()
+
+    # CloudPickle tries to pickles files by slurping them up into memory. We
+    # assume we have a shared filesystem, so this is not necessary.
+    def save_file(self, obj):
+        for special in ["stdin", "stdout", "stderr"]:
+            if obj is getattr(sys, special):
+                return self.save_reduce(getattr, (sys, special), obj=obj)
+        if hasattr(obj, "isatty") and obj.isatty():
+            raise pickle.PicklingError("Cannot pickle opened ttys")
+        # XX FIXME should fstat the file and make sure the name actually
+        # refers to it?
+        if obj.closed:
+            offset = 0
+        else:
+            offset = obj.tell()
+        return self.save_reduce(_open_file,
+                                (obj.name, obj.mode, offset, obj.closed))
+    dispatch[file] = save_file
+
+def _reconstruct_ndarray_from_shmem(shared_raw_array, shape):
+    shared_ndarray = np.ctypeslib.as_array(shared_data)
+    shared_ndarray.shape = shape
+    return shared_ndarray
+
+# The pickles created by this pickler can only be unpickled on the same
+# machine, and only while this pickler object still exists.
+class ParimapShmemPickler(ParimapPickler):
+    dispatch = ParimapShmemPickler.copy()
+
+    def __init__(self, file, protocol=None):
+        ParimapPickler.__init__(self, file, protocol)
+        self._owned_refs = []
+
+    if have_numpy:
+        def save_ndarray(self, arr):
+            # We don't handle sub-classes. Pickler.save doesn't actually do
+            # superclass lookup in the 'dispatch' dict, but just to make sure
+            # it's clear.
+            assert type(arr) == np.ndarray
+            if arr.dtype == np.dtype(np.float64):
+                typecode = "d"
+            elif arr.dtype == np.dtype(np.float32):
+                typecode = "f"
+            else:
+                # Other dtypes are not implemented (yet), so fall back on
+                # regular pickle.
+                return ParimapPickler.save(arr)
+            # Allocate a shared memory region of the appropriate size, and
+            # copy the data into it.
+            shared_data = multiprocessing.sharedctypes.RawArray(typecode,
+                                                                arr.size)
+            shared_ndarray = np.ctypeslib.as_array(shared_data)
+            shared_ndarray.shape = arr.shape
+            shared_ndarray[...] = arr[...]
+            self._owned_refs.append(shared_data)
+            return self.save_reduce(_reconstruct_ndarray_from_shmem,
+                                    (shared_data, arr.shape))
+
+        dispatch[np.ndarray] = save_ndarray
 
 CONFIG_ENVVAR = "PYRERP_PARALLEL"
 
-class UPIMapError(Exception):
+class ParimapError(Exception):
     pass
 
 def _try_switch_class(obj, new_class):
@@ -86,20 +182,20 @@ def _try_switch_class(obj, new_class):
 
 class _CrossProcessExceptionMixin(object):
     # assumes attrs:
-    #   -- _upimap_orig_class
-    #   -- _upimap_traceback_list
-    #   -- _upimap_mapper
+    #   -- _parimap_orig_class
+    #   -- _parimap_traceback_list
+    #   -- _parimap_mapper
     def pm(self):
-        return self._upimap_mapper.post_mortem()
+        return self._parimap_mapper.post_mortem()
 
     def __str__(self):
         return ("\n-- Traceback from worker process --\n%s"
                 "%s: %s\n\n"
                 "If running from interactive shell, to open a debugger use:\n"
                 "   import sys; sys.last_value.pm()"
-                % ("".join(traceback.format_list(self._upimap_traceback_list)),
-                   self._upimap_orig_class.__name__,
-                   self._upimap_orig_class.__str__(self),
+                % ("".join(traceback.format_list(self._parimap_traceback_list)),
+                   self._parimap_orig_class.__name__,
+                   self._parimap_orig_class.__str__(self),
                    ))
 
 def _try_wrap_exception(exc, traceback_list, mapper):
@@ -115,9 +211,9 @@ def _try_wrap_exception(exc, traceback_list, mapper):
                             {})
     new_exc = _try_switch_class(exc, new_type)
     if isinstance(new_exc, new_type):
-        new_exc._upimap_orig_class = old_type
-        new_exc._upimap_traceback_list = traceback_list
-        new_exc._upimap_mapper = mapper
+        new_exc._parimap_orig_class = old_type
+        new_exc._parimap_traceback_list = traceback_list
+        new_exc._parimap_mapper = mapper
     return new_exc
 
 _config = {
@@ -144,7 +240,7 @@ def configure(mode=None, processes=None):
     if processes is not None:
         self._config["processes"] = processes
 
-def upimap(fn, iterator, **kwargs):
+def parimap(fn, iterator, **kwargs):
     iterator = iter(iterator)
     special_args = {}
     for key in kwargs:
@@ -277,12 +373,12 @@ class MPimap(object):
             and self._jobs_finished == self._jobs_started):
             self._transition(self._FINISHED)
         if self._state is self._DEBUGGABLE:
-            raise UPIMapError("called next() on a mapper that has already "
+            raise ParimapError("called next() on a mapper that has already "
                               "failed")
         elif self._state is self._CRASHED:
-            raise UPIMapError("child process died unexpectedly")
+            raise ParimapError("child process died unexpectedly")
         elif self._state is self._CLOSED:
-            raise UPIMapError(".next() called on a closed iterator")
+            raise ParimapError(".next() called on a closed iterator")
         elif self._state is self._FINISHED:
             raise StopIteration
         else:
@@ -333,7 +429,7 @@ class MPimap(object):
 
     def post_mortem(self):
         if self._state is not self._DEBUGGABLE:
-            raise UPIMapError("no jobs have failed, so nothing to debug")
+            raise ParimapError("no jobs have failed, so nothing to debug")
         self._debug_start_queue.put(None)
         result = self._debug_done_queue.get()
         if result[0] == "debug-exc":
