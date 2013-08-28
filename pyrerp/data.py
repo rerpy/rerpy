@@ -8,7 +8,7 @@ import pandas
 from patsy import DesignInfo
 from pyrerp.util import unpack_pandas, pack_pandas
 import pyrerp.events
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 import abc
 
 class ElectrodeInfo(object):
@@ -86,6 +86,12 @@ class DataFormat(object):
     def __ne__(self, other):
         return not (self == other)
 
+    def ms_to_samples(self, ms):
+        return int(round(ms * self.exact_sample_rate_hz / 1000.0))
+
+    def samples_to_ms(self, samples):
+        return samples * 1000.0 / self.exact_sample_rate_hz
+
     def compute_symbolic_transform(self, expression, exclude=[]):
         # This converts symbolic expressions like "-A1/2" into
         # matrices which perform that transformation. (Actually it is a bit of
@@ -124,6 +130,9 @@ def test_DataFormat():
     # no duplicate channel names
     assert_raises(ValueError, DataFormat, 1024, "uV", ["MiCe", "MiCe"])
 
+    assert df.ms_to_samples(1000) == 1024
+    assert df.samples_to_ms(1024) == 1000
+
     assert df == df
     assert not (df != df)
 
@@ -159,7 +168,6 @@ class Recording(object):
     electrode_info = None
     "ElectrodeInfo object (if available, can be None)"
 
-
     # Subclasses that represent an on-disk file should probably provide some
     # sort of pathname attribute as well, but this can get more complicated
     # (e.g. kutaslab recordings consist of *two* files, a .log and a
@@ -184,6 +192,10 @@ class Recording(object):
 
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self.name)
+
+rERPSpec = namedtuple("rERPSpec",
+                      ["name", "event_query", "start_time", "stop_time",
+                       "formula"])
 
 class DataSet(object):
     def __init__(self, recordings=[]):
@@ -238,47 +250,115 @@ class DataSet(object):
                 info[(recording, span_id)] = length
         return info
 
-    def span_items(self):
-        for recording in self._recordings:
-            for (span_id, in_data) in recording.span_items():
-                yield (recording, span_id), self._transform_data(data)
+    def span_items(self, spans=None):
+        if spans is None:
+            spans = self.span_lengths
+        # We keep a cache of a single recording/iterator/data value
+        # So if your spans are ordered (possibly with repeats) then we are
+        # very efficient. Otherwise not so much.
+        # XX FIXME: eventually may want to push the span_id filtering down
+        # into Recordings, I guess, to better support file formats that allow
+        # random access?
+        current_recording = None
+        current_iter = None
+        current_span_id = None
+        current_transformed_data = None
+        for span in spans:
+            wanted_recording, wanted_span_id = span
+            if (wanted_recording is not current_recording
+                or (current_span_id is not None
+                    and current_span_id > wanted_span_id)):
+                current_recording = wanted_recording
+                current_iter = iter(enumerate(current_recording.span_data()))
+                current_span_id = None
+                current_transformed_data = None
+            while current_span_id != wanted_span_id:
+                try:
+                    span_id, in_data = current_iter.next()
+                except StopIteration:
+                    raise KeyError, span
+                if span_id == wanted_span_id:
+                    current_span_id = span_id
+                    current_transformed_data = self._transform_data(in_data)
+            assert wanted_recording is current_recording
+            assert current_span_id == wanted_span_id
+            yield ((current_recording, current_span_id),
+                   current_transformed_data)
 
-    def span_values(self):
-        for _, data in self.span_items():
+    def span_values(self, spans=None):
+        for _, data in self.span_items(spans=recordings):
             yield data
 
-    # For each event type, need:
-    #   name/tag
-    #   query
-    #   formula
-    #   start time, stop time
-    def rerp(self, event_query, start_time, stop_time, formula,
+    def rerp(self, name, event_query, start_time, stop_time, formula,
              artifact_query="has _ARTIFACT_TYPE",
              artifact_type_field="_ARTIFACT_TYPE",
              overlap_correction=True,
-             # This can be True, False, or "auto". If False, we always build
-             # one giant regression model, treating the data as continuous. If
-             # "auto", we use the (much faster) approach of generating a
-             # single regression model and then applying it to each latency
-             # separately -- but *only* if this will produce the same result
-             # as doing the full regression. If True, then we either use the
-             # fast method, or else error out. Changing this argument never
-             # affects the actual output of this function -- if it does,
-             # that's a bug! In general, we can do the fast thing if:
-             #   -- overlap_correction=False, or
-             #   -- overlap_correction=True and there are in fact no overlaps,
-             #      and
-             #   -- any artifacts affect either all or none of each epoch.
-             regress_by_epoch="auto"):
-        rerp_specs = [("", event_query, start_time, stop_time, formula)]
+             regression_strategy="auto"):
+        rerp_specs = [rERPSpec(name, event_query,
+                               start_time, stop_time, formula)]
         return self.multi_rerp(rerp_specs,
                                artifact_query=artifact_query,
                                artifact_type_field=artifact_type_field,
                                overlap_correction=overlap_correction,
-                               regress_by_epoch="auto")
+                               regression_strategy=regression_strategy)
 
     def multi_rerp(self, rerp_specs,
                    artifact_query="has _ARTIFACT_TYPE",
                    artifact_type_field="_ARTIFACT_TYPE",
-                   overlap_correction="if-needed"):
+                   overlap_correction=True,
+                   # This can be "continuous", "by-epoch", or "auto". If
+                   # "continuous", we always build one giant regression model,
+                   # treating the data as continuous. If "auto", we use the
+                   # (much faster) approach of generating a single regression
+                   # model and then applying it to each latency separately --
+                   # but *only* if this will produce the same result as doing
+                   # the full regression. If "epoch", then we either use the
+                   # fast method, or else error out. Changing this argument
+                   # never affects the actual output of this function -- if it
+                   # does, that's a bug! In general, we can do the fast thing
+                   # if:
+                   # -- any artifacts affect either all or none of each
+                   #    epoch, and
+                   # -- either, overlap_correction=False,
+                   # -- or, overlap_correction=True and there are in fact no
+                   #    overlaps.
+                   regression_strategy="auto"):
+        return multi_rerp_impl(self, rerp_specs,
+                               artifact_query, artifact_type_field,
+                               overlap_correction, regression_strategy)
+
+
+
+        # For artifact and bad data in general counting:
+        # make an intervalset for each kind of bad data
+        # intersect each with the "wanted data" spans to throw away
+        # irrelevantly bad data
+        # and then do a special union operation that counts which and how many
+        # of the inputs is non-zero at each point, to calculate shares
+
+
+        # First get a representation of all okay data
+        # starting with which spans we have recordings for,
+        # then subtract artifacts,
+        # then subtract NAs
+        # Then for the rest of the data,
+        epoch_spans = []
+        bad_spans = []
+        for (name, event_query, start_time, stop_time, formula) in rerp_specs:
+
+            event_set = self.events.query(event_query)
+
+        # Make a design matrix for each
+        # Figure out which data points are okay:
+        #   -- where there is some entry in the design matrix
+        #   -- where there is no artifact
+        #   -- where all the design matrixes are non-NA
+
+        # list like (start, stop, info), sort then scan to find overlaps. info
+        # can be a reference to a row in a design matrix, or it could be a
+        # note that the given span is off-limits.
+        # If overlap_correction=False, we are going to handle each data span
+        # individually. The only question is whether any of them have partial
+        # overlaps with artifacts -- if so, then we need to do the
+        # And if regress_by_epoch is auto or
         pass

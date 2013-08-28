@@ -524,6 +524,17 @@ class Event(object):
         self._events = events
         self._id = id
 
+    def __eq__(self, other):
+        if not isinstance(other, Event):
+            return False
+        return (self._events is other._events) and (self._id == other._id)
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((id(self._events), self._id))
+
     def __getstate__(self):
         raise ValueError, "Event objects are not pickleable"
 

@@ -12,30 +12,6 @@ import multiprocessing
 
 from pyrerp.incremental_ls import XtXIncrementalLS
 
-# We pass data to children using shared memory. This is more portable than
-# playing tricks with fork() (i.e., it works on windows), but much cheaper
-# than pickling the arrays.
-def mp_wrap_array(arr):
-    if arr.dtype == np.dtype(np.float64):
-        typecode = "d"
-    elif arr.dtype == np.dtype(np.float32):
-        typecode = "f"
-    else:
-        raise ValueError("don't know how to put dtype %r in shared memory"
-                         % (arr.dtype,))
-    shared_data = multiprocessing.sharedctypes.RawArray(typecode, arr.size)
-    shared_ndarray = np.ctypeslib.as_array(shared_data)
-    shared_ndarray.shape = arr.shape
-    shared_ndarray[...] = arr[...]
-    box = (shared_data, arr.shape)
-    return box
-
-def mp_unwrap_array(box):
-    shared_data, shape = box
-    shared_ndarray = np.ctypeslib.as_array(shared_data)
-    shared_ndarray.shape = shape
-    return shared_ndarray
-
 # How many data points/rows of the expanded X matrix should we process in each
 # batch? Larger numbers produce a smaller number of larger jobs, so there's
 # some trade-off: we want something small enough to effectively parallelize

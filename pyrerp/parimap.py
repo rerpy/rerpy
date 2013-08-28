@@ -51,7 +51,8 @@
 # tricks for better IPC: picloud-style pickling, fork sharing?
 # support for other parallelization systems (ssh, slurm, sge, picloud)?
 # chunking?
-# passing numpy arrays through shared memory?
+# passing numpy arrays through shared memory? (not clear if this is really
+#   even a win)
 # coordination between multiple parimaps, allowing you to have multiple
 #   instantiated at once (e.g., one feeding another), and coordinate the work
 #   using a shared process pool? (Deadlock avoidance becomes a bit tricky!)
@@ -161,17 +162,41 @@ def configure(mode=None, processes=None):
     if processes is not None:
         self._config["processes"] = processes
 
-def parimap(fn, iterator, **kwargs):
-    iterator = iter(iterator)
+class _OrderPreserver(object):
+    def __init__(self, fn):
+        self._fn = fn
+
+    def __call__(self, *args, **kwargs):
+        return (args[0], self._fn(*args[1:], **kwargs))
+
+def parimap(fn, *iterables, **kwargs):
+    if _config["mode"] == "serial":
+        return parimap_unordered(fn, *iterables, **kwargs)
+    else:
+        iterables = (itertools.count(),) + iterables
+        result_idxs = {}
+        next_result_idx = 0
+        for idx, result in parimap_unordered(_OrderPreserver(fn),
+                                             *iterables, **kwargs):
+            result_idxs[idx] = result
+            while next_result_idx in result_idxs:
+                result = result_idxs[next_result_idx]
+                del result_idxs[next_result_idx]
+                yield result
+                next_result_idx += 1
+
+
+def parimap_unordered(fn, *iterables, **kwargs):
+    iterators = [iter(obj) for obj in iterables]
     special_args = {}
     for key in kwargs:
         if key.startswith("__"):
             special_args[key[2:]] = kwargs[key]
             del kwargs[key]
     if _config["mode"] == "serial":
-        return itertools.imap(fn, iterator, **kwargs)
+        return itertools.imap(fn, *iterators, **kwargs)
     elif _config["mode"] == "multiprocess":
-        return MPimap(fn, iterator, kwargs, special_args)
+        return MPimap(fn, iterators, kwargs, special_args)
 
 def _mpimap_worker(worker_id, fn, kwargs,
                    work_queue, result_queue,
