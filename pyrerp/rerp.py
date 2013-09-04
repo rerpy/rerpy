@@ -8,7 +8,7 @@ from collections import namedtuple, OrderedDict
 import numpy as np
 import scipy.sparse as sp
 import pandas
-from patsy import (dmatrices, ModelDesc, Term, build_design_matrices)
+from patsy import dmatrices, ModelDesc, Term, build_design_matrices
 
 from pyrerp.incremental_ls import XtXIncrementalLS
 from pyrerp.parimap import parimap_unordered
@@ -38,12 +38,12 @@ def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
                     eval_env):
     # We need to be able to refer to individual recording spans in a
     # convenient, sortable way -- but Recording objects aren't sortable and
-    # are otherwise inconvenient to work with. So we assign a sequential
-    # integer id to each (Recording, span_id) pair.
-    recording_span_lengths = data_set.span_lengths
-    recording_span_intern_table = {}
-    for (i, recording_and_span_id) in enumerate(recording_span_lengths):
-        recording_span_intern_table[recording_and_span_id] = i
+    # are otherwise inconvenient to work with. So we represent each
+    # (Recording, span) pair by its index in the data_set.
+    recspan_lengths = data_set.span_lengths
+    recspan_intern_table = {}
+    for (i, recording_and_span_id) in enumerate(recspan_lengths):
+        recspan_intern_table[recording_and_span_id] = i
 
     # This list contains 3-tuples that record the position of interesting
     # events in the data, like epochs that are to be analyzed and
@@ -56,12 +56,12 @@ def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
     spans = []
 
     # Get artifacts.
-    spans.extend(_artifact_spans(recording_span_intern_table, data_set,
+    spans.extend(_artifact_spans(recspan_intern_table, data_set,
                                  artifact_query, artifact_type_field))
 
     # And now get the events themselves, and calculate the associated epochs
     # (and any associated artifacts).
-    epoch_span_info = _epoch_spans(recording_span_intern_table,
+    epoch_span_info = _epoch_spans(recspan_intern_table,
                                    data_set, rerp_specs,
                                    eval_env)
     (rerp_infos, epoch_spans,
@@ -149,16 +149,16 @@ def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
                         total_overlap_ticks, total_overlap_multiplicity,
                         artifact_counts, betas)
 
-def _artifact_spans(recording_span_intern_table,
+def _artifact_spans(recspan_intern_table,
                     data_set, artifact_query, artifact_type_field):
     # Create "artifacts" to prevent us from trying to analyze any
     # data the falls outwith the bounds of our recordings.
     for recspan, length in data_set.span_lengths.iteritems():
-        recording_span_intern = recording_span_intern_table[recspan]
-        neg_inf = (recording_span_intern, -2**31)
-        zero = (recording_span_intern, 0)
-        end = (recording_span_intern, length)
-        pos_inf = (recording_span_intern, 2**31)
+        recspan_intern = recspan_intern_table[recspan]
+        neg_inf = (recspan_intern, -2**31)
+        zero = (recspan_intern, 0)
+        end = (recspan_intern, length)
+        pos_inf = (recspan_intern, 2**31)
         yield (neg_inf, zero, _Artifact("_NO_RECORDING", None))
         yield (end, pos_inf, _Artifact("_NO_RECORDING", None))
 
@@ -169,9 +169,9 @@ def _artifact_spans(recording_span_intern_table,
             raise TypeError("artifact type must be a string, not %r"
                             % (artifact_type,))
         recspan = (artifact_event.recording, artifact_event.span_id)
-        recording_span_intern = recording_span_intern_table[recspan]
-        yield ((recording_span_intern, artifact_event.start_idx),
-               (recording_span_intern, artifact_event.stop_idx),
+        recspan_intern = recspan_intern_table[recspan]
+        yield ((recspan_intern, artifact_event.start_idx),
+               (recspan_intern, artifact_event.stop_idx),
                _Artifact(artifact_type, None))
 
 class _ArangeFactor(object):
@@ -188,7 +188,7 @@ class _ArangeFactor(object):
     def eval(self, state, data):
         return np.arange(self._n)
 
-def _epoch_spans(recording_span_intern_table, data_set, rerp_specs, eval_env):
+def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
     rerp_infos = []
     rerp_names = set()
     spans = []
@@ -230,11 +230,11 @@ def _epoch_spans(recording_span_intern_table, data_set, rerp_specs, eval_env):
             # -1 for non-existent
             design_row_idx = design_row_idxes[i]
             recspan = (event.recording, event.span_id)
-            recording_span_intern = recording_span_intern_table[recspan]
+            recspan_intern = recspan_intern_table[recspan]
             epoch_start = start_offset + event.start_idx
             epoch_stop = stop_offset + event.start_idx
-            epoch_span = ((recording_span_intern, epoch_start),
-                          (recording_span_intern, epoch_stop))
+            epoch_span = ((recspan_intern, epoch_start),
+                          (recspan_intern, epoch_stop))
             if design_row_idx == -1:
                 design_row = None
             else:
@@ -388,13 +388,13 @@ def _choose_strategy(requested_strategy,
                          % (requested_strategy,))
 
 def _analysis_jobs(data_set, analysis_spans):
-    recording_spans = list(data_set.span_lengths)
-    wanted_recording_spans = []
+    recspans = list(data_set.span_lengths)
+    wanted_recspans = []
     for start, stop, epochs in analysis_spans:
         assert start[0] == stop[0]
         # Un-intern
-        wanted_recording_spans.append(recording_spans[start[0]])
-    data_iter = data_set.span_values(wanted_recording_spans)
+        wanted_recspans.append(recspans[start[0]])
+    data_iter = data_set.span_values(wanted_recspans)
     for data, analysis_span in itertools.izip(data_iter, analysis_spans):
         start, stop, epochs = analysis_span
         yield data[start[1]:stop[1], :], start[1], epochs

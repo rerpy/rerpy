@@ -403,8 +403,9 @@ class KutaslabRecording(Recording):
         self._raw_log_events = raw_log_events
         self._calibration_condition = calibration_condition
 
-    def span_data(self):
-        for (start, stop) in self._span_slices:
+    def span_data(self, span_ids):
+        for span_id in span_ids:
+            start, stop = self._span_slices[span_id]
             yield self._data[start:stop, :]
 
     def event_iter(self):

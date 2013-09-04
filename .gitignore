@@ -1,6 +1,7 @@
 # Project specific files #
 ##########################
 
+MANIFEST
 .coverage
 htmlcov/
 .tox

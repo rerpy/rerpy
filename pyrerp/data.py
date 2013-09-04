@@ -4,6 +4,7 @@
 
 import cPickle
 from collections import OrderedDict, namedtuple
+from itertools import groupby, izip
 import abc
 
 import numpy as np
@@ -183,8 +184,8 @@ class Recording(object):
     "A list giving the length of each span (in order by span id)"
 
     @abc.abstractmethod
-    def span_data(self):
-        "Iterator over the data in each span (in order by span id)"
+    def span_data(self, span_ids=None):
+        """Iterator over the data for the given spans."""
 
     @abc.abstractmethod
     def event_iter(self):
@@ -196,9 +197,20 @@ class Recording(object):
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self.name)
 
-rERPSpec = namedtuple("rERPSpec",
-                      ["name", "event_query", "start_time", "stop_time",
-                       "formula"])
+_rERPSpec = namedtuple("_rERPSpec",
+                       ["name", "event_query", "start_time", "stop_time",
+                        "formula"])
+
+RecSpanId = namedtuple("RecSpanId", ["recording", "span_id"])
+
+def rERP(event_query, start_time, stop_time, formula="~ 1", name=None):
+    if name is None:
+        name = "%s: %s" % (event_query, formula)
+    return _rERPSpec(event_query=event_query,
+                     start_time=start_time,
+                     stop_time=stop_time,
+                     formula=formula,
+                     name=name)
 
 class DataSet(object):
     def __init__(self, recordings=[]):
@@ -250,43 +262,39 @@ class DataSet(object):
         info = OrderedDict()
         for recording in self._recordings:
             for (span_id, length) in enumerate(recording.span_lengths):
-                info[(recording, span_id)] = length
+                info[RecSpanId(recording, span_id)] = length
         return info
 
     def span_items(self, spans=None):
         if spans is None:
             spans = self.span_lengths
-        # We keep a cache of a single recording/iterator/data value
-        # So if your spans are ordered (possibly with repeats) then we are
-        # very efficient. Otherwise not so much.
-        # XX FIXME: eventually may want to push the span_id filtering down
-        # into Recordings, I guess, to better support file formats that allow
-        # random access?
-        current_recording = None
-        current_iter = None
-        current_span_id = None
-        current_transformed_data = None
-        for span in spans:
-            wanted_recording, wanted_span_id = span
-            if (wanted_recording is not current_recording
-                or (current_span_id is not None
-                    and current_span_id > wanted_span_id)):
-                current_recording = wanted_recording
-                current_iter = iter(enumerate(current_recording.span_data()))
-                current_span_id = None
-                current_transformed_data = None
-            while current_span_id != wanted_span_id:
-                try:
-                    span_id, in_data = current_iter.next()
-                except StopIteration:
-                    raise KeyError, span
-                if span_id == wanted_span_id:
-                    current_span_id = span_id
-                    current_transformed_data = self._transform_data(in_data)
-            assert wanted_recording is current_recording
-            assert current_span_id == wanted_span_id
-            yield ((current_recording, current_span_id),
-                   current_transformed_data)
+        # Two pieces of trickiness here, both solved by using
+        # itertools.groupby. Both imply that for maximum efficiency, you
+        # should provide your spans= in sorted order if possible.
+        # 1) Some Recording objects may be able to spit out a list of n
+        # spans in a single call more quickly than they can spans for n single
+        # calls (because underneath they're using some sequential-access
+        # storage format, and this lets them do 1 pass instead of n
+        # passes). So we want to make only a single call to
+        # recording.span_data per recording.
+        # 2) If the exact same span is requested multiple times (and this is
+        # the easiest way to write e.g. the rERP algorithm), then we don't
+        # want to search for it and transform it multiple times. So we
+        # collapse together repeats before passing them to
+        # recording.span_data, and then re-duplicate them when yielding.
+        for recording, rec_iter in groupby(spans, lambda recspan: recspan[0]):
+            span_ids = []
+            counts = []
+            for recspan, recspan_iter in groupby(rec_iter):
+                span_ids.append(recspan[1])
+                # sum(...) is a cute generator expression idiom for
+                # len(iter) (because len(iter) doesn't work)
+                counts.append(sum(1 for _ in recspans))
+            for i, in_data in enumerate(recording.span_data(spans=span_ids)):
+                recspan = RecSpanId(recording, span_ids[i])
+                data = self._transform_data(in_data)
+                for j in xrange(counts[i]):
+                    yield (recspan, data)
 
     def span_values(self, spans=None):
         for _, data in self.span_items(spans=spans):

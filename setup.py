@@ -26,7 +26,7 @@ setup(
     license="XX None yet",
     packages=["pyrerp"],
     url="https://github.com/njsmith/pyrerp",
-    requires=["numpy", "scipy", "patsy"],
+    requires=["numpy", "scipy", "pandas", "patsy"],
     classifiers =
       [ "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",

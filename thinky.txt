@@ -1,3 +1,12 @@
+need a way to save DataSets
+  either with or without data
+  without data: ask each Recording for an object that when unpickled
+    and then called will return the original recording
+  with data: for each recording dump the data out and use a special
+    InOurProprietaryDataFormatRecording
+
+datasets should have
+
 formats:
   Python code for reading .cnt (NeuroScan) files (no license but could
   easily rewrite or email about):
