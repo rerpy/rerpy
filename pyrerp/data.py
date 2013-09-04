@@ -3,13 +3,16 @@
 # See file COPYING for license information.
 
 import cPickle
-import numpy as np
-import pandas
-from patsy import DesignInfo
-from pyrerp.util import unpack_pandas, pack_pandas
-import pyrerp.events
 from collections import OrderedDict, namedtuple
 import abc
+
+import numpy as np
+import pandas
+from patsy import DesignInfo, EvalEnvironment
+
+from pyrerp.util import unpack_pandas, pack_pandas
+import pyrerp.events
+from pyrerp.rerp import multi_rerp_impl
 
 class ElectrodeInfo(object):
     def __init__(self, names, thetas, rs):
@@ -224,7 +227,7 @@ class DataSet(object):
         if self._transform is None:
             return data
         else:
-            return np.dot(self._transform, data)
+            return np.dot(data, self._transform.T)
 
     def transform(self, transformation, exclude=[]):
         if self._transform is None:
@@ -286,21 +289,24 @@ class DataSet(object):
                    current_transformed_data)
 
     def span_values(self, spans=None):
-        for _, data in self.span_items(spans=recordings):
+        for _, data in self.span_items(spans=spans):
             yield data
 
     def rerp(self, name, event_query, start_time, stop_time, formula,
              artifact_query="has _ARTIFACT_TYPE",
              artifact_type_field="_ARTIFACT_TYPE",
              overlap_correction=True,
-             regression_strategy="auto"):
+             regression_strategy="auto",
+             eval_env=0):
+        eval_env = EvalEnvironment.capture(eval_env, reference=1)
         rerp_specs = [rERPSpec(name, event_query,
                                start_time, stop_time, formula)]
         return self.multi_rerp(rerp_specs,
                                artifact_query=artifact_query,
                                artifact_type_field=artifact_type_field,
                                overlap_correction=overlap_correction,
-                               regression_strategy=regression_strategy)
+                               regression_strategy=regression_strategy,
+                               eval_env=eval_env)
 
     def multi_rerp(self, rerp_specs,
                    artifact_query="has _ARTIFACT_TYPE",
@@ -322,10 +328,13 @@ class DataSet(object):
                    # -- either, overlap_correction=False,
                    # -- or, overlap_correction=True and there are in fact no
                    #    overlaps.
-                   regression_strategy="auto"):
+                   regression_strategy="auto",
+                   eval_env=0):
+        eval_env = EvalEnvironment.capture(eval_env, reference=1)
         return multi_rerp_impl(self, rerp_specs,
                                artifact_query, artifact_type_field,
-                               overlap_correction, regression_strategy)
+                               overlap_correction, regression_strategy,
+                               eval_env)
 
 
 

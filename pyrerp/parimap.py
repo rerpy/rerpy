@@ -171,7 +171,8 @@ class _OrderPreserver(object):
 
 def parimap(fn, *iterables, **kwargs):
     if _config["mode"] == "serial":
-        return parimap_unordered(fn, *iterables, **kwargs)
+        for result in parimap_unordered(fn, *iterables, **kwargs):
+            yield result
     else:
         iterables = (itertools.count(),) + iterables
         result_idxs = {}
@@ -205,9 +206,9 @@ def _mpimap_worker(worker_id, fn, kwargs,
         get = work_queue.get
         put = result_queue.put
         while True:
-            iterator_value = get()
+            iterator_values = get()
             try:
-                result = fn(iterator_value, **kwargs)
+                result = fn(*iterator_values, **kwargs)
             except BaseException, e:
                 _, _, tb = sys.exc_info()
                 put(("exc", e, traceback.extract_tb(tb), worker_id))
@@ -254,11 +255,11 @@ class MPimap(object):
     #           -> _FINISHED ----\
     #           ------------------+-> _CLOSED
 
-    def __init__(self, fn, iterator, kwargs, special_args):
+    def __init__(self, fn, iterators, kwargs, special_args):
         self._fn = fn
         self._kwargs = kwargs
-        self._iterator = iterator
-        self._iterator_has_more = True
+        self._iterators = iterators
+        self._iterators_have_more = True
         self._special_args = special_args
 
         if _config["processes"] == "auto":
@@ -315,7 +316,7 @@ class MPimap(object):
 
     def next(self):
         if (self._state is self._RUNNING
-            and not self._iterator_has_more
+            and not self._iterators_have_more
             and self._jobs_finished == self._jobs_started):
             self._transition(self._FINISHED)
         if self._state is self._DEBUGGABLE:
@@ -349,7 +350,7 @@ class MPimap(object):
         # later, in serial, in this process. If the workers go faster than the
         # input iterator, then eventually this loop will still terminate once
         # the work and result queues have both filled up.
-        if self._iterator_has_more:
+        if self._iterators_have_more:
             # .full() is documented to be somewhat unreliable, but the code
             # looks clear to me -- it just checks the value of the semaphore
             # that counts queued items, and put() acquires this semaphore
@@ -359,12 +360,12 @@ class MPimap(object):
             # calling full().
             while not self._work_queue.full():
                 try:
-                    value = self._iterator.next()
+                    values = [it.next() for it in self._iterators]
                 except StopIteration:
-                    self._iterator_has_more = False
+                    self._iterators_have_more = False
                     break
                 self._jobs_started += 1
-                self._work_queue.put(value)
+                self._work_queue.put(values)
         # Check for dead processes
         # XX FIXME: should we key this off SIGCHLD or a timer or anything? it
         # might be a bit expensive to do a full poll after every single job.

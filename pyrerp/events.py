@@ -9,9 +9,10 @@ import struct
 from cStringIO import StringIO
 import numpy as np
 import pandas
-from patsy import PatsyError
-from patsy.origin import Origin
-from patsy.parse_core import Token, Operator, parse
+from patsy import PatsyError, Origin
+# XX FIXME: these aren't actually exposed from patsy yet, should fix that at
+# some point...
+from patsy.infix_parser import Token, Operator, infix_parse
 # We need isinstance(..., Recording), but we don't do 'from ... import
 # Recording' because that would create a circular import:
 import pyrerp.data
@@ -1140,4 +1141,4 @@ def _eval(events, tree):
         assert False
 
 def query_from_string(events, string):
-    return _eval(events, parse(_tokenize(string), _ops, _atomic))
+    return _eval(events, infix_parse(_tokenize(string), _ops, _atomic))

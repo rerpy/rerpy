@@ -7,7 +7,8 @@ from collections import namedtuple, OrderedDict
 
 import numpy as np
 import scipy.sparse as sp
-from patsy import build_design_matrices
+import pandas
+from patsy import (dmatrices, ModelDesc, Term, build_design_matrices)
 
 from pyrerp.incremental_ls import XtXIncrementalLS
 from pyrerp.parimap import parimap_unordered
@@ -15,13 +16,15 @@ from pyrerp.parimap import parimap_unordered
 # Can't use a namedtuple for this because we want __eq__ and __hash__ to use
 # identity semantics, not value semantics.
 class _Epoch(object):
-    def __init__(self, start_idx, epoch_len,
-                 design_row, design_offset, expanded_design_offset):
+    def __init__(self, start_idx, ticks,
+                 design_row, design_offset, expanded_design_offset,
+                 rerp_idx):
         self.start_idx = start_idx
-        self.epoch_len = epoch_len
+        self.ticks = ticks
         self.design_row = design_row
         self.design_offset = design_offset
         self.expanded_design_offset = expanded_design_offset
+        self.rerp_idx = rerp_idx
 
 # If an artifact has a non-None "epoch" field, then it means that when overlap
 # correction is disabled, this artifact only applies to the given epoch. (This
@@ -31,7 +34,8 @@ class _Epoch(object):
 _Artifact = namedtuple("_Artifact", ["type", "epoch"])
 
 def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
-                    overlap_correction, regression_strategy):
+                    overlap_correction, regression_strategy,
+                    eval_env):
     # We need to be able to refer to individual recording spans in a
     # convenient, sortable way -- but Recording objects aren't sortable and
     # are otherwise inconvenient to work with. So we assign a sequential
@@ -58,7 +62,8 @@ def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
     # And now get the events themselves, and calculate the associated epochs
     # (and any associated artifacts).
     epoch_span_info = _epoch_spans(recording_span_intern_table,
-                                   data_set, rerp_specs)
+                                   data_set, rerp_specs,
+                                   eval_env)
     (rerp_infos, epoch_spans,
      design_width, expanded_design_width) = epoch_span_info
     spans.extend(epoch_spans)
@@ -75,6 +80,9 @@ def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
     epochs_with_artifacts = set()
     total_wanted_ticks = 0
     total_good_ticks = 0
+    total_overlap_ticks = 0
+    total_overlap_multiplicity = 0
+    artifact_counts = {}
     # _epoch_subspans gives us chunks of data that we would *like* to analyze,
     # along with the epochs and artifacts that are relevant to it. This
     # representation already incorporates the effects of having overlap
@@ -88,20 +96,27 @@ def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
     for epoch_subspan in _epoch_subspans(spans, overlap_correction):
         start, stop, epochs, artifacts = epoch_subspan
         assert epochs
-        total_wanted_ticks += stop[1] - start[1]
+        ticks = stop[1] - start[1]
+        total_wanted_ticks += ticks
         if artifacts:
             epochs_with_artifacts.update(epochs)
-            _count_artifacts(artifact_counts, stop[1] - start[1], artifacts)
+            _count_artifacts(artifact_counts, ticks, artifacts)
         else:
             epochs_with_data.update(epochs)
             if len(epochs) > 1:
                 have_multi_epoch_data = True
-            total_good_ticks += stop[1] - start[1]
+                total_overlap_ticks += ticks
+            total_good_ticks += ticks
+            total_overlap_multiplicity += ticks * len(epochs)
             analysis_spans.append((start, stop, epochs))
 
+    for epoch in epochs_with_data:
+        rerp_infos[epoch.rerp_idx]["epochs_with_data"] += 1
+    for epoch in epochs_with_artifacts:
+        rerp_infos[epoch.rerp_idx]["epochs_with_artifacts"] += 1
+    partial_epochs = epochs_with_data.intersection(epochs_with_artifacts)
     regression_strategy = _choose_strategy(regression_strategy,
-                                           epochs_with_data,
-                                           epochs_with_artifacts,
+                                           bool(partial_epochs),
                                            have_multi_epoch_data)
 
     if regression_strategy == "by-epoch":
@@ -110,8 +125,7 @@ def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
         worker = _ContinuousWorker(expanded_design_width)
     else:
         assert False
-    jobs_iter = _analysis_jobs(data_set, recording_span_intern_table,
-                               analysis_spans)
+    jobs_iter = _analysis_jobs(data_set, analysis_spans)
     model = XtXIncrementalLS()
     for job_result in parimap_unordered(worker, jobs_iter):
         model.append_bottom_half(job_result)
@@ -127,11 +141,12 @@ def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
     #   ...
     #   predictor 2, latency n
     #   ...
-    betas.resize((-1, len(data_set.data_format.channel_names)))
+    betas = betas.reshape((-1, len(data_set.data_format.channel_names)))
 
     return rERPAnalysis(data_set.data_format,
                         rerp_infos, overlap_correction, regression_strategy,
                         total_wanted_ticks, total_good_ticks,
+                        total_overlap_ticks, total_overlap_multiplicity,
                         artifact_counts, betas)
 
 def _artifact_spans(recording_span_intern_table,
@@ -148,25 +163,39 @@ def _artifact_spans(recording_span_intern_table,
         yield (end, pos_inf, _Artifact("_NO_RECORDING", None))
 
     # Now lookup the actual artifacts recorded in the events structure.
-    for artifact_event in self.events.find(artifact_query):
+    for artifact_event in data_set.events.find(artifact_query):
         artifact_type = artifact_event.get(artifact_type_field, "_UNKNOWN")
         if not isinstance(artifact_type, basestring):
             raise TypeError("artifact type must be a string, not %r"
                             % (artifact_type,))
         recspan = (artifact_event.recording, artifact_event.span_id)
         recording_span_intern = recording_span_intern_table[recspan]
-        yield ((recording_span_intern, artifact_event.start_idx)
+        yield ((recording_span_intern, artifact_event.start_idx),
                (recording_span_intern, artifact_event.stop_idx),
                _Artifact(artifact_type, None))
 
-def _epoch_spans(recording_span_intern_table, data_set, rerp_specs):
+class _ArangeFactor(object):
+    def __init__(self, n):
+        self._n = n
+        self.origin = None
+
+    def name(self):
+        return "arange(%s)" % (self._n,)
+
+    def memorize_passes_needed(self, state):
+        return 0
+
+    def eval(self, state, data):
+        return np.arange(self._n)
+
+def _epoch_spans(recording_span_intern_table, data_set, rerp_specs, eval_env):
     rerp_infos = []
     rerp_names = set()
     spans = []
     design_offset = 0
     expanded_design_offset = 0
     data_format = data_set.data_format
-    for rerp_spec in rerp_specs:
+    for rerp_idx, rerp_spec in enumerate(rerp_specs):
         start_offset = data_format.ms_to_samples(rerp_spec.start_time)
         # Offsets are half open: [start, stop)
         # But, it's more intuitive for times to be closed: [start, stop]
@@ -175,22 +204,44 @@ def _epoch_spans(recording_span_intern_table, data_set, rerp_specs):
         stop_offset = 1 + data_format.ms_to_samples(rerp_spec.stop_time)
         if start_offset >= stop_offset:
             raise ValueError("Epochs must be >1 sample long!")
-        event_set = self.events.find(rerp_spec.event_query)
-        design = patsy.dmatrix(rerp_spec.formula, event_set,
-                               return_type="dataframe")
+        event_set = data_set.events.find(rerp_spec.event_query)
+        # Tricky bit: the specifies a RHS-only formula, but really we have an
+        # implicit LHS (determined by the event_query). This makes things
+        # complicated when it comes to e.g. keeping track of which items
+        # survived NA removal, determining the number of rows in an
+        # intercept-only formula, etc. Really we want patsy to just treat all
+        # this stuff the same way as it normally handles a LHS~RHS
+        # formula. So, we convert our RHS formula into a LHS~RHS formula,
+        # using a special LHS that represents each event by a placeholder
+        # integer!
+        desc = ModelDesc.from_formula(rerp_spec.formula, eval_env)
+        if desc.lhs_termlist:
+            raise ValueError("Formula cannot have a left-hand side")
+        desc.lhs_termlist = [Term([_ArangeFactor(len(event_set))])]
+        fake_lhs, design = dmatrices(desc, event_set)
+        surviving_event_idxes = np.asarray(fake_lhs, dtype=int).ravel()
+        design_row_idxes = np.empty(len(event_set))
+        design_row_idxes.fill(-1)
+        design_row_idxes[surviving_event_idxes] = np.arange(design.shape[0])
+        # Now design_row_idxes[i] is -1 if event i was thrown out, and
+        # otherwise gives the row in 'design' which refers to event 'i'.
         for i in xrange(len(event_set)):
             event = event_set[i]
-            recording_span_intern = recspan_intern_from_event(event)
+            # -1 for non-existent
+            design_row_idx = design_row_idxes[i]
+            recspan = (event.recording, event.span_id)
+            recording_span_intern = recording_span_intern_table[recspan]
             epoch_start = start_offset + event.start_idx
             epoch_stop = stop_offset + event.start_idx
             epoch_span = ((recording_span_intern, epoch_start),
                           (recording_span_intern, epoch_stop))
-            if i not in design.index:
+            if design_row_idx == -1:
                 design_row = None
             else:
-                design_row = np.asarray(design.loc[i, :])
+                design_row = design[design_row_idx, :]
             epoch = _Epoch(epoch_start, epoch_stop - epoch_start,
-                           design_row, design_offset, expanded_design_offset)
+                           design_row, design_offset, expanded_design_offset,
+                           rerp_idx)
             if design_row is None:
                 # Event thrown out due to missing predictors; this
                 # makes its whole epoch into an artifact -- but if overlap
@@ -204,15 +255,19 @@ def _epoch_spans(recording_span_intern_table, data_set, rerp_specs):
         if rerp_spec.name in rerp_names:
             raise ValueError("name %r used for two different sub-analyses"
                              % (rerp_spec.name,))
-        rerp_names.add(rerp_spec.name]
-        rerp_infos.append({
+        rerp_names.add(rerp_spec.name)
+        rerp_info = {
             "spec": rerp_spec,
             "design_info": design.design_info,
             "start_offset": start_offset,
             "stop_offset": stop_offset,
             "design_offset": design_offset,
             "expanded_design_offset": expanded_design_offset,
-            })
+            "total_epochs": len(event_set),
+            "epochs_with_data": 0,
+            "epochs_with_artifacts": 0,
+            }
+        rerp_infos.append(rerp_info)
         design_offset += design.shape[1]
         epoch_samples = stop_offset - start_offset
         expanded_design_offset += epoch_samples * design.shape[1]
@@ -282,11 +337,12 @@ def _epoch_subspans(spans, overlap_correction):
         else:
             assert isinstance(tag, _Artifact)
             tag_dict = current_artifacts
-        if incr == 1 and tag not in tag_dict:
+        if change == +1 and tag not in tag_dict:
             tag_dict[tag] = 0
-        tag_dict[tag] += incr
-        if incr == -1 and tag_dict[tag] == 0:
+        tag_dict[tag] += change
+        if change == -1 and tag_dict[tag] == 0:
             del tag_dict[tag]
+        last_position = position
     assert current_epochs == current_artifacts == {}
 
 def _count_artifacts(counts, num_points, artifacts):
@@ -304,13 +360,11 @@ def _count_artifacts(counts, num_points, artifacts):
         subcounts["proportional"] += num_points * 1.0 / len(artifacts)
 
 def _choose_strategy(requested_strategy,
-                     epochs_with_data, epochs_with_artifacts,
-                     have_multi_epoch_data):
+                     have_partial_epochs, have_multi_epoch_data):
+    by_epoch_possible = not (have_partial_epochs or have_multi_epoch_data)
     if requested_strategy == "continuous":
         return requested_strategy
-    have_partial_epochs = bool(epochs_with_data.intersection(epochs_with_artifacts))
-    by_epoch_possible = not (have_partial_epochs or have_multi_epoch_data)
-    if requested_strategy == "auto":
+    elif requested_strategy == "auto":
         if by_epoch_possible:
             return "by-epoch"
         else:
@@ -333,12 +387,14 @@ def _choose_strategy(requested_strategy,
                          "\"by-epoch\", \"continuous\", or \"auto\""
                          % (requested_strategy,))
 
-def _analysis_jobs(data_set, recording_span_intern_table, analysis_spans):
-    recording_spans = []
+def _analysis_jobs(data_set, analysis_spans):
+    recording_spans = list(data_set.span_lengths)
+    wanted_recording_spans = []
     for start, stop, epochs in analysis_spans:
         assert start[0] == stop[0]
-        recording_spans.append(recording_span_intern_table[start[0]])
-    data_iter = data_set.span_values(recording_spans)
+        # Un-intern
+        wanted_recording_spans.append(recording_spans[start[0]])
+    data_iter = data_set.span_values(wanted_recording_spans)
     for data, analysis_span in itertools.izip(data_iter, analysis_spans):
         start, stop, epochs = analysis_span
         yield data[start[1]:stop[1], :], start[1], epochs
@@ -388,14 +444,14 @@ class _ContinuousWorker(object):
         for epoch in epochs:
             for i, x_value in enumerate(epoch.design_row):
                 write_slice = slice(write_ptr, write_ptr + data.shape[0])
+                write_ptr += data.shape[0]
                 design_data[write_slice] = x_value
                 design_i[write_slice] = np.arange(data.shape[0])
                 col_start = epoch.expanded_design_offset
-                col_start += i * epoch.epoch_len
-                col_start += data_start_idx - epoch.epoch_start
+                col_start += i * epoch.ticks
+                col_start += data_start_idx - epoch.start_idx
                 design_j[write_slice] = np.arange(col_start,
                                                   col_start + data.shape[0])
-            write_ptr += design_row.shape[0] * data.shape[0]
         x_strip_coo = sp.coo_matrix((design_data, (design_i, design_j)),
                                     shape=(data.shape[0],
                                            self._expanded_design_width))
@@ -405,11 +461,16 @@ class _ContinuousWorker(object):
 
 class rERP(object):
     def __init__(self, rerp_info, data_format, betas):
-        self.name = rerp_info["name"]
         self.spec = rerp_info["spec"]
         self.design_info = rerp_info["design_info"]
         self.start_offset = rerp_info["start_offset"]
         self.stop_offset = rerp_info["stop_offset"]
+        self.total_epochs = rerp_info["total_epochs"]
+        self.epochs_with_data = rerp_info["epochs_with_data"]
+        self.epochs_with_artifacts = rerp_info["epochs_with_artifacts"]
+        self.partial_epochs = ((self.epochs_with_data
+                                + self.epochs_with_artifacts)
+                               - self.total_epochs)
         self.data_format = data_format
 
         self.epoch_ticks = self.stop_offset - self.start_offset
@@ -457,6 +518,7 @@ class rERPAnalysis(object):
     def __init__(self, data_format,
                  rerp_infos, overlap_correction, regression_strategy,
                  total_wanted_ticks, total_good_ticks,
+                 total_overlap_ticks, total_overlap_multiplicity,
                  artifact_counts, betas):
         self.overlap_correction = overlap_correction
         self.regression_strategy = regression_strategy
@@ -464,14 +526,16 @@ class rERPAnalysis(object):
         self.total_wanted_ticks = total_wanted_ticks
         self.total_good_ticks = total_good_ticks
         self.total_bad_ticks = total_wanted_ticks - total_good_ticks
+        self.total_overlap_ticks = total_overlap_ticks
+        self.mean_overlap = total_overlap_multiplicity * 1.0 / total_good_ticks
 
         self.rerps = OrderedDict()
-        for rerp_info in self.rerp_infos:
+        for rerp_info in rerp_infos:
             i = rerp_info["expanded_design_offset"]
             epoch_len = rerp_info["stop_offset"] - rerp_info["start_offset"]
             num_predictors = len(rerp_info["design_info"].column_names)
             this_betas = betas[i:i + epoch_len * num_predictors, :]
             this_betas.resize((num_predictors, epoch_len, this_betas.shape[1]))
-            self.rerps[rerp_info["name"]] = rERP(rerp_info,
-                                                 data_format,
-                                                 betas)
+            self.rerps[rerp_info["spec"].name] = rERP(rerp_info,
+                                                      data_format,
+                                                      this_betas)
