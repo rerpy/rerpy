@@ -18,20 +18,18 @@ from pyrerp.parimap import parimap_unordered
 class _Epoch(object):
     def __init__(self, start_idx, ticks,
                  design_row, design_offset, expanded_design_offset,
-                 rerp_idx):
+                 rerp_idx, intrinsic_artifacts):
         self.start_idx = start_idx
         self.ticks = ticks
         self.design_row = design_row
         self.design_offset = design_offset
         self.expanded_design_offset = expanded_design_offset
         self.rerp_idx = rerp_idx
+        self.intrinsic_artifacts = intrinsic_artifacts
 
-# If an artifact has a non-None "epoch" field, then it means that when overlap
-# correction is disabled, this artifact only applies to the given epoch. (This
-# is useful for "artifacts" like, that event missing some predictors. This
-# needs to be treated as an artifact when overlap rejection is turned on, but
-# not otherwise.)
-_Artifact = namedtuple("_Artifact", ["type", "epoch"])
+DataSpan = namedtuple("DataSpan", ["start", "stop", "epoch", "artifact"])
+DataSubSpan = namedtuple("DataSubSpan",
+                         ["start", "stop", "epochs", "artifacts"])
 
 def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
                     overlap_correction, regression_strategy,
@@ -159,8 +157,8 @@ def _artifact_spans(recspan_intern_table,
         zero = (recspan_intern, 0)
         end = (recspan_intern, length)
         pos_inf = (recspan_intern, 2**31)
-        yield (neg_inf, zero, _Artifact("_NO_RECORDING", None))
-        yield (end, pos_inf, _Artifact("_NO_RECORDING", None))
+        yield DataSpan(neg_inf, zero, None, "_NO_RECORDING")
+        yield DataSpan(end, pos_inf, None, "_NO_RECORDING")
 
     # Now lookup the actual artifacts recorded in the events structure.
     for artifact_event in data_set.events.find(artifact_query):
@@ -170,9 +168,10 @@ def _artifact_spans(recspan_intern_table,
                             % (artifact_type,))
         recspan = (artifact_event.recording, artifact_event.span_id)
         recspan_intern = recspan_intern_table[recspan]
-        yield ((recspan_intern, artifact_event.start_idx),
-               (recspan_intern, artifact_event.stop_idx),
-               _Artifact(artifact_type, None))
+        yield DataSpan((recspan_intern, artifact_event.start_idx),
+                       (recspan_intern, artifact_event.stop_idx),
+                       None,
+                       artifact_type)
 
 class _ArangeFactor(object):
     def __init__(self, n):
@@ -233,15 +232,13 @@ def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
             recspan_intern = recspan_intern_table[recspan]
             epoch_start = start_offset + event.start_idx
             epoch_stop = stop_offset + event.start_idx
-            epoch_span = ((recspan_intern, epoch_start),
-                          (recspan_intern, epoch_stop))
             if design_row_idx == -1:
                 design_row = None
             else:
                 design_row = design[design_row_idx, :]
             epoch = _Epoch(epoch_start, epoch_stop - epoch_start,
                            design_row, design_offset, expanded_design_offset,
-                           rerp_idx)
+                           rerp_idx, [])
             if design_row is None:
                 # Event thrown out due to missing predictors; this
                 # makes its whole epoch into an artifact -- but if overlap
@@ -249,9 +246,11 @@ def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
                 # this epoch, not anything else. (We still want to treat
                 # it as an artifact though so we get proper accounting at
                 # the end.)
-                artifact = _Artifact("_MISSING_PREDICTOR", epoch)
-                spans.append(epoch_span + (artifact,))
-            spans.append(epoch_span + (epoch,))
+                epoch.intrinsic_artifacts.append("_MISSING_PREDICTOR")
+            spans.append(DataSpan((recspan_intern, epoch_start),
+                                  (recspan_intern, epoch_stop),
+                                  epoch,
+                                  None))
         if rerp_spec.name in rerp_names:
             raise ValueError("name %r used for two different sub-analyses"
                              % (rerp_spec.name,))
@@ -312,48 +311,50 @@ def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
 def _epoch_subspans(spans, overlap_correction):
     state_changes = []
     for span in spans:
-        start, stop, tag = span
-        state_changes.append((start, tag, +1))
-        state_changes.append((stop, tag, -1))
+        start, stop, epoch, artifact = span
+        state_changes.append((start, epoch, artifact, +1))
+        state_changes.append((stop, epoch, artifact, -1))
     state_changes.sort()
     last_position = None
     current_epochs = {}
     current_artifacts = {}
-    for position, tag, change in state_changes:
+    for position, epoch, artifact, change in state_changes:
         if (last_position is not None
             and position != last_position
             and current_epochs):
             if overlap_correction:
-                yield (last_position, position,
-                       tuple(current_epochs), tuple(current_artifacts))
+                effective_artifacts = set(current_artifacts)
+                for epoch in current_epochs:
+                    effective_artifacts.update(epoch.intrinsic_artifacts)
+                yield DataSubSpan(last_position, position,
+                                  tuple(current_epochs),
+                                  tuple(effective_artifacts))
             else:
                 for epoch in current_epochs:
-                    yield (last_position, position,
-                           (epoch,),
-                           tuple(art for art in current_artifacts
-                                 if art.epoch is None or art.epoch is epoch))
-        if isinstance(tag, _Epoch):
-            tag_dict = current_epochs
-        else:
-            assert isinstance(tag, _Artifact)
-            tag_dict = current_artifacts
-        if change == +1 and tag not in tag_dict:
-            tag_dict[tag] = 0
-        tag_dict[tag] += change
-        if change == -1 and tag_dict[tag] == 0:
-            del tag_dict[tag]
+                    effective_artifacts = set(current_artifacts)
+                    effective_artifacts.update(epoch.intrinsic_artifacts)
+                    yield DataSubSpan(last_position, position,
+                                      (epoch,),
+                                      tuple(effective_artifacts))
+        for (state, state_dict) in [(epoch, current_epochs),
+                                    (artifact, current_artifacts)]:
+            if change == +1 and state not in state_dict:
+                state_dict[state] = 0
+            state_dict[state] += change
+            if change == -1 and state_dict[state] == 0:
+                del state_dict[state]
         last_position = position
     assert current_epochs == current_artifacts == {}
 
 def _count_artifacts(counts, num_points, artifacts):
     for artifact in artifacts:
-        if artifact.type not in counts:
-            counts[artifact.type] = {
+        if artifact not in counts:
+            counts[artifact] = {
                 "total": 0,
                 "unique": 0,
                 "proportional": 0,
                 }
-        subcounts = counts[artifact.type]
+        subcounts = counts[artifact]
         subcounts["total"] += num_points
         if len(artifacts) == 1:
             subcounts["unique"] += num_points
