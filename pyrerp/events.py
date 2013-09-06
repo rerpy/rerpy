@@ -13,9 +13,6 @@ from patsy import PatsyError, Origin
 # XX FIXME: these aren't actually exposed from patsy yet, should fix that at
 # some point...
 from patsy.infix_parser import Token, Operator, infix_parse
-# We need isinstance(..., Recording), but we don't do 'from ... import
-# Recording' because that would create a circular import:
-import pyrerp.data
 
 __all__ = ["Events", "EventsError"]
 
@@ -82,15 +79,11 @@ def _table_name(key):
 # string-queries (plus the actual database field name they map to).
 # In string queries these can be de-magicalified by quoting them with
 # backquotes, i.e.,:
-#   "_SPAN_ID == 1"   <-> placeholder.span_id == 1
-#   "`_SPAN_ID` == 1" <-> placeholder["_SPAN_ID"] == 1
-_magic_query_strings = set(["_RECORDING", "_SPAN_ID", "_START_IDX",
-                            "_STOP_IDX", "_RECORDING_NAME"])
+#   "_RECSPAN_ID == 1"   <-> placeholder.recspan_id == 1
+#   "`_RECSPAN_ID` == 1" <-> placeholder["_RECSPAN_ID"] == 1
+_magic_query_strings = set(["_RECSPAN_ID", "_START_IDX", "_STOP_IDX"])
 def _magic_query_string_to_query(events, name, origin=None):
-    if name == "_RECORDING":
-        return RecordingQuery(events, origin)
-    else:
-        return IndexFieldQuery(events, name[1:].lower(), origin)
+    return IndexFieldQuery(events, name[1:].lower(), origin)
 
 class Events(object):
     NUMERIC = "numeric"
@@ -98,10 +91,6 @@ class Events(object):
     BOOL = "bool"
 
     def __init__(self):
-        # int -> Recording
-        self._recordings = []
-        # Recording -> int
-        self._recordings_map = {}
         self._interval_magnitudes = set()
         self._connection = sqlite3.connect(":memory:")
         # Maps key names to value types (NUMERIC, BLOB, BOOL), or None if we
@@ -121,38 +110,22 @@ class Events(object):
         c.execute("PRAGMA case_sensitive_like = true;")
         c.execute("CREATE TABLE sys_events "
                   "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                  "recording_id INTEGER NOT NULL, "
-                  "span_id INTEGER NOT NULL, "
+                  "recspan_id INTEGER NOT NULL, "
                   "start_idx NUMERIC NOT NULL, "
                   "stop_idx NUMERIC NOT NULL, "
                   "interval_magnitude INTEGER NOT NULL, "
-                  "recording_name);")
+                  );
         c.execute("CREATE INDEX sys_events_by_start_idx "
-                  "ON sys_events (recording_id, span_id, start_idx);")
+                  "ON sys_events (recspan_id, start_idx);")
         c.execute("CREATE INDEX sys_events_by_stop_idx "
-                  "ON sys_events (recording_id, span_id, stop_idx);")
+                  "ON sys_events (recspan_id, stop_idx);")
         # The special indices used to make overlaps queries fast
         c.execute("CREATE INDEX sys_events_interval_start_idx "
-                  "ON sys_events (recording_id, span_id, "
+                  "ON sys_events (recspan_id, "
                                  "interval_magnitude, start_idx);")
         c.execute("CREATE INDEX sys_events_interval_stop_idx "
-                  "ON sys_events (recording_id, span_id, "
+                  "ON sys_events (recspan_id, "
                                  "interval_magnitude, stop_idx);")
-
-    def _intern_recording(self, recording):
-        if recording in self._recordings_map:
-            return self._recordings_map[recording]
-        else:
-            idx = len(self._recordings)
-            self._recordings.append(recording)
-            self._recordings_map[recording] = idx
-            return idx
-
-    def _try_intern_recording(self, recording):
-        return self._recordings_map.get(recording)
-
-    def _extern_recording(self, recording_idx):
-        return self._recordings[recording_idx]
 
     # Convert str's to buffer objects before passing them into sqlite, because
     # that is how you tell the sqlite3 module to store them as
@@ -237,11 +210,10 @@ class Events(object):
             self._connection.execute("ANALYZE;")
         self._analyze_threshold *= 2
 
-    def add_event(self, recording, span_id, start_idx, stop_idx, attributes):
+    def add_event(self, recspan_id, start_idx, stop_idx, attributes):
         # Create tables up front before entering transaction:
         for key in attributes:
             self._ensure_table_for_key(key)
-        recording_id = self._intern_recording(recording)
         if not start_idx < stop_idx:
             raise ValueError, "start_idx must be < stop_idx"
         if not start_idx >= 0:
@@ -252,11 +224,9 @@ class Events(object):
             c = self._connection.cursor()
             self._execute(c,
               "INSERT INTO sys_events "
-              "  (recording_id, span_id, start_idx, stop_idx,"
-              "   interval_magnitude, recording_name) "
+              "  (recspan_id, start_idx, stop_idx, interval_magnitude) "
               "values (?, ?, ?, ?, ?, ?)",
-              [recording_id, span_id, start_idx, stop_idx, interval_magnitude,
-               recording.name])
+              [recspan_id, start_idx, stop_idx, interval_magnitude])
             event_id = c.lastrowid
             for key, value in attributes.iteritems():
                 self._observe_value_for_key(key, value)
@@ -386,16 +356,16 @@ class Events(object):
                    sql_where.code))
         if joins:
             code += " AND (%s)" % (" AND ".join(joins),)
-        code += "ORDER BY sys_events.recording_id, sys_events.span_id, sys_events.start_idx"
+        code += "ORDER BY sys_events.recspan_id, sys_events.start_idx"
         c = self._connection.cursor()
         self._execute(c, code, sql_where.args)
         return c
 
-    def at(self, recording, span_id, start_idx, stop_idx=None):
+    def at(self, recspan_id, start_idx, stop_idx=None):
         if stop_idx is None:
             stop_idx = start_idx + 1
         p = self.placeholder
-        q = p.overlaps(recording, span_id, start_idx, stop_idx)
+        q = p.overlaps(recspan_id, start_idx, stop_idx)
         return self.find(q)
 
     def __iter__(self):
@@ -436,7 +406,7 @@ class Events(object):
     def __getstate__(self):
         events = []
         for ev in self:
-            events.append((ev.recording, ev.span_id, ev.start_idx, ev.stop_idx, dict(ev)))
+            events.append((ev.recspan_id, ev.start_idx, ev.stop_idx, dict(ev)))
         # 0 as an ad-hoc version number in case we need to change this later
         return (0, events)
 
@@ -445,8 +415,8 @@ class Events(object):
             raise ValueError, "unrecognized pickle data version for Events object"
         self.__init__()
         _, events = state
-        for recording, span_id, start_idx, stop_idx, attrs in events:
-            self.add_event(recording, span_id, start_idx, stop_idx, attrs)
+        for recspan_id, start_idx, stop_idx, attrs in events:
+            self.add_event(recspan_id, start_idx, stop_idx, attrs)
 
 # This is like a "frozen" query -- it always refers to the same events even if
 # the original set changes (though the values in those events may change!),
@@ -540,13 +510,8 @@ class Event(object):
         raise ValueError, "Event objects are not pickleable"
 
     @property
-    def recording(self):
-        rid = self._events._event_index_field("recording_id", self._id)
-        return self._events._extern_recording(rid)
-
-    @property
-    def span_id(self):
-        return self._events._event_index_field("span_id", self._id)
+    def recspan_id(self):
+        return self._events._event_index_field("recspan_id", self._id)
 
     @property
     def start_idx(self):
@@ -559,12 +524,11 @@ class Event(object):
     def overlaps(self, *args):
         if len(args) == 1:
             ev = args[0]
-            return self.overlaps(ev.recording, ev.span_id,
+            return self.overlaps(ev.recspan_id,
                                  ev.start_idx, ev.stop_idx)
         else:
-            (recording, span_id, start_idx, stop_idx) = args
-            return (self.recording == recording
-                    and self.span_id == span_id
+            (recspan_id, start_idx, stop_idx) = args
+            return (self.recspan_id == recspan_id
                     and self.start_idx < stop_idx
                     and start_idx < self.stop_idx)
 
@@ -638,9 +602,9 @@ class Event(object):
     def _repr_pretty_(self, p, cycle):
         assert not cycle
         p.begin_group(2,
-                      "<%s in %r, span %s, ticks %s-%s:"
-                      % (self.__class__.__name__, self.recording,
-                         self.span_id, self.start_idx, self.stop_idx))
+                      "<%s in recspan %s, ticks %s-%s:"
+                      % (self.__class__.__name__,
+                         self.recspan_id, self.start_idx, self.stop_idx))
         p.breakable()
         p.pretty(dict(self.iteritems()))
         p.end_group(2, ">")
@@ -653,8 +617,7 @@ class Event(object):
             raise IndexError, "count must be non-zero"
         query = self._events.as_query(query)
         p = self._events.placeholder
-        query &= (p.recording == self.recording)
-        query &= (p.span_id == self.span_id)
+        query &= (p.recspan_id == self.recspan_id)
         if count > 0:
             query &= (p.start_idx > self.start_idx)
             return query.run()[count - 1]
@@ -681,12 +644,8 @@ class PlaceholderEvent(object):
         return AttrQuery(self._events, key)
 
     @property
-    def recording(self):
-        return RecordingQuery(self._events)
-
-    @property
-    def span_id(self):
-        return IndexFieldQuery(self._events, "span_id")
+    def recspan_id(self):
+        return IndexFieldQuery(self._events, "recspan_id")
 
     @property
     def start_idx(self):
@@ -704,14 +663,12 @@ class PlaceholderEvent(object):
             ev = args[0]
             if isinstance(ev, PlaceholderEvent):
                 raise ValueError, "cannot test for overlap between two placeholders"
-            return self.overlaps(ev.recording, ev.span_id,
+            return self.overlaps(ev.recspan_id,
                                  ev.start_idx, ev.stop_idx)
         else:
-            (recording, span_id, start_idx, stop_idx) = args
+            (recspan_id, start_idx, stop_idx) = args
             return OverlapsQuery(self._events,
-                                 self._events._try_intern_recording(recording),
-                                 span_id,
-                                 start_idx, stop_idx)
+                                 recspan_id, start_idx, stop_idx)
 
 class SqlWhere(object):
     def __init__(self, code, tables, args):
@@ -815,17 +772,13 @@ class Query(object):
 class LiteralQuery(Query):
     def __init__(self, events, value, origin=None):
         Query.__init__(self, events, origin)
-        if isinstance(value, pyrerp.data.Recording):
-            self._value = self._events._try_intern_recording(value)
-            self._saved_value_type = "RECORDING"
-        else:
-            self._value = value
-            try:
-                self._saved_value_type = self._events._value_type(self._value)
-            except ValueError:
-                raise EventsError("literals must be boolean, string, numeric, "
-                                  "or None",
-                                  self)
+        self._value = value
+        try:
+            self._saved_value_type = self._events._value_type(self._value)
+        except ValueError:
+            raise EventsError("literals must be boolean, string, numeric, "
+                              "or None",
+                              self)
 
     def _sql_where(self):
         return SqlWhere("?", set(), [self._value])
@@ -877,22 +830,6 @@ class HasKeyQuery(Query):
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self._key)
 
-class RecordingQuery(Query):
-    def _sql_where(self):
-        # sys_events is always included in the join, so no need to add it to
-        # the tables.
-        return SqlWhere("sys_events.recording_id", set(), [])
-
-    def _value_type(self):
-        return "RECORDING"
-
-    def __repr__(self):
-        return "<%s>" % (self.__class__.__name__,)
-
-    @property
-    def name(self):
-        return IndexFieldQuery(self._events, "recording_name")
-
 class IndexFieldQuery(Query):
     def __init__(self, events, field, origin=None):
         Query.__init__(self, events, origin)
@@ -904,20 +841,16 @@ class IndexFieldQuery(Query):
         return SqlWhere("sys_events.%s" % (self._field,), set(), [])
 
     def _value_type(self):
-        if self._field == "recording_name":
-            return self._events.BLOB
-        else:
-            return self._events.NUMERIC
+        return self._events.NUMERIC
 
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self._field)
 
 class OverlapsQuery(Query):
     def __init__(self, events,
-                 recording_id, span_id, start_idx, stop_idx, origin=None):
+                 recspan_id, start_idx, stop_idx, origin=None):
         Query.__init__(self, events, origin)
-        self._recording_id = recording_id
-        self._span_id = span_id
+        self._recspan_id = recspan_id
         self._start_idx = start_idx
         self._stop_idx = stop_idx
 
@@ -926,13 +859,12 @@ class OverlapsQuery(Query):
         possibilities = []
         for magnitude in self._events._interval_magnitudes:
             constraints = [
-                "sys_events.recording_id == ?",
-                "sys_events.span_id == ?",
+                "sys_events.recspan_id == ?",
                 "sys_events.interval_magnitude == ?",
                 "((sys_events.start_idx < ? AND (? - ?) < sys_events.start_idx)"
                   " OR (sys_events.stop_idx < (? + ?) AND ? < sys_events.stop_idx))",
                 ]
-            args += [self._recording_id, self._span_id,
+            args += [self._recspan_id,
                      magnitude,
                      self._stop_idx, self._start_idx, magnitude,
                      self._stop_idx, magnitude, self._start_idx]
@@ -944,7 +876,7 @@ class OverlapsQuery(Query):
 
     def __repr__(self):
         return ("<%s %r %r [%r, %r)>"
-                % (self.__class__.__name__, self._recording_id, self._span_id,
+                % (self.__class__.__name__, self._recspan_id,
                    self._start_idx, self._stop_idx))
 
 # This is only used internally

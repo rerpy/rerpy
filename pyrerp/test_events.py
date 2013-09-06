@@ -5,23 +5,15 @@
 import cPickle
 import numpy as np
 from pyrerp.events import Events, EventsError
-from pyrerp.data import Recording
 from nose.tools import assert_raises
-
-class MockRecording(object):
-    def __init__(self, name=None):
-        self.name = name
-Recording.register(MockRecording)
 
 def test_Events_basic():
     # load/store of different types
     # errors on type mismatches
     # storing None
     e = Events()
-    r = MockRecording()
-    ev1 = e.add_event(r, 0, 10, 11, {"a": 1, "b": "hello", "c": True})
-    assert ev1.recording is r
-    assert ev1.span_id == 0
+    ev1 = e.add_event(0, 10, 11, {"a": 1, "b": "hello", "c": True})
+    assert ev1.recspan_id == 0
     assert ev1.start_idx == 10
     assert ev1.stop_idx == 11
     assert ev1["a"] == 1
@@ -33,31 +25,29 @@ def test_Events_basic():
     assert dict(ev1) == {"a": 1, "b": "hello", "c": True}
     ev1["a"] = 2
     assert ev1["a"] == 2
-    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"a": "string"})
-    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"a": True})
-    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"b": 10})
-    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"b": True})
-    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"c": 10})
-    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"c": "string"})
+    assert_raises(ValueError, e.add_event, 0, 20, 21, {"a": "string"})
+    assert_raises(ValueError, e.add_event, 0, 20, 21, {"a": True})
+    assert_raises(ValueError, e.add_event, 0, 20, 21, {"b": 10})
+    assert_raises(ValueError, e.add_event, 0, 20, 21, {"b": True})
+    assert_raises(ValueError, e.add_event, 0, 20, 21, {"c": 10})
+    assert_raises(ValueError, e.add_event, 0, 20, 21, {"c": "string"})
     ev1["a"] = None
     assert ev1["a"] is None
     ev1["xxx"] = None
-    ev2 = e.add_event(r, 0, 11, 12, {"xxx": 3})
-    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"xxx": "string"})
-    assert_raises(ValueError, e.add_event, r, 0, 20, 21, {"xxx": True})
+    ev2 = e.add_event(0, 11, 12, {"xxx": 3})
+    assert_raises(ValueError, e.add_event, 0, 20, 21, {"xxx": "string"})
+    assert_raises(ValueError, e.add_event, 0, 20, 21, {"xxx": True})
     assert ev2["xxx"] == 3
     assert ev2.start_idx == 11
     assert ev1["xxx"] is None
 
     e_pick = cPickle.loads(cPickle.dumps(e))
     ev1_pick, ev2_pick = list(e_pick)
-    assert isinstance(ev1_pick.recording, MockRecording)
-    assert ev1_pick.span_id == 0
+    assert ev1_pick.recspan_id == 0
     assert ev1_pick.start_idx == 10
     assert ev1_pick.stop_idx == 11
     assert ev1_pick.items() == ev1.items()
-    assert isinstance(ev2_pick.recording, MockRecording)
-    assert ev2_pick.span_id == 0
+    assert ev2_pick.recspan_id == 0
     assert ev2_pick.start_idx == 11
     assert ev2_pick.stop_idx == 12
     assert ev2_pick.items() == ev2.items()
@@ -66,11 +56,9 @@ def test_Event():
     # set/get/del, index
     # dict methods
     e = Events()
-    r = MockRecording()
     d = {"a": 1, "b": "hello", "c": True}
-    ev1 = e.add_event(r, 1, 10, 12, d)
-    assert ev1.recording is r
-    assert ev1.span_id == 1
+    ev1 = e.add_event(1, 10, 12, d)
+    assert ev1.recspan_id == 1
     assert ev1.start_idx == 10
     assert ev1.stop_idx == 12
     assert dict(ev1.iteritems()) == d
@@ -100,19 +88,19 @@ def test_Event():
     assert not ev1.has_key("z")
 
     assert ev1.overlaps(ev1)
-    assert not ev1.overlaps(MockRecording(), 1, 9, 11)
-    assert not ev1.overlaps(r, 0, 9, 11)
-    assert ev1.overlaps(r, 1, 9, 11)
-    assert ev1.overlaps(r, 1, 10, 12)
-    assert ev1.overlaps(r, 1, 10, 11)
-    assert ev1.overlaps(r, 1, 11, 12)
-    assert not ev1.overlaps(r, 1, 0, 2)
-    assert not ev1.overlaps(r, 1, 100, 102)
+    assert not ev1.overlaps(1, 9, 11)
+    assert not ev1.overlaps(0, 9, 11)
+    assert ev1.overlaps(1, 9, 11)
+    assert ev1.overlaps(1, 10, 12)
+    assert ev1.overlaps(1, 10, 11)
+    assert ev1.overlaps(1, 11, 12)
+    assert not ev1.overlaps(1, 0, 2)
+    assert not ev1.overlaps(1, 100, 102)
     # Check half-openness
-    assert not ev1.overlaps(r, 0, 9, 10)
-    assert not ev1.overlaps(r, 0, 12, 15)
+    assert not ev1.overlaps(0, 9, 10)
+    assert not ev1.overlaps(0, 12, 15)
     # Nothing overlaps an empty interval
-    assert not ev1.overlaps(r, 0, 11, 11)
+    assert not ev1.overlaps(0, 11, 11)
 
     assert len(e) == 1
     ev1.delete()
@@ -125,28 +113,26 @@ def test_Event():
 def test_misc_queries():
     # ANY, at, __iter__, __len__
     e = Events()
-    r = MockRecording()
-    e.add_event(r, 0, 20, 21, {"a": -1})
-    e.add_event(r, 0, 10, 11, {"a": 1})
-    e.add_event(r, 0, 30, 31, {"a": 100})
+    e.add_event(0, 20, 21, {"a": -1})
+    e.add_event(0, 10, 11, {"a": 1})
+    e.add_event(0, 30, 31, {"a": 100})
     assert len(e) == 3
     # Always sorted by index:
     assert [ev.start_idx for ev in e] == [10, 20, 30]
     assert [ev.start_idx for ev in e.find(e.ANY)] == [10, 20, 30]
-    assert len(e.at(r, 0, 10)) == 1
-    assert e.at(r, 0, 10)[0]["a"] == 1
-    assert len(e.at(r, 0, 20)) == 1
-    assert e.at(r, 0, 20)[0]["a"] == -1
-    assert len(e.at(r, 0, 15)) == 0
-    assert len(e.at(r, 0, 15, 40)) == 2
+    assert len(e.at(0, 10)) == 1
+    assert e.at(0, 10)[0]["a"] == 1
+    assert len(e.at(0, 20)) == 1
+    assert e.at(0, 20)[0]["a"] == -1
+    assert len(e.at(0, 15)) == 0
+    assert len(e.at(0, 15, 40)) == 2
 
 def test_Event_relative():
     e = Events()
-    r = MockRecording()
-    ev20 = e.add_event(r, 0, 20, 21, {"a": 20, "extra": True})
-    ev10 = e.add_event(r, 0, 10, 11, {"a": 10})
-    ev30 = e.add_event(r, 0, 30, 31, {"a": 30})
-    ev40 = e.add_event(r, 0, 40, 41, {"a": 40, "extra": True})
+    ev20 = e.add_event(0, 20, 21, {"a": 20, "extra": True})
+    ev10 = e.add_event(0, 10, 11, {"a": 10})
+    ev30 = e.add_event(0, 30, 31, {"a": 30})
+    ev40 = e.add_event(0, 40, 41, {"a": 40, "extra": True})
 
     assert ev20.relative(1)["a"] == 30
     assert_raises(IndexError, ev20.relative, 0)
@@ -158,9 +144,8 @@ def test_Event_relative():
 
 def test_Event_move():
     e = Events()
-    r = MockRecording()
-    ev20 = e.add_event(r, 0, 20, 21, {"a": 20, "extra": True})
-    ev10 = e.add_event(r, 0, 10, 15, {"a": 10})
+    ev20 = e.add_event(0, 20, 21, {"a": 20, "extra": True})
+    ev10 = e.add_event(0, 10, 15, {"a": 10})
     assert ev20.start_idx == 20
     assert ev20.stop_idx == 21
     assert ev20.relative(-1)["a"] == 10
@@ -178,9 +163,8 @@ def test_Event_move():
 def test_find():
     # all the different calling conventions
     e = Events()
-    r = MockRecording("asdf")
-    e.add_event(r, 0, 10, 11, {"a": 1, "b": True})
-    e.add_event(r, 0, 20, 21, {"a": -1, "b": True})
+    e.add_event(0, 10, 11, {"a": 1, "b": True})
+    e.add_event(0, 20, 21, {"a": -1, "b": True})
 
     assert [ev.start_idx for ev in e.find()] == [10, 20]
 
@@ -188,23 +172,18 @@ def test_find():
     assert [ev.start_idx for ev in e.find({"a": 1, "b": True})] == [10]
     assert [ev.start_idx for ev in e.find({"a": 1, "b": False})] == []
     assert [ev.start_idx for ev in e.find({"b": True})] == [10, 20]
-    assert [ev.start_idx for ev in e.find({"_RECORDING": MockRecording()})] == []
-    assert [ev.start_idx for ev in e.find({"_RECORDING": r})] == [10, 20]
-    assert [ev.start_idx for ev in e.find({"_SPAN_ID": 0})] == [10, 20]
-    assert [ev.start_idx for ev in e.find({"_SPAN_ID": 1})] == []
+    assert [ev.start_idx for ev in e.find({"_RECSPAN_ID": 0})] == [10, 20]
+    assert [ev.start_idx for ev in e.find({"_RECSPAN_ID": 1})] == []
     assert [ev.start_idx for ev in e.find({"_START_IDX": 10})] == [10]
     assert [ev.start_idx for ev in e.find({"_STOP_IDX": 11})] == [10]
-    assert [ev.start_idx for ev in e.find({"_RECORDING_NAME": "asdf"})] == [10, 20]
-    assert [ev.start_idx for ev in e.find({"_RECORDING_NAME": "fdsa"})] == []
 
     assert [ev.start_idx for ev in e.find(e.placeholder["a"] == 1)] == [10]
 
 def test_EventSet():
     e = Events()
-    r = MockRecording()
-    e.add_event(r, 0, 10, 11, {"a": 1, "b": True, "c": None})
-    e.add_event(r, 0, 20, 21, {"a": -1, "b": True})
-    e.add_event(r, 0, 15, 16, {"a": -1, "b": False, "c": 1})
+    e.add_event(0, 10, 11, {"a": 1, "b": True, "c": None})
+    e.add_event(0, 20, 21, {"a": -1, "b": True})
+    e.add_event(0, 15, 16, {"a": -1, "b": False, "c": 1})
     es = e.find()
     assert es[0].start_idx == 10
     assert es[1].start_idx == 15
@@ -226,13 +205,11 @@ def test_python_query():
     # types (esp. including None)
     # index
     e = Events()
-    r1 = MockRecording()
-    r2 = MockRecording()
-    ev10 = e.add_event(r1, 0, 10, 11,
+    ev10 = e.add_event(0, 10, 11,
                        {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
-    ev20 = e.add_event(r1, 1, 20, 25,
+    ev20 = e.add_event(1, 20, 25,
                        {"a": -1, "b": "fdsa", "c": False, "d": -3.14, "e": None})
-    ev21 = e.add_event(r2, 0, 21, 26,
+    ev21 = e.add_event(0, 21, 26,
                        {"a": 1, "b": "asdf", "c": False, "d": -3.14, "e": 123})
 
     p = e.placeholder
@@ -247,11 +224,6 @@ def test_python_query():
     t(p.start_idx <= 20, [10, 20])
     t(~(p.start_idx == 20), [10, 21])
     t(~(p.start_idx != 20), [20])
-
-    t(p.recording == r1, [10, 20])
-    t(p.recording == r2, [21])
-    assert_raises(EventsError, p.recording.__eq__, 1)
-    assert_raises(EventsError, p.start_idx.__eq__, r1)
 
     t(p["a"] == 1, [10, 21])
     t(p["a"] != 1, [20])
@@ -327,17 +299,16 @@ def test_python_query():
     t(p.overlaps(ev10), [10])
     t(p.overlaps(ev20), [20])
     t(p.overlaps(ev21), [21])
-    t(p.overlaps(r1, 0, 5, 10), [])
-    t(p.overlaps(r1, 0, 5, 11), [10])
-    t(p.overlaps(r1, 0, 11, 20), [])
-    t(p.overlaps(r1, 0, 11, 100), [])
+    t(p.overlaps(0, 5, 10), [])
+    t(p.overlaps(0, 5, 11), [10])
+    t(p.overlaps(0, 11, 20), [])
+    t(p.overlaps(0, 11, 100), [])
     for i in xrange(20, 25):
-        t(p.overlaps(r1, 1, i, i + 1), [20])
+        t(p.overlaps(1, i, i + 1), [20])
 
 def test_python_query_typechecking():
     e = Events()
-    r = MockRecording()
-    e.add_event(r, 0, 10, 11,
+    e.add_event(0, 10, 11,
                 {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
 
     p = e.placeholder
@@ -360,13 +331,11 @@ def test_python_query_typechecking():
 
 def test_string_query():
     e = Events()
-    r1 = MockRecording("r1")
-    r2 = MockRecording("r2")
-    e.add_event(r1, 0, 10, 12,
+    e.add_event(0, 10, 12,
                 {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
-    e.add_event(r2, 1, 20, 25,
+    e.add_event(1, 20, 25,
                 {"a": 2, "b": "fdsa", "c": False, "d": 5.1, "e": 22,
-                 "f": "stuff", "_RECORDING_NAME": "r100", "_START_IDX": 10,
+                 "f": "stuff", "_START_IDX": 10,
                  "and": 33})
 
     def t(s, expected_start_indices):
@@ -396,16 +365,12 @@ def test_string_query():
     t("`a` == 1", [10])
     assert_raises(EventsError, e.find, "a == \"1\"")
 
-    # RECORDING_NAME and friends
-    t("_RECORDING_NAME == 'r1'", [10])
-    t("_RECORDING_NAME == 'r2'", [20])
-    t("_SPAN_ID == 1", [20])
+    # _RECSPAN_ID and friends
+    t("_RECSPAN_ID == 1", [20])
     t("_START_IDX < 15", [10])
     t("_STOP_IDX > 22", [20])
 
     # backquotes
-    t("has `_RECORDING_NAME`", [20])
-    t("`_RECORDING_NAME` == 'r100'", [20])
     t("`_START_IDX` == 10", [20])
     t("`and` == 33", [20])
     t("not has `and`", [10])

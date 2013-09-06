@@ -5,7 +5,27 @@ need a way to save DataSets
   with data: for each recording dump the data out and use a special
     InOurProprietaryDataFormatRecording
 
-datasets should have
+not sure the recording/dataset divide is really making sense
+maybe we should have recspan metadata, and have recspans directly in
+datasets (possibly with a hidden on-demand loader layer)
+and have datasets
+and make span metadata available via events (because every event is in
+exactly one span so not so hard) for both search and formulas
+
+
+two levels of metadata:
+  sensor info: position, type, maybe intrinsic units (or implied by
+    type)
+  channel info:
+    relation to sensors, comes in several types:
+      raw (e.g. MEG):
+      ref'ed (e.g. EEG): one privileged sensor whose name we share,
+       plus some linear transformation of other sensor values
+      arbitrary linear function: ICA components
+
+dataset itself just gives id to each recspan
+
+
 
 formats:
   Python code for reading .cnt (NeuroScan) files (no license but could
