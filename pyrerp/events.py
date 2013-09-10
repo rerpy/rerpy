@@ -2,22 +2,47 @@
 # Copyright (C) 2012-2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
+# Need to put this somewhere, so...
+#
+# NOTES ON SQLITE3 TRANSACTION HANDLING
+# -------------------------------------
+#
+# The Python sqlite3 module has really confusing transaction behaviour which
+# is substantially more annoying than sqlite3's own built-in transaction
+# behaviour.
+#
+# Basically:
+# - Anything that looks like SELECT will leave the transaction state
+#   unchanged.
+# - Anything that looks like an UPDATE/DELETE/INSERT/REPLACE will silently
+#   create a new transaction.
+# - Anything else (e.g. DDL statements) will silently commit any existing
+#   transaction (!!!!)
+# - 'commit' will also commit any existing transaction.
+# - 'with con: ...' is just a way to putting a rollback/commit at the end of
+#   the block; it does nothing at the beginning.
+
 import sqlite3
 import string
 import re
-import struct
-from cStringIO import StringIO
+from collections import namedtuple
+
 import numpy as np
 import pandas
 from patsy import PatsyError, Origin
 # XX FIXME: these aren't actually exposed from patsy yet, should fix that at
 # some point...
 from patsy.infix_parser import Token, Operator, infix_parse
+from patsy.util import repr_pretty_delegate
 
 __all__ = ["Events", "EventsError"]
 
 class EventsError(PatsyError):
     pass
+
+################################################################
+## Name munging (because it's easier than dealing with SQL quoting)
+################################################################
 
 # An injective map from arbitrary non-empty unicode strings to strings that
 # match the regex [_a-zA-Z][_a-zA-Z0-9]+ (i.e., are valid SQL identifiers)
@@ -54,7 +79,75 @@ def test__munge_name():
     munged_names = set([_munge_name(n) for n in clean_names + unclean_names])
     assert len(munged_names) == len(clean_names) + len(unclean_names)
 
-# http://www.logarithmic.net/pfh/blog/01235197474
+################################################################
+## A simple type system, and tools to get them in and out of sqlite
+################################################################
+
+# General idea:
+# For each key, there is a single type: numeric, text, or bool. These are
+# stored as numeric, blob, and bool in sqlite respectively.
+#
+# For each event, a key can be:
+#   missing: no row in the db, ev["foo"] raises KeyError
+#   None: db row with NULL value, ev["foo"] returns None
+#   a value of the given type: db row with that value, ev["foo"] gives that value
+
+_NUMERIC = "numeric"
+_BLOB = "text"
+_BOOL = "bool"
+
+def _value_type(value):
+    # must come first, because issubclass(bool, int)
+    if isinstance(value, (bool, np.bool_)):
+        return _BOOL
+    elif isinstance(value, (int, long, float, np.number)):
+        return _NUMERIC
+    elif isinstance(value, (str, unicode, np.character)):
+        return _BLOB
+    elif value is None:
+        return None
+    else:
+        raise ValueError, ("Invalid value %r: "
+                           "must be a string, number, bool, or None"
+                           % (value,))
+
+def _sql_value_to_value_type(sql_value, value_type):
+    # SQLite's type system discards the distinction between bools and
+    # ints, so we have to recover it on the way out.
+    if value_type is _BOOL:
+        return bool(sql_value)
+    else:
+        return sql_value
+
+# Convert str's to buffer objects before passing them into sqlite, because
+# that is how you tell the sqlite3 module to store them as
+# BLOBs. (sqlite3.Binary is an alias for 'buffer'.) This function also
+# handles converting numpy scalars into equivalents that are acceptable to
+# sqlite.
+def _encode_sql_value(val):
+    if np.issubsctype(type(val), np.str_):
+        return sqlite3.Binary(val)
+    elif np.issubsctype(type(val), np.bool_):
+        return bool(val)
+    elif np.issubsctype(type(val), np.integer):
+        return int(val)
+    elif np.issubsctype(type(val), np.floating):
+        return float(val)
+    else:
+        return val
+
+# And reverse the transformation on the way out.
+def _decode_sql_value(val):
+    if isinstance(val, sqlite3.Binary):
+        return str(val)
+    else:
+        return val
+
+################################################################
+## A clever trick for supporting efficient overlap queries
+##    (see http://www.logarithmic.net/pfh/blog/01235197474)
+################################################################
+
 def approx_interval_magnitude(span):
     """Returns a number M such that:
       M <= span <= 2*M
@@ -72,31 +165,47 @@ def test_approx_interval_magnitude():
         M = approx_interval_magnitude(span)
         assert M <= span <= 2 * M
 
-def _table_name(key):
-    return "attr_" + _munge_name(key)
+################################################################
+## The core event stuff.
+################################################################
 
-# Keys that have a special magical meaning in dict-queries and
-# string-queries (plus the actual database field name they map to).
-# In string queries these can be de-magicalified by quoting them with
-# backquotes, i.e.,:
-#   "_RECSPAN_ID == 1"   <-> placeholder.recspan_id == 1
-#   "`_RECSPAN_ID` == 1" <-> placeholder["_RECSPAN_ID"] == 1
-_magic_query_strings = set(["_RECSPAN_ID", "_START_IDX", "_STOP_IDX"])
-def _magic_query_string_to_query(events, name, origin=None):
-    return IndexFieldQuery(events, name[1:].lower(), origin)
-
-class Events(object):
-    NUMERIC = "numeric"
-    BLOB = "text"
-    BOOL = "bool"
-
-    def __init__(self):
-        self._interval_magnitudes = set()
-        self._connection = sqlite3.connect(":memory:")
+# This is used to allow for lots of code to be shared between events and
+# recspans, both of which can have arbitrary key/value pairs associated with
+# them.
+class ObjType(object):
+    def __init__(self, name, sys_table, event_join_field):
         # Maps key names to value types (NUMERIC, BLOB, BOOL), or None if we
         # have yet to see any values for the given key and so don't know what
         # type it should have.
-        self._key_types = {}
+        self.key_types = {}
+        self.name = name
+        self.sys_table = sys_table
+        self.event_join_field = event_join_field
+
+    def table_name(self, key):
+        return self.name + "_attr_" + _munge_name(key)
+
+    def value_type_for_key(self, key):
+        return self.key_types.get(key)
+
+    def observe_value_for_key(self, key, value):
+        self.key_types.setdefault(key, None)
+        value_type = _value_type(value)
+        if value_type is None:
+            return
+        wanted_type = self.value_type_for_key(key)
+        if wanted_type is None:
+            self.key_types[key] = value_type
+        else:
+            if wanted_type != value_type:
+                err = ("Invalid value %r for key %s: wanted %s"
+                       % (value, key, wanted_type))
+                raise ValueError, err
+
+class Events(object):
+    def __init__(self):
+        self._interval_magnitudes = set()
+        self._connection = sqlite3.connect(":memory:")
 
         # Every time 'op_count' passes 'analyze_threshold', we run ANALYZE and
         # double 'analyze_threshold'. Starting analyze_threshold as 256 or so
@@ -106,14 +215,25 @@ class Events(object):
         self._op_count = 0
         self._analyze_threshold = 1
 
+        self._objtypes = {}
+
         c = self._connection.cursor()
         c.execute("PRAGMA case_sensitive_like = true;")
+        c.execute("PRAGMA foreign_keys = on;")
+        self._objtypes["recspan"] = ObjType("recspan",
+                                            "sys_recspans", "recspan_id")
+        c.execute("CREATE TABLE sys_recspans "
+                  "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                  "ticks INTEGER NOT NULL)"
+                  );
+        self._objtypes["event"] = ObjType("event", "sys_events", "id")
         c.execute("CREATE TABLE sys_events "
                   "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
                   "recspan_id INTEGER NOT NULL, "
                   "start_idx NUMERIC NOT NULL, "
                   "stop_idx NUMERIC NOT NULL, "
                   "interval_magnitude INTEGER NOT NULL, "
+                  "FOREIGN KEY(recspan_id) REFERENCES sys_recspans(id))"
                   );
         c.execute("CREATE INDEX sys_events_by_start_idx "
                   "ON sys_events (recspan_id, start_idx);")
@@ -127,93 +247,43 @@ class Events(object):
                   "ON sys_events (recspan_id, "
                                  "interval_magnitude, stop_idx);")
 
-    # Convert str's to buffer objects before passing them into sqlite, because
-    # that is how you tell the sqlite3 module to store them as
-    # BLOBs. (sqlite3.Binary is an alias for 'buffer'.) This function also
-    # handles converting numpy scalars into equivalents that are acceptable to
-    # sqlite.
-    def _encode_sql_value(self, val):
-        if np.issubsctype(type(val), np.str_):
-            return sqlite3.Binary(val)
-        elif np.issubsctype(type(val), np.bool_):
-            return bool(val)
-        elif np.issubsctype(type(val), np.integer):
-            return int(val)
-        elif np.issubsctype(type(val), np.floating):
-            return float(val)
-        else:
-            return val
-
-    # And reverse the transformation on the way out.
-    def _decode_sql_value(self, val):
-        if isinstance(val, sqlite3.Binary):
-            return str(val)
-        else:
-            return val
-
     def _execute(self, c, sql, args):
-        return c.execute(sql, [self._encode_sql_value(arg) for arg in args])
+        return c.execute(sql, [_encode_sql_value(arg) for arg in args])
 
-    def _value_type_for_key(self, key):
-        return self._key_types.get(key)
-
-    def _value_type(self, value):
-        # must come first, because issubclass(bool, int)
-        if isinstance(value, (bool, np.bool_)):
-            return self.BOOL
-        elif isinstance(value, (int, long, float, np.number)):
-            return self.NUMERIC
-        elif isinstance(value, (str, unicode, np.character)):
-            return self.BLOB
-        elif value is None:
-            return None
-        else:
-            raise ValueError, ("Invalid value %r: "
-                               "must be a string, number, bool, or None"
-                               % (value,))
-
-    def _sql_value_to_value_type(self, sql_value, value_type):
-        # SQLite's type system discards the distinction between bools and
-        # ints, so we have to recover it on the way out.
-        if value_type == self.BOOL:
-            return bool(sql_value)
-        else:
-            return sql_value
-
-    def _observe_value_for_key(self, key, value):
-        value_type = self._value_type(value)
-        if value_type is None:
-            return
-        wanted_type = self._value_type_for_key(key)
-        if wanted_type is None:
-            self._key_types[key] = value_type
-        else:
-            if wanted_type != value_type:
-                err = ("Invalid value %r for key %s: wanted %s"
-                       % (value, key, wanted_type))
-                raise ValueError, err
-
-    # NOTE: DDL statements like table creation cannot be performed inside a
-    # transaction. So don't call this method inside a transaction.
-    def _ensure_table_for_key(self, key):
-        table = _table_name(key)
-        self._connection.execute("CREATE TABLE IF NOT EXISTS %s ("
-                                   "event_id INTEGER PRIMARY KEY, "
-                                   "value);" % (table,))
-        self._connection.execute("CREATE INDEX IF NOT EXISTS %s_idx "
-                                   "ON %s (value);" % (table, table))
-        self._key_types.setdefault(key, None)
-
+    # WARNING: this should not be called inside a transaction, it might commit
+    # it.
     def _incr_op_count(self):
         self._op_count += 1
         if self._op_count >= self._analyze_threshold:
             self._connection.execute("ANALYZE;")
         self._analyze_threshold *= 2
 
+    # WARNING: this will commit any ongoing transaction!
+    def _ensure_table_for_key(self, objtype, key):
+        table = objtype.table_name(key)
+        self._connection.execute("CREATE TABLE IF NOT EXISTS %s ("
+                                   "obj_id INTEGER PRIMARY KEY, "
+                                   "value);" % (table,))
+        self._connection.execute("CREATE INDEX IF NOT EXISTS %s_idx "
+                                   "ON %s (value);" % (table, table))
+
+    # WARNING: this neither commits nor creates the table if it doesn't exist,
+    # it's your job to call _ensure_table_for_key and start a transaction
+    # before calling this, and maybe call _incr_op_count after
+    def _obj_setitem_core(self, objtype, id, key, value):
+        c = self._connection.cursor()
+        table = objtype.table_name(key)
+        objtype.observe_value_for_key(key, value)
+        self._execute(c,
+                      "INSERT OR REPLACE INTO %s (obj_id, value) "
+                      "VALUES (?, ?);"
+                      % (table,), (id, value))
+
     def add_event(self, recspan_id, start_idx, stop_idx, attributes):
+        objtype = self._objtypes["event"]
         # Create tables up front before entering transaction:
         for key in attributes:
-            self._ensure_table_for_key(key)
+            self._ensure_table_for_key(objtype, key)
         if not start_idx < stop_idx:
             raise ValueError, "start_idx must be < stop_idx"
         if not start_idx >= 0:
@@ -222,20 +292,85 @@ class Events(object):
         self._interval_magnitudes.add(interval_magnitude)
         with self._connection:
             c = self._connection.cursor()
-            self._execute(c,
-              "INSERT INTO sys_events "
-              "  (recspan_id, start_idx, stop_idx, interval_magnitude) "
-              "values (?, ?, ?, ?, ?, ?)",
-              [recspan_id, start_idx, stop_idx, interval_magnitude])
+            try:
+                self._execute(c,
+                  "INSERT INTO sys_events "
+                  "  (recspan_id, start_idx, stop_idx, interval_magnitude) "
+                  "values (?, ?, ?, ?)",
+                  [recspan_id, start_idx, stop_idx, interval_magnitude])
+            except sqlite3.IntegrityError:
+                raise EventsError("undefined recspan")
             event_id = c.lastrowid
             for key, value in attributes.iteritems():
-                self._observe_value_for_key(key, value)
-                self._execute(c,
-                              "INSERT INTO %s (event_id, value) VALUES (?, ?);"
-                                % (_table_name(key),),
-                              (event_id, value))
+                self._obj_setitem_core(objtype, event_id, key, value)
         self._incr_op_count()
         return Event(self, event_id)
+
+    def add_recspan(self, recspan_id, ticks, attributes):
+        objtype = self._objtypes["recspan"]
+        # Create tables up front before entering transaction:
+        for key in attributes:
+            self._ensure_table_for_key(objtype, key)
+        with self._connection:
+            c = self._connection.cursor()
+            self._execute(c,
+              "INSERT INTO sys_recspans (id, ticks) values (?, ?)",
+              [recspan_id, ticks])
+            for key, value in attributes.iteritems():
+                self._obj_setitem_core(objtype, recspan_id, key, value)
+        self._incr_op_count()
+        return Recspan(self, recspan_id)
+
+    def _delete_obj(self, objtype, obj_id):
+        with self._connection:
+            c = self._connection.cursor()
+            self._execute(c, "DELETE FROM %s WHERE id = ?;"
+                          % (objtype.sys_table,), (obj_id,))
+            for key in objtype.key_types:
+                self._execute(c,
+                              "DELETE FROM %s WHERE obj_id = ?;"
+                                % (objtype.table_name(key),),
+                              (obj_id,))
+        self._incr_op_count()
+
+    def _obj_index_field(self, objtype, id, field):
+        c = self._connection.cursor()
+        code = "SELECT %s FROM %s WHERE id = ?;" % (field, objtype.sys_table)
+        self._execute(c, code, (id,))
+        return _decode_sql_value(c.fetchone()[0])
+
+    def _obj_setitem(self, objtype, id, key, value):
+        self._ensure_table_for_key(objtype, key)
+        with self._connection:
+            self._obj_setitem_core(objtype, id, key, value)
+        self._incr_op_count()
+
+    def _obj_getitem(self, objtype, id, key):
+        c = self._connection.cursor()
+        table = objtype.table_name(key)
+        code = "SELECT value FROM %s WHERE obj_id = ?;" % (table,)
+        try:
+            self._execute(c, code, (id,))
+            row = c.fetchone()
+        except sqlite3.OperationalError:
+            # The table doesn't exist:
+            raise KeyError, key
+        # The table exists, but has no entry with the given obj_id:
+        if row is None:
+            raise KeyError, key
+        return _sql_value_to_value_type(_decode_sql_value(row[0]),
+                                        objtype.key_types[key])
+
+    def _obj_delitem(self, objtype, id, key):
+        # Raise a KeyError if it doesn't exist:
+        self._obj_getitem(objtype, id, key)
+        # Okay, now delete it
+        c = self._connection.cursor()
+        table = objtype.table_name(key)
+        code = "DELETE FROM %s WHERE obj_id = ?;" % (table,)
+        with self._connection:
+            self._execute(c, code, (id,))
+        self._incr_op_count()
 
     def _move_event(self, id, offset):
         # Fortunately, this operation doesn't change the magnitude of the
@@ -251,76 +386,16 @@ class Events(object):
                           "WHERE id = ?",
                           [offset, offset, id])
 
-    def _delete_event(self, id):
-        with self._connection:
-            c = self._connection.cursor()
-            self._execute(c, "DELETE FROM sys_events WHERE id = ?;", (id,))
-            for key in self._key_types:
-                self._execute(c,
-                              "DELETE FROM %s WHERE event_id = ?;"
-                                % (_table_name(key),),
-                              (id,))
-        self._incr_op_count()
-
-    def _event_index_field(self, field, id):
-        c = self._connection.cursor()
-        code = "SELECT %s FROM sys_events WHERE id = ?;" % (field,)
-        self._execute(c, code, (id,))
-        return self._decode_sql_value(c.fetchone()[0])
-
-    def _event_getitem(self, id, key):
-        c = self._connection.cursor()
-        table = _table_name(key)
-        code = "SELECT value FROM %s WHERE event_id = ?;" % (table,)
-        try:
-            self._execute(c, code, (id,))
-            row = c.fetchone()
-        except sqlite3.OperationalError:
-            raise KeyError, key
-        if row is None:
-            raise KeyError, key
-        return self._sql_value_to_value_type(self._decode_sql_value(row[0]),
-                                             self._key_types[key])
-
-    def _event_setitem(self, id, key, value):
-        self._ensure_table_for_key(key)
-        with self._connection:
-            c = self._connection.cursor()
-            table = _table_name(key)
-            self._observe_value_for_key(key, value)
-            self._execute(c,
-                          "UPDATE %s SET value = ? WHERE event_id = ?;"
-                            % (table,),
-                          (value, id))
-            if c.rowcount == 0:
-                self._execute(c,
-                              "INSERT INTO %s (event_id, value) VALUES (?, ?);"
-                                % (table,),
-                              (id, value))
-        self._incr_op_count()
-
-    def _event_delitem(self, id, key):
-        # Raise a KeyError if it doesn't exist:
-        self._event_getitem(id, key)
-        # Okay, now delete it
-        c = self._connection.cursor()
-        table = _table_name(key)
-        code = "DELETE FROM %s WHERE event_id = ?;" % (table,)
-        self._execute(c, code, (id,))
-        self._incr_op_count()
-
     @property
     def placeholder(self):
         return PlaceholderEvent(self)
 
-    @property
-    def ANY(self):
-        return LiteralQuery(self, True)
-
     def as_query(self, query_like):
+        """query_like can be {"a": 1, "b": 2} or a Query or a string or a bool
+        """
         if isinstance(query_like, dict):
             p = self.placeholder
-            query = self.ANY
+            query = LiteralQuery(self, True)
             equalities = []
             for query_name in _magic_query_strings.intersection(query_like):
                 q = _magic_query_string_to_query(self, query_name)
@@ -328,7 +403,9 @@ class Events(object):
             for k, v in query_like.iteritems():
                 query &= (p[k] == v)
         elif isinstance(query_like, basestring):
-            query = query_from_string(self, query_like)
+            query = _query_from_string(self, query_like)
+        elif isinstance(query_like, bool):
+            query = LiteralQuery(self, query_like)
         else:
             query = query_like
 
@@ -339,17 +416,15 @@ class Events(object):
                              "object")
         return query
 
-    def find(self, query_like={}):
-        """find({"a": 1, "b": 2}) or find(query_obj) or find(\"string\") or
-        find().
-        """
-        return self.as_query(query_like).run()
-
-    def _query(self, sql_where, tables, query_vals):
-        tables = set(sql_where.tables)
-        tables.add("sys_events")
-        joins = ["%s.event_id == sys_events.id" % (table,)
-                 for table in tables if table != "sys_events"]
+    def _query(self, sql_where, query_tables, query_vals):
+        tables = set(["sys_events"])
+        tables.update(query_tables)
+        joins = []
+        for objtype, objtype_tables in sql_where.attr_tables.iteritems():
+            for table in objtype_tables:
+                tables.add(table)
+                joins.append("%s.obj_id == sys_events.%s"
+                             % (table, objtype.event_join_field))
         code = ("SELECT %s FROM %s WHERE (%s) "
                 % (", ".join(query_vals),
                    ", ".join(tables),
@@ -361,20 +436,22 @@ class Events(object):
         self._execute(c, code, sql_where.args)
         return c
 
+    def recspan(self, recspan_id):
+        return Recspan(self, recspan_id)
+
+    def all_recspans(self):
+        c = self._connection.cursor()
+        for row in self._execute(c,
+                                 "SELECT id FROM sys_recspans ORDER BY id",
+                                 ()):
+            yield Recspan(self, _decode_sql_value(row[0]))
+
     def at(self, recspan_id, start_idx, stop_idx=None):
         if stop_idx is None:
             stop_idx = start_idx + 1
         p = self.placeholder
         q = p.overlaps(recspan_id, start_idx, stop_idx)
-        return self.find(q)
-
-    def __iter__(self):
-        return iter(self.ANY.run())
-
-    def __len__(self):
-        c = self._connection.cursor()
-        self._execute(c, "SELECT count(*) FROM sys_events;", [])
-        return self._decode_sql_value(c.fetchone()[0])
+        return list(q)
 
     def __repr__(self):
         return "<%s object with %s entries>" % (self.__class__.__name__,
@@ -391,161 +468,81 @@ class Events(object):
         p = self.placeholder
         query = subset
         if query is None:
-            query = self.ANY
+            query = self.as_query(True)
         for row_idx in df.index:
             row = df.xs(row_idx)
             this_query = query
             for df_key, db_key in on.iteritems():
                 this_query &= (p[db_key] == row[df_key])
-            for ev in this_query.run():
+            for ev in this_query:
                 for df_key in row.index:
                     if df_key not in on:
                         ev[df_key] = row[df_key]
 
     # Pickling
     def __getstate__(self):
+        recspans = []
+        for recspan in self.all_recspans():
+            recspans.append((recspan.id, recspan.ticks, dict(recspan)))
         events = []
-        for ev in self:
+        for ev in self.as_query(True):
             events.append((ev.recspan_id, ev.start_idx, ev.stop_idx, dict(ev)))
         # 0 as an ad-hoc version number in case we need to change this later
-        return (0, events)
+        return (0, recspans, events)
 
     def __setstate__(self, state):
         if state[0] != 0:
             raise ValueError, "unrecognized pickle data version for Events object"
         self.__init__()
-        _, events = state
+        _, recspans, events = state
+        for recspan_id, ticks, attrs in recspans:
+            self.add_recspan(recspan_id, ticks, attrs)
         for recspan_id, start_idx, stop_idx, attrs in events:
             self.add_event(recspan_id, start_idx, stop_idx, attrs)
 
-# This is like a "frozen" query -- it always refers to the same events even if
-# the original set changes (though the values in those events may change!),
-# can be mutated in place, and, crucially, it supports __getitem__ to get a
-# Series of values. So you can pass it as a 'data' object to dmatrix and
-# friends!
-class EventSet(object):
-    def __init__(self, events, event_ids):
+################################################################
+## Objects representing single events/recspans
+################################################################
+
+class _Obj(object):
+    def __init__(self, events, objtype, obj_id):
         self._events = events
-        self._event_ids = event_ids
-
-    def remove(self, event):
-        if event._events is not self._events:
-            raise KeyError, event
-        try:
-            self._event_ids.remove(event.id)
-        except ValueError:
-            raise KeyError, event
-
-    def __len__(self):
-        return len(self._event_ids)
-
-    def __iter__(self):
-        for db_id in self._event_ids:
-            yield Event(self._events, db_id)
-
-    def __getitem__(self, idx):
-        if hasattr(idx, "__index__") or isinstance(idx, (slice, type(Ellipsis))):
-            return Event(self._events, self._event_ids[idx])
-        elif isinstance(idx, basestring):
-            # This will raise a KeyError for any events where the field is
-            # just undefined, and will return None otherwise. This could be
-            # done more efficiently by querying the database directly, but
-            # let's not fret about that until it matters.
-            values = [ev[idx] for ev in self]
-            # We use pandas.Series here because it has much more sensible
-            # NaN/None handling than raw numpy.
-            #   np.asarray([None, 1, 2]) -> object (!) array
-            #   np.asarray([np.nan, "a", "b"]) -> ["nan", "a", "b"] (!)
-            # but
-            #   pandas.Series([None, 1, 2]) -> [nan, 1, 2]
-            #   pandas.Series([None, "a", "b"]) -> [None, "a", "b"]
-            return pandas.Series(values)
-        else:
-            raise TypeError, "index must be an integer or string"
-
-    # def __setitem__(self, key, value):
-    #     # XX we should probably support Series and ndarrays and stuff here
-    #     # XX we REALLY SHOULD support aligned assignment so we can write
-    #     # things like
-    #     #   my_set["foo"] = my_set.next(query)["foo"]
-    #     # and make sure that nan gets mapped to deleting the value
-    #     # ...though this would require that my_set.next() be indexed by the
-    #     # same events in my_set, not the events in my_set.next(). Is that
-    #     # good or bad?
-    #     xx
-
-    def update(self, d):
-        for ev in self:
-            ev.update(d)
-
-    def __repr__(self):
-        return "<%s with %s events>" % (self.__class__.__name__,
-                                        len(self._event_ids))
-
-    def _repr_pretty_(self, p, cycle):
-        assert not cycle
-        p.begin_group(2, "<%s with %s events:" % (self.__class__.__name__,
-                                                  len(self._event_ids)))
-        p.breakable()
-        p.pretty(list(self))
-        p.end_group(2, ">")
-
-class Event(object):
-    def __init__(self, events, id):
-        self._events = events
-        self._id = id
+        self._objtype = objtype
+        self._obj_id = obj_id
 
     def __eq__(self, other):
-        if not isinstance(other, Event):
-            return False
-        return (self._events is other._events) and (self._id == other._id)
+        return (type(self) is type(other)
+                and self._events is other._events
+                and self._objtype is other._objtype
+                and self._obj_id is other._obj_id)
 
     def __ne__(self, other):
         return not (self == other)
 
     def __hash__(self):
-        return hash((id(self._events), self._id))
+        return hash((id(self._events), id(self._objtype), self._obj_id))
 
     def __getstate__(self):
         raise ValueError, "Event objects are not pickleable"
 
-    @property
-    def recspan_id(self):
-        return self._events._event_index_field("recspan_id", self._id)
-
-    @property
-    def start_idx(self):
-        return self._events._event_index_field("start_idx", self._id)
-
-    @property
-    def stop_idx(self):
-        return self._events._event_index_field("stop_idx", self._id)
-
-    def overlaps(self, *args):
-        if len(args) == 1:
-            ev = args[0]
-            return self.overlaps(ev.recspan_id,
-                                 ev.start_idx, ev.stop_idx)
-        else:
-            (recspan_id, start_idx, stop_idx) = args
-            return (self.recspan_id == recspan_id
-                    and self.start_idx < stop_idx
-                    and start_idx < self.stop_idx)
+    def _index_field(self, field):
+        return self._events._obj_index_field(self._objtype,
+                                             self._obj_id, field)
 
     def __getitem__(self, key):
-        return self._events._event_getitem(self._id, key)
+        return self._events._obj_getitem(self._objtype, self._obj_id, key)
 
     def __setitem__(self, key, value):
-        self._events._event_setitem(self._id, key, value)
+        self._events._obj_setitem(self._objtype, self._obj_id, key, value)
 
     def __delitem__(self, key):
-        self._events._event_delitem(self._id, key)
+        self._events._obj_delitem(self._objtype, self._obj_id, key)
 
     def delete(self):
-        self._events._delete_event(self._id)
+        self._events._delete_obj(self._objtype, self._obj_id)
 
     def iteritems(self):
-        for key in self._events._key_types:
+        for key in self._objtype.key_types:
             try:
                 yield key, self[key]
             except KeyError:
@@ -592,11 +589,38 @@ class Event(object):
 
     has_key = __contains__
 
-    def __repr__(self):
-        return "<%s %s at %s: %s>" % (
-            self.__class__.__name__, self._id, self.index,
-            repr(dict(self.iteritems())))
+class Event(_Obj):
+    def __init__(self, events, id):
+        _Obj.__init__(self, events, events._objtypes["event"], id)
 
+    @property
+    def recspan_id(self):
+        return self._index_field("recspan_id")
+
+    @property
+    def recspan(self):
+        return Recspan(self._events, self._index_field("recspan_id"))
+
+    @property
+    def start_idx(self):
+        return self._index_field("start_idx")
+
+    @property
+    def stop_idx(self):
+        return self._index_field("stop_idx")
+
+    def overlaps(self, *args):
+        if len(args) == 1:
+            ev = args[0]
+            return self.overlaps(ev.recspan_id,
+                                 ev.start_idx, ev.stop_idx)
+        else:
+            (recspan_id, start_idx, stop_idx) = args
+            return (self.recspan_id == recspan_id
+                    and self.start_idx < stop_idx
+                    and start_idx < self.stop_idx)
+
+    __repr__ = repr_pretty_delegate
     # For the IPython pretty-printer:
     #   http://ipython.org/ipython-doc/dev/api/generated/IPython.lib.pretty.html
     def _repr_pretty_(self, p, cycle):
@@ -620,15 +644,41 @@ class Event(object):
         query &= (p.recspan_id == self.recspan_id)
         if count > 0:
             query &= (p.start_idx > self.start_idx)
-            return query.run()[count - 1]
+            return list(query)[count - 1]
         else:
             query &= (p.start_idx < self.start_idx)
-            return query.run()[count]
+            return list(query)[count]
 
     def move(self, offset):
         """Shifts this event's timestamp by 'offset' samples (positive for
         forward, negative for backward)."""
-        self._events._move_event(self._id, offset)
+        self._events._move_event(self._obj_id, offset)
+
+class Recspan(_Obj):
+    def __init__(self, events, id):
+        _Obj.__init__(self, events, events._objtypes["recspan"], id)
+
+    @property
+    def id(self):
+        return self._index_field("id")
+
+    @property
+    def ticks(self):
+        return self._index_field("ticks")
+
+    __repr__ = repr_pretty_delegate
+    # For the IPython pretty-printer:
+    #   http://ipython.org/ipython-doc/dev/api/generated/IPython.lib.pretty.html
+    def _repr_pretty_(self, p, cycle):
+        assert not cycle
+        p.begin_group(2,
+                      "<%s %s with %s ticks:"
+                      % (self.__class__.__name__,
+                         self._obj_id, self.ticks))
+        p.breakable()
+        p.pretty(dict(self.iteritems()))
+        p.end_group(2, ">")
+
 
 ###############################################
 #
@@ -636,12 +686,33 @@ class Event(object):
 #
 ###############################################
 
-class PlaceholderEvent(object):
-    def __init__(self, events):
+# Keys that have a special magical meaning in dict-queries and
+# string-queries (plus the actual database field name they map to).
+# In string queries these can be de-magicalified by quoting them with
+# backquotes, i.e.,:
+#   "_RECSPAN_ID == 1"   <-> placeholder.recspan_id == 1
+#   "`_RECSPAN_ID` == 1" <-> placeholder["_RECSPAN_ID"] == 1
+_magic_query_strings = set(["_RECSPAN_ID", "_START_IDX", "_STOP_IDX"])
+def _magic_query_string_to_query(events, name, origin=None):
+    return IndexFieldQuery(events, name[1:].lower(), origin)
+
+class _PlaceholderObj(object):
+    def __init__(self, events, objtype):
         self._events = events
+        self._objtype = objtype
 
     def __getitem__(self, key):
-        return AttrQuery(self._events, key)
+        return AttrQuery(self._events, self._objtype, key)
+
+    def has_key(self, key):
+        return HasKeyQuery(self._events, self._objtype, key)
+
+    def __repr__(self):
+        return "<%s>" % (self.__class__.__name__,)
+
+class PlaceholderEvent(_PlaceholderObj):
+    def __init__(self, events):
+        _PlaceholderObj.__init__(self, events, events._objtypes["event"])
 
     @property
     def recspan_id(self):
@@ -655,8 +726,9 @@ class PlaceholderEvent(object):
     def stop_idx(self):
         return IndexFieldQuery(self._events, "stop_idx")
 
-    def has_key(self, key):
-        return HasKeyQuery(self._events, key)
+    @property
+    def recspan(self):
+        return PlaceholderRecspan(self._events)
 
     def overlaps(self, *args):
         if len(args) == 1:
@@ -670,11 +742,11 @@ class PlaceholderEvent(object):
             return OverlapsQuery(self._events,
                                  recspan_id, start_idx, stop_idx)
 
-class SqlWhere(object):
-    def __init__(self, code, tables, args):
-        self.code = code
-        self.tables = tables
-        self.args = args
+class PlaceholderRecspan(_PlaceholderObj):
+    def __init__(self, events):
+        _PlaceholderObj.__init__(self, events, events._objtypes["recspan"])
+
+SqlWhere = namedtuple("SqlWhere", ["code", "attr_tables", "args"])
 
 class Query(object):
     def __init__(self, events, origin=None):
@@ -730,13 +802,13 @@ class Query(object):
         return self._make_op(">=", ">=", [self, other])
 
     def __and__(self, other):
-        return self._make_op("and", "AND", [self, other], Events.BOOL)
+        return self._make_op("and", "AND", [self, other], _BOOL)
 
     def __or__(self, other):
-        return self._make_op("or", "OR", [self, other], Events.BOOL)
+        return self._make_op("or", "OR", [self, other], _BOOL)
 
     def __invert__(self):
-        return self._make_op("not", "NOT", [self], Events.BOOL)
+        return self._make_op("not", "NOT", [self], _BOOL)
 
     def __nonzero__(self):
         raise TypeError("can't convert query directly to bool "
@@ -751,37 +823,34 @@ class Query(object):
         assert False
 
     def __len__(self):
-        if self._value_type() != Events.BOOL:
-            raise EventsError("query must be boolean", query)
+        if self._value_type() is not _BOOL:
+            raise EventsError("top-level query must be boolean", self)
         c = self._events._query(self._sql_where(), [], ["count(*)"])
         for (count,) in c:
             return count
 
-    def _db_ids(self):
-        if self._value_type() != Events.BOOL:
+    def __iter__(self):
+        if self._value_type() is not _BOOL:
             raise EventsError("top-level query must be boolean", self)
         c = self._events._query(self._sql_where(),
                                 ["sys_events"],
                                 ["sys_events.id"])
         for (db_id,) in c:
-            yield self._events._decode_sql_value(db_id)
-
-    def run(self):
-        return EventSet(self._events, list(self._db_ids()))
+            yield Event(self._events, _decode_sql_value(db_id))
 
 class LiteralQuery(Query):
     def __init__(self, events, value, origin=None):
         Query.__init__(self, events, origin)
         self._value = value
         try:
-            self._saved_value_type = self._events._value_type(self._value)
+            self._saved_value_type = _value_type(self._value)
         except ValueError:
             raise EventsError("literals must be boolean, string, numeric, "
                               "or None",
                               self)
 
     def _sql_where(self):
-        return SqlWhere("?", set(), [self._value])
+        return SqlWhere("?", {}, [self._value])
 
     def _value_type(self):
         return self._saved_value_type
@@ -790,46 +859,59 @@ class LiteralQuery(Query):
         return "<%s: %r>" % (self.__class__.__name__, self._value)
 
 class AttrQuery(Query):
-    def __init__(self, events, key, origin=None):
+    def __init__(self, events, objtype, key, origin=None):
         Query.__init__(self, events, origin)
         self._key = key
+        self._objtype = objtype
         # Go ahead and create any tables that are being queried -- if someone
         # makes a typo then this will create an empty table, but creating a
-        # table by itself is a total no-op at the data level, so whatever.
-        self._events._ensure_table_for_key(self._key)
+        # table by itself is a total no-op at the semantic level, so whatever.
+        self._events._ensure_table_for_key(objtype, self._key)
+
+    def exists(self):
+        return HasKeyQuery(self._events, self._objtype,
+                           self._key, self.origin)
 
     def _sql_where(self):
-        table_id = _table_name(self._key)
-        return SqlWhere(table_id + ".value", set([table_id]), [])
+        table_id = self._objtype.table_name(self._key)
+        return SqlWhere(table_id + ".value",
+                        {self._objtype: frozenset([table_id])},
+                        [])
 
     def _value_type(self):
-        return self._events._value_type_for_key(self._key)
+        return self._objtype.value_type_for_key(self._key)
 
     def __repr__(self):
-        return "<%s %r>" % (self.__class__.__name__, self._key)
+        return "<%s %s %r>" % (self.__class__.__name__,
+                               self._objtype.name,
+                               self._key)
 
 class HasKeyQuery(Query):
-    def __init__(self, events, key, origin=None):
+    def __init__(self, events, objtype, key, origin=None):
         Query.__init__(self, events, origin)
         self._key = key
+        self._objtype = objtype
         # Go ahead and create any tables that are being queried -- if someone
         # makes a typo then this will create an empty table, but creating a
-        # table by itself is a total no-op at the data level, so whatever.
-        self._events._ensure_table_for_key(self._key)
+        # table by itself is a total no-op at the semantic level, so whatever.
+        self._events._ensure_table_for_key(objtype, self._key)
 
     def _sql_where(self):
-        table_id = _table_name(self._key)
+        table = self._objtype.table_name(self._key)
         return SqlWhere("EXISTS (SELECT 1 FROM %s inner_table "
-                        "WHERE sys_events.id == inner_table.event_id)"
-                        % (table_id,),
-                        set(), [])
+                        "WHERE sys_events.%s == inner_table.obj_id)"
+                        % (table, self._objtype.event_join_field),
+                        {}, [])
 
     def _value_type(self):
-        return self._events.BOOL
+        return _BOOL
 
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self._key)
 
+# For now we only support queries on Event index fields, not Recspan index
+# fields. The only Recspan index field is 'ticks', and can't really see why
+# that would be useful, so whatever.
 class IndexFieldQuery(Query):
     def __init__(self, events, field, origin=None):
         Query.__init__(self, events, origin)
@@ -838,10 +920,10 @@ class IndexFieldQuery(Query):
     def _sql_where(self):
         # sys_events is always included in the join, so no need to add it to
         # the tables.
-        return SqlWhere("sys_events.%s" % (self._field,), set(), [])
+        return SqlWhere("sys_events.%s" % (self._field,), {}, [])
 
     def _value_type(self):
-        return self._events.NUMERIC
+        return _NUMERIC
 
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self._field)
@@ -869,22 +951,15 @@ class OverlapsQuery(Query):
                      self._stop_idx, self._start_idx, magnitude,
                      self._stop_idx, magnitude, self._start_idx]
             possibilities.append(" AND ".join(constraints))
-        return SqlWhere(" OR ".join(possibilities), set(), args)
+        return SqlWhere(" OR ".join(possibilities), {}, args)
 
     def _value_type(self):
-        return self._events.BOOL
+        return _BOOL
 
     def __repr__(self):
         return ("<%s %r %r [%r, %r)>"
                 % (self.__class__.__name__, self._recspan_id,
                    self._start_idx, self._stop_idx))
-
-# This is only used internally
-class IdQuery(Query):
-    def _sql_where(self):
-        # sys_events is always included in the join, so no need to add it to
-        # the tables.
-        return SqlWhere("sys_events.id", set(), [])
 
 class QueryOperator(Query):
     def __init__(self, events, sql_op, children, origin=None):
@@ -898,16 +973,22 @@ class QueryOperator(Query):
         if len(self._children) == 1:
             # Special case for NOT
             rhs_sqlwhere = lhs_sqlwhere
-            lhs_sqlwhere = SqlWhere("", set(), [])
+            lhs_sqlwhere = SqlWhere("", {}, [])
         else:
             rhs_sqlwhere = self._children[1]._sql_where()
+        new_attr_tables = {}
+        for attr_tables in [lhs_sqlwhere.attr_tables,
+                            rhs_sqlwhere.attr_tables]:
+            for objtype, table_set in attr_tables.iteritems():
+                new_attr_tables[objtype] = table_set.union(
+                    new_attr_tables.get(objtype, []))
         return SqlWhere("(%s %s %s)"
                        % (lhs_sqlwhere.code, self._sql_op, rhs_sqlwhere.code),
-                       lhs_sqlwhere.tables.union(rhs_sqlwhere.tables),
-                       lhs_sqlwhere.args + rhs_sqlwhere.args)
+                        new_attr_tables,
+                        lhs_sqlwhere.args + rhs_sqlwhere.args)
 
     def _value_type(self):
-        return Events.BOOL
+        return _BOOL
 
     def __repr__(self):
         return "<%s (%s %r)>" % (self.__class__.__name__,
@@ -921,6 +1002,7 @@ class QueryOperator(Query):
 ########################################
 
 _punct_ops = [
+    Operator(".", 2, 200),
     Operator("==", 2, 100),
     Operator("!=", 2, 100),
     Operator("<", 2, 100),
@@ -936,7 +1018,7 @@ _text_ops = [
     ]
 _ops = _punct_ops + _text_ops
 
-_atomic = ["ATTR", "LITERAL", "MAGIC_FIELD"]
+_atomic = ["ATTR", "LITERAL", "MAGIC_FIELD", "_RECSPAN"]
 
 def _read_quoted_string(string, i):
     start = i
@@ -1024,6 +1106,8 @@ def _tokenize(string):
                 yield Token("LITERAL", origin, None)
             elif token in _magic_query_strings:
                 yield Token("MAGIC_FIELD", origin, token)
+            elif token == "_RECSPAN":
+                yield Token("_RECSPAN", origin, token)
             else:
                 yield Token("ATTR", origin, token)
             i = match.end()
@@ -1056,21 +1140,32 @@ def _eval(events, tree):
     if tree.type in _op_to_pymethod:
         eval_args = [_eval(events, arg) for arg in tree.args]
         return getattr(eval_args[0], _op_to_pymethod[tree.type])(*eval_args[1:])
+    elif tree.type == ".":
+        if tree.args[0].type != "_RECSPAN":
+            raise EventsError("left argument of '.' must be _RECSPAN",
+                              tree.args[0].origin)
+        if tree.args[1].type != "ATTR":
+            raise EventsError("right arguments of '.' must be attribute",
+                              tree.args[1].origin)
+        return AttrQuery(events, events._objtypes["recspan"],
+                         tree.args[1].token.extra, tree.origin)
     elif tree.type == "has":
         assert len(tree.args) == 1
-        arg = tree.args[0]
-        if arg.type != "ATTR":
-            raise EventsError("'has' expects an attribute name", arg)
-        return HasKeyQuery(events, arg.token.extra, tree.origin)
+        eval_arg = _eval(events, tree.args[0])
+        if not isinstance(eval_arg, AttrQuery):
+            raise EventsError("argument of 'has' must be an attribute",
+                              tree.args[0].origin)
+        return eval_arg.exists()
     elif tree.type == "LITERAL":
         return LiteralQuery(events, tree.token.extra, tree.origin)
     elif tree.type == "ATTR":
-        return AttrQuery(events, tree.token.extra, tree.origin)
+        return AttrQuery(events, events._objtypes["event"],
+                         tree.token.extra, tree.origin)
     elif tree.type == "MAGIC_FIELD":
         return _magic_query_string_to_query(events, tree.token.extra,
-                                              tree.origin)
+                                            tree.origin)
     else:
         assert False
 
-def query_from_string(events, string):
+def _query_from_string(events, string):
     return _eval(events, infix_parse(_tokenize(string), _ops, _atomic))

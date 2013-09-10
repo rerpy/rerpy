@@ -12,7 +12,7 @@ import bisect
 import numpy as np
 import pandas
 
-from pyrerp.data import ElectrodeInfo, DataFormat, Recording
+from pyrerp.data import SensorInfo, DataFormat, Recording
 from pyrerp.util import maybe_open
 from pyrerp._kutaslab import _decompress_crw_chunk
 
@@ -343,7 +343,7 @@ def read_loc(file_like):
         names.append(name)
         thetas.append(theta)
         rs.append(r)
-    return ElectrodeInfo(names, thetas, rs)
+    return SensorInfo(names, thetas, rs)
 
 # XX someday should fix this so that it delays reading the actual data until
 # needed (to avoid the giant memory overhead of loading in lots of data sets
@@ -368,7 +368,7 @@ class KutaslabRecording(Recording):
         if f_loc is not None:
             self.electrode_info = read_loc(f_loc)
         else:
-            self.electrode_info = ElectrodeInfo([], [], [])
+            self.electrode_info = SensorInfo([], [], [])
         self.data_format = DataFormat(hz, "RAW", channel_names)
 
         raw_log_events = read_log(f_log)

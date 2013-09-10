@@ -16,10 +16,10 @@ from pyrerp.parimap import parimap_unordered
 # Can't use a namedtuple for this because we want __eq__ and __hash__ to use
 # identity semantics, not value semantics.
 class _Epoch(object):
-    def __init__(self, start_idx, ticks,
+    def __init__(self, start_tick, ticks,
                  design_row, design_offset, expanded_design_offset,
                  rerp_idx, intrinsic_artifacts):
-        self.start_idx = start_idx
+        self.start_tick = start_tick
         self.ticks = ticks
         self.design_row = design_row
         self.design_offset = design_offset
@@ -161,15 +161,15 @@ def _artifact_spans(recspan_intern_table,
         yield DataSpan(end, pos_inf, None, "_NO_RECORDING")
 
     # Now lookup the actual artifacts recorded in the events structure.
-    for artifact_event in data_set.events.find(artifact_query):
+    for artifact_event in data_set.events(artifact_query):
         artifact_type = artifact_event.get(artifact_type_field, "_UNKNOWN")
         if not isinstance(artifact_type, basestring):
             raise TypeError("artifact type must be a string, not %r"
                             % (artifact_type,))
         recspan = (artifact_event.recording, artifact_event.span_id)
         recspan_intern = recspan_intern_table[recspan]
-        yield DataSpan((recspan_intern, artifact_event.start_idx),
-                       (recspan_intern, artifact_event.stop_idx),
+        yield DataSpan((recspan_intern, artifact_event.start_tick),
+                       (recspan_intern, artifact_event.stop_tick),
                        None,
                        artifact_type)
 
@@ -187,6 +187,37 @@ class _ArangeFactor(object):
     def eval(self, state, data):
         return np.arange(self._n)
 
+# Two little adapter classes to allow for rEPR formulas like
+#   ~ 1 + stimulus_type + _RECSPAN.subject
+class _FormulaEnv(object):
+    def __init__(self, events):
+        self._events = events
+
+    def __getitem__(self, key):
+        if key == "_RECSPAN":
+            return _FormulaRecspan([ev.recspan for ev in self._events])
+        else:
+            # This will raise a KeyError for any events where the field is
+            # just undefined, and will return None otherwise. This could be
+            # done more efficiently by querying the database directly, but
+            # let's not fret about that until it matters.
+            #
+            # We use pandas.Series here because it has much more sensible
+            # NaN/None handling than raw numpy.
+            #   np.asarray([None, 1, 2]) -> object (!) array
+            #   np.asarray([np.nan, "a", "b"]) -> ["nan", "a", "b"] (!)
+            # but
+            #   pandas.Series([None, 1, 2]) -> [nan, 1, 2]
+            #   pandas.Series([None, "a", "b"]) -> [None, "a", "b"]
+            pandas.Series([ev[key] for ev in self._events])
+
+class _FormulaRecspan(object):
+    def __init__(self, recspans):
+        self._recspans = recspans
+
+    def __getattr__(self, attr):
+        return pandas.Series([rs[attr] for rs in self._recspans])
+
 def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
     rerp_infos = []
     rerp_names = set()
@@ -203,7 +234,7 @@ def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
         stop_offset = 1 + data_format.ms_to_samples(rerp_spec.stop_time)
         if start_offset >= stop_offset:
             raise ValueError("Epochs must be >1 sample long!")
-        event_set = data_set.events.find(rerp_spec.event_query)
+        events = list(data_set.events(rerp_spec.event_query))
         # Tricky bit: the specifies a RHS-only formula, but really we have an
         # implicit LHS (determined by the event_query). This makes things
         # complicated when it comes to e.g. keeping track of which items
@@ -216,22 +247,22 @@ def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
         desc = ModelDesc.from_formula(rerp_spec.formula, eval_env)
         if desc.lhs_termlist:
             raise ValueError("Formula cannot have a left-hand side")
-        desc.lhs_termlist = [Term([_ArangeFactor(len(event_set))])]
-        fake_lhs, design = dmatrices(desc, event_set)
+        desc.lhs_termlist = [Term([_ArangeFactor(len(events))])]
+        fake_lhs, design = dmatrices(desc, _FormulaEnv(events))
         surviving_event_idxes = np.asarray(fake_lhs, dtype=int).ravel()
-        design_row_idxes = np.empty(len(event_set))
+        design_row_idxes = np.empty(len(events))
         design_row_idxes.fill(-1)
         design_row_idxes[surviving_event_idxes] = np.arange(design.shape[0])
         # Now design_row_idxes[i] is -1 if event i was thrown out, and
         # otherwise gives the row in 'design' which refers to event 'i'.
-        for i in xrange(len(event_set)):
-            event = event_set[i]
+        for i in xrange(len(events)):
+            event = events[i]
             # -1 for non-existent
             design_row_idx = design_row_idxes[i]
             recspan = (event.recording, event.span_id)
             recspan_intern = recspan_intern_table[recspan]
-            epoch_start = start_offset + event.start_idx
-            epoch_stop = stop_offset + event.start_idx
+            epoch_start = start_offset + event.start_tick
+            epoch_stop = stop_offset + event.start_tick
             if design_row_idx == -1:
                 design_row = None
             else:
@@ -262,7 +293,7 @@ def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
             "stop_offset": stop_offset,
             "design_offset": design_offset,
             "expanded_design_offset": expanded_design_offset,
-            "total_epochs": len(event_set),
+            "total_epochs": len(events),
             "epochs_with_data": 0,
             "epochs_with_artifacts": 0,
             }
@@ -405,11 +436,11 @@ class _ByEpochWorker(object):
         self._design_width = design_width
 
     def __call__(self, job):
-        data, data_start_idx, epochs = job
+        data, data_start_tick, epochs = job
         assert len(epochs) == 1
         epoch = epochs[0]
-        assert epoch.start_idx == data_start_idx
-        assert data.shape[0] == epoch.stop_idx - epoch.start_idx
+        assert epoch.start_tick == data_start_tick
+        assert data.shape[0] == epoch.stop_tick - epoch.start_tick
         # XX FIXME: making this a sparse array could be more efficient
         x_strip = np.zeros((1, design_width))
         x_idx = slice(epoch.design_offset,
@@ -423,7 +454,7 @@ class _ContinuousWorker(object):
         self._expanded_design_width = expanded_design_width
 
     def __call__(self, job):
-        data, data_start_idx, epochs = job
+        data, data_start_tick, epochs = job
         nnz = 0
         for epoch in epochs:
             nnz += epoch.design_row.shape[0] * data.shape[0]
@@ -450,7 +481,7 @@ class _ContinuousWorker(object):
                 design_i[write_slice] = np.arange(data.shape[0])
                 col_start = epoch.expanded_design_offset
                 col_start += i * epoch.ticks
-                col_start += data_start_idx - epoch.start_idx
+                col_start += data_start_tick - epoch.start_tick
                 design_j[write_slice] = np.arange(col_start,
                                                   col_start + data.shape[0])
         x_strip_coo = sp.coo_matrix((design_data, (design_i, design_j)),

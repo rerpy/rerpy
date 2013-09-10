@@ -1,3 +1,9 @@
+new plan: operation F it
+  still have an iteration interface to DataSets but
+    for now store the arrays in memory
+    apply transforms immediately
+    leave full sensor metadata for later
+
 need a way to save DataSets
   either with or without data
   without data: ask each Recording for an object that when unpickled
@@ -25,6 +31,19 @@ two levels of metadata:
 
 dataset itself just gives id to each recspan
 
+
+if we ever want to support recordings that are aligned but without a
+fixed shared sampling rate -- maybe this will happen for EEG/MEG etc.?
+-- then recspan_id becomes basically time_base_id, and each actual
+recording is oriented relative to a time_base -- annotate with start
+time (time base, floating point time), sampling rate (floating point),
+and events similarly are placed at particular (time base, floating
+point time) locations.
+this is enough to, given an event (and a set of channels we care
+about) locate the data in all of those channels's at that
+event. Don't need extra storage costs and possible rounding headaches
+involved in storing/search floating point times arrays because can
+calculate them on the fly...
 
 
 formats:

@@ -12,10 +12,24 @@ def test_Events_basic():
     # errors on type mismatches
     # storing None
     e = Events()
+    # need a recspan before adding events
+    assert_raises(EventsError,
+                  e.add_event, 0, 10, 11, {})
+    r1 = e.add_recspan(0, 100, {"a": "hello", "b": True, "c": None, "d": 1})
+    assert r1.id == 0
+    assert r1.ticks == 100
+    assert r1["a"] == "hello"
+    assert r1["b"] == True
+    assert r1["c"] is None
+    assert r1["d"] is 1
+    # Use same names, different types, to check that type constraints don't
+    # apply between events and recspans
     ev1 = e.add_event(0, 10, 11, {"a": 1, "b": "hello", "c": True})
     assert ev1.recspan_id == 0
     assert ev1.start_idx == 10
     assert ev1.stop_idx == 11
+    assert ev1.recspan.id == 0
+    assert ev1.recspan == r1
     assert ev1["a"] == 1
     assert ev1["b"] == "hello"
     assert ev1["c"] == True
@@ -42,7 +56,11 @@ def test_Events_basic():
     assert ev1["xxx"] is None
 
     e_pick = cPickle.loads(cPickle.dumps(e))
-    ev1_pick, ev2_pick = list(e_pick)
+    r1_pick, = e_pick.all_recspans()
+    assert r1_pick.id == 0
+    assert r1_pick.ticks == 100
+    assert r1_pick.items() == r1.items()
+    ev1_pick, ev2_pick = list(e_pick.as_query(True))
     assert ev1_pick.recspan_id == 0
     assert ev1_pick.start_idx == 10
     assert ev1_pick.stop_idx == 11
@@ -56,6 +74,7 @@ def test_Event():
     # set/get/del, index
     # dict methods
     e = Events()
+    r1 = e.add_recspan(1, 100, {})
     d = {"a": 1, "b": "hello", "c": True}
     ev1 = e.add_event(1, 10, 12, d)
     assert ev1.recspan_id == 1
@@ -88,7 +107,6 @@ def test_Event():
     assert not ev1.has_key("z")
 
     assert ev1.overlaps(ev1)
-    assert not ev1.overlaps(1, 9, 11)
     assert not ev1.overlaps(0, 9, 11)
     assert ev1.overlaps(1, 9, 11)
     assert ev1.overlaps(1, 10, 12)
@@ -102,9 +120,9 @@ def test_Event():
     # Nothing overlaps an empty interval
     assert not ev1.overlaps(0, 11, 11)
 
-    assert len(e) == 1
+    assert len(e.as_query(True)) == 1
     ev1.delete()
-    assert len(e) == 0
+    assert len(e.as_query(True)) == 0
     # XX: maybe this should be a ValueError or something, but checking for
     # whether the event object itself exists in __getitem__ is extra work that
     # doesn't seem worth bothering with.
@@ -113,13 +131,15 @@ def test_Event():
 def test_misc_queries():
     # ANY, at, __iter__, __len__
     e = Events()
+    e.add_recspan(0, 100, {})
+    e.add_recspan(1, 100, {})
     e.add_event(0, 20, 21, {"a": -1})
     e.add_event(0, 10, 11, {"a": 1})
     e.add_event(0, 30, 31, {"a": 100})
-    assert len(e) == 3
+    e.add_event(1, 15, 16, {})
+    assert len(e.as_query(True)) == 4
     # Always sorted by index:
-    assert [ev.start_idx for ev in e] == [10, 20, 30]
-    assert [ev.start_idx for ev in e.find(e.ANY)] == [10, 20, 30]
+    assert [ev.start_idx for ev in e.as_query(True)] == [10, 20, 30, 15]
     assert len(e.at(0, 10)) == 1
     assert e.at(0, 10)[0]["a"] == 1
     assert len(e.at(0, 20)) == 1
@@ -129,10 +149,13 @@ def test_misc_queries():
 
 def test_Event_relative():
     e = Events()
+    e.add_recspan(0, 100, {})
+    e.add_recspan(1, 100, {})
     ev20 = e.add_event(0, 20, 21, {"a": 20, "extra": True})
     ev10 = e.add_event(0, 10, 11, {"a": 10})
     ev30 = e.add_event(0, 30, 31, {"a": 30})
     ev40 = e.add_event(0, 40, 41, {"a": 40, "extra": True})
+    ev1_40 = e.add_event(1, 40, 41, {"a": 140, "extra": False})
 
     assert ev20.relative(1)["a"] == 30
     assert_raises(IndexError, ev20.relative, 0)
@@ -141,9 +164,13 @@ def test_Event_relative():
     assert ev30.relative(-2)["a"] == 10
     assert ev10.relative(1, "extra")["a"] == 20
     assert ev10.relative(2, "extra")["a"] == 40
+    # Can't cross into different recspans
+    assert_raises(IndexError, ev40.relative, 1)
+    assert_raises(IndexError, ev1_40.relative, -1)
 
 def test_Event_move():
     e = Events()
+    e.add_recspan(0, 100, {})
     ev20 = e.add_event(0, 20, 21, {"a": 20, "extra": True})
     ev10 = e.add_event(0, 10, 15, {"a": 10})
     assert ev20.start_idx == 20
@@ -160,51 +187,34 @@ def test_Event_move():
     assert ev10.start_idx == 15
     assert ev10.stop_idx == 20
 
-def test_find():
+def test_as_query():
     # all the different calling conventions
     e = Events()
+    e.add_recspan(0, 100, {})
     e.add_event(0, 10, 11, {"a": 1, "b": True})
     e.add_event(0, 20, 21, {"a": -1, "b": True})
 
-    assert [ev.start_idx for ev in e.find()] == [10, 20]
+    assert [ev.start_idx for ev in e.as_query(True)] == [10, 20]
+    assert not list(e.as_query(False))
 
-    assert [ev.start_idx for ev in e.find({"a": 1})] == [10]
-    assert [ev.start_idx for ev in e.find({"a": 1, "b": True})] == [10]
-    assert [ev.start_idx for ev in e.find({"a": 1, "b": False})] == []
-    assert [ev.start_idx for ev in e.find({"b": True})] == [10, 20]
-    assert [ev.start_idx for ev in e.find({"_RECSPAN_ID": 0})] == [10, 20]
-    assert [ev.start_idx for ev in e.find({"_RECSPAN_ID": 1})] == []
-    assert [ev.start_idx for ev in e.find({"_START_IDX": 10})] == [10]
-    assert [ev.start_idx for ev in e.find({"_STOP_IDX": 11})] == [10]
+    assert [ev.start_idx for ev in e.as_query({"a": 1})] == [10]
+    assert [ev.start_idx for ev in e.as_query({"a": 1, "b": True})] == [10]
+    assert [ev.start_idx for ev in e.as_query({"a": 1, "b": False})] == []
+    assert [ev.start_idx for ev in e.as_query({"b": True})] == [10, 20]
+    assert [ev.start_idx for ev in e.as_query({"_RECSPAN_ID": 0})] == [10, 20]
+    assert [ev.start_idx for ev in e.as_query({"_RECSPAN_ID": 1})] == []
+    assert [ev.start_idx for ev in e.as_query({"_START_IDX": 10})] == [10]
+    assert [ev.start_idx for ev in e.as_query({"_STOP_IDX": 11})] == [10]
 
-    assert [ev.start_idx for ev in e.find(e.placeholder["a"] == 1)] == [10]
-
-def test_EventSet():
-    e = Events()
-    e.add_event(0, 10, 11, {"a": 1, "b": True, "c": None})
-    e.add_event(0, 20, 21, {"a": -1, "b": True})
-    e.add_event(0, 15, 16, {"a": -1, "b": False, "c": 1})
-    es = e.find()
-    assert es[0].start_idx == 10
-    assert es[1].start_idx == 15
-    assert es[2].start_idx == 20
-    assert es[-1].start_idx == 20
-    assert_raises(IndexError, es.__getitem__, 3)
-    a_series = es["a"]
-    assert np.all(a_series == [1, -1, -1])
-    assert a_series.dtype == np.dtype(int)
-    b_series = es["b"]
-    assert np.all(b_series == [True, False, True])
-    assert b_series.dtype == np.dtype(bool)
-    assert_raises(KeyError, es.__getitem__, "c")
-    # Make sure that both None and flat-out missing values are handled
-    # correctly:
+    assert [ev.start_idx for ev in e.as_query(e.placeholder["a"] == 1)] == [10]
 
 def test_python_query():
     # all operators
     # types (esp. including None)
     # index
     e = Events()
+    e.add_recspan(0, 100, {"recspan_zero": True})
+    e.add_recspan(1, 100, {"recspan_zero": False, "recspan_extra": "hi"})
     ev10 = e.add_event(0, 10, 11,
                        {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
     ev20 = e.add_event(1, 20, 25,
@@ -214,13 +224,13 @@ def test_python_query():
 
     p = e.placeholder
     def t(q, expected):
-        assert [ev.start_idx for ev in e.find(q)] == expected
+        assert [ev.start_idx for ev in q] == expected
 
     t(p.start_idx == 10, [10])
-    t(p.start_idx != 10, [20, 21])
+    t(p.start_idx != 10, [21, 20])
     t(p.start_idx < 10, [])
-    t(p.start_idx > 10, [20, 21])
-    t(p.start_idx >= 20, [20, 21])
+    t(p.start_idx > 10, [21, 20])
+    t(p.start_idx >= 20, [21, 20])
     t(p.start_idx <= 20, [10, 20])
     t(~(p.start_idx == 20), [10, 21])
     t(~(p.start_idx != 20), [20])
@@ -230,11 +240,11 @@ def test_python_query():
     t(p["a"] < 1, [20])
     t(p["a"] > 1, [])
     t(p["a"] >= 1, [10, 21])
-    t(p["a"] <= 1, [10, 20, 21])
+    t(p["a"] <= 1, [10, 21, 20])
     t(~(p["a"] == 1), [20])
     t(~(p["a"] != 1), [10, 21])
     t(p["a"] == 1.5, [])
-    t(p["a"] < 1.5, [10, 20, 21])
+    t(p["a"] < 1.5, [10, 21, 20])
     t(p["a"] < 0.5, [20])
     t(p["a"] > 0.5, [10, 21])
 
@@ -242,7 +252,7 @@ def test_python_query():
     t(p["b"] != "asdf", [20])
     t(p["b"] < "asdf", [])
     t(p["b"] > "asdf", [20])
-    t(p["b"] >= "asdf", [10, 20, 21])
+    t(p["b"] >= "asdf", [10, 21, 20])
     t(p["b"] <= "asdf", [10, 21])
     t(p["b"] <= "b", [10, 21])
     t(p["b"] >= "b", [20])
@@ -250,50 +260,52 @@ def test_python_query():
     t(~(p["b"] != "asdf"), [10, 21])
 
     t(p["c"] == True, [10])
-    t(p["c"] != True, [20, 21])
-    t(p["c"] == False, [20, 21])
+    t(p["c"] != True, [21, 20])
+    t(p["c"] == False, [21, 20])
     t(p["c"] != False, [10])
     t(p["c"], [10])
-    t(~p["c"], [20, 21])
-    t(p["c"] < True, [20, 21])
-    t(p["c"] <= True, [10, 20, 21])
+    t(~p["c"], [21, 20])
+    t(p["c"] < True, [21, 20])
+    t(p["c"] <= True, [10, 21, 20])
     t(p["c"] > True, [])
     t(p["c"] > False, [10])
-    t(p["c"] >= False, [10, 20, 21])
-    t(~(p["c"] == True), [20, 21])
+    t(p["c"] >= False, [10, 21, 20])
+    t(~(p["c"] == True), [21, 20])
     t(~(p["c"] != True), [10])
 
     t(p["d"] == 1.5, [10])
-    t(p["d"] != 1.5, [20, 21])
-    t(p["d"] < 1.5, [20, 21])
+    t(p["d"] != 1.5, [21, 20])
+    t(p["d"] < 1.5, [21, 20])
     t(p["d"] > 1.5, [])
     t(p["d"] >= 1.5, [10])
-    t(p["d"] <= 1.5, [10, 20, 21])
-    t(~(p["d"] == 1.5), [20, 21])
+    t(p["d"] <= 1.5, [10, 21, 20])
+    t(~(p["d"] == 1.5), [21, 20])
     t(~(p["d"] != 1.5), [10])
     t(p["d"] == 1, [])
-    t(p["d"] < 10, [10, 20, 21])
-    t(p["d"] < 1, [20, 21])
+    t(p["d"] < 10, [10, 21, 20])
+    t(p["d"] < 1, [21, 20])
     t(p["d"] > 1, [10])
 
     t(p["e"] == None, [10, 20])
     t(p["e"] != None, [21])
 
-    t(p.has_key("e"), [10, 20, 21])
+    t(p.has_key("e"), [10, 21, 20])
     t(~p.has_key("e"), [])
 
     t(p["nonexistent"] == 10, [])
     t(p["nonexistent"] != 10, [])
     t(p["nonexistent"] == None, [])
+    t(p["nonexistent"].exists(), [])
     t(p.has_key("nonexistent"), [])
-    t(~p.has_key("nonexistent"), [10, 20, 21])
+    t(~p["nonexistent"].exists(), [10, 21, 20])
+    t(~p.has_key("nonexistent"), [10, 21, 20])
 
-    t(p["a"] > p["d"], [20, 21])
+    t(p["a"] > p["d"], [21, 20])
     t(p["a"] < p["d"], [10])
 
     t((p.start_idx < 21) & (p["a"] == 1), [10])
-    t((p.start_idx < 21) | (p["a"] == 1), [10, 20, 21])
-    t(~((p.start_idx < 21) & (p["a"] == 1)), [20, 21])
+    t((p.start_idx < 21) | (p["a"] == 1), [10, 21, 20])
+    t(~((p.start_idx < 21) & (p["a"] == 1)), [21, 20])
     t(~((p.start_idx < 21) | (p["a"] == 1)), [])
 
     t(p.overlaps(ev10), [10])
@@ -302,21 +314,26 @@ def test_python_query():
     t(p.overlaps(0, 5, 10), [])
     t(p.overlaps(0, 5, 11), [10])
     t(p.overlaps(0, 11, 20), [])
-    t(p.overlaps(0, 11, 100), [])
+    t(p.overlaps(0, 11, 100), [21])
     for i in xrange(20, 25):
         t(p.overlaps(1, i, i + 1), [20])
 
+    t(p.recspan["recspan_zero"], [10, 21])
+    t(~p.recspan["recspan_zero"], [20])
+    t(p.recspan["recspan_extra"].exists(), [20])
+
 def test_python_query_typechecking():
     e = Events()
+    e.add_recspan(0, 100, {})
     e.add_event(0, 10, 11,
                 {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
 
     p = e.placeholder
 
-    assert list(e.find(p["e"] == 1)) == []
-    assert len(list(e.find(p["e"] == None))) == 1
+    assert list(p["e"] == 1) == []
+    assert len(list(p["e"] == None)) == 1
 
-    for bad in (True, "asdf", r):
+    for bad in (True, "asdf"):
         assert_raises(EventsError, p["a"].__eq__, bad)
         assert_raises(EventsError, p["a"].__gt__, bad)
         assert_raises(EventsError, p["a"].__lt__, bad)
@@ -327,10 +344,12 @@ def test_python_query_typechecking():
     assert_raises(EventsError, p["a"].__and__, p["c"])
     assert_raises(EventsError, p["a"].__invert__)
 
-    assert_raises(EventsError, e.find, p["e"])
+    assert_raises(EventsError, list, p["e"])
 
 def test_string_query():
     e = Events()
+    e.add_recspan(0, 100, {"recspan_attr1": 33})
+    e.add_recspan(1, 100, {"recspan_attr2": "hello"})
     e.add_event(0, 10, 12,
                 {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
     e.add_event(1, 20, 25,
@@ -339,8 +358,7 @@ def test_string_query():
                  "and": 33})
 
     def t(s, expected_start_indices):
-        result = e.find(s)
-        start_indices = [ev.start_idx for ev in result]
+        start_indices = [ev.start_idx for ev in e.as_query(s)]
         assert start_indices == expected_start_indices
 
     # all operators
@@ -363,12 +381,15 @@ def test_string_query():
     t("b == \"asdf\"", [10])
     t("b == \'asdf\'", [10])
     t("`a` == 1", [10])
-    assert_raises(EventsError, e.find, "a == \"1\"")
+    assert_raises(EventsError, e.as_query, "a == \"1\"")
 
     # _RECSPAN_ID and friends
     t("_RECSPAN_ID == 1", [20])
     t("_START_IDX < 15", [10])
     t("_STOP_IDX > 22", [20])
+
+    t("_RECSPAN.recspan_attr1 == 20", [])
+    t("has _RECSPAN.recspan_attr1", [10])
 
     # backquotes
     t("`_START_IDX` == 10", [20])
