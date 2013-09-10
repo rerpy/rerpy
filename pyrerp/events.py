@@ -262,10 +262,12 @@ class Events(object):
     def _ensure_table_for_key(self, objtype, key):
         table = objtype.table_name(key)
         self._connection.execute("CREATE TABLE IF NOT EXISTS %s ("
-                                   "obj_id INTEGER PRIMARY KEY, "
-                                   "value);" % (table,))
+                                 "obj_id INTEGER PRIMARY KEY, "
+                                 "value, "
+                                 "FOREIGN KEY(obj_id) REFERENCES %s(id));"
+                                 % (table, objtype.sys_table))
         self._connection.execute("CREATE INDEX IF NOT EXISTS %s_idx "
-                                   "ON %s (value);" % (table, table))
+                                 "ON %s (value);" % (table, table))
 
     # WARNING: this neither commits nor creates the table if it doesn't exist,
     # it's your job to call _ensure_table_for_key and start a transaction
@@ -324,13 +326,13 @@ class Events(object):
     def _delete_obj(self, objtype, obj_id):
         with self._connection:
             c = self._connection.cursor()
-            self._execute(c, "DELETE FROM %s WHERE id = ?;"
-                          % (objtype.sys_table,), (obj_id,))
             for key in objtype.key_types:
                 self._execute(c,
                               "DELETE FROM %s WHERE obj_id = ?;"
                                 % (objtype.table_name(key),),
                               (obj_id,))
+            self._execute(c, "DELETE FROM %s WHERE id = ?;"
+                          % (objtype.sys_table,), (obj_id,))
         self._incr_op_count()
 
     def _obj_index_field(self, objtype, id, field):
@@ -342,7 +344,10 @@ class Events(object):
     def _obj_setitem(self, objtype, id, key, value):
         self._ensure_table_for_key(objtype, key)
         with self._connection:
-            self._obj_setitem_core(objtype, id, key, value)
+            try:
+                self._obj_setitem_core(objtype, id, key, value)
+            except sqlite3.IntegrityError:
+                raise EventsError("event no longer exists")
         self._incr_op_count()
 
     def _obj_getitem(self, objtype, id, key):
@@ -371,6 +376,12 @@ class Events(object):
         with self._connection:
             self._execute(c, code, (id,))
         self._incr_op_count()
+
+    def _obj_exists(self, objtype, id):
+        c = self._connection.cursor()
+        code = "SELECT COUNT(*) FROM %s WHERE id = ?" % (objtype.sys_table,)
+        self._execute(c, code, (id,))
+        return bool(c.fetchone()[0])
 
     def _move_event(self, id, offset):
         # Fortunately, this operation doesn't change the magnitude of the
@@ -523,7 +534,8 @@ class _Obj(object):
         return hash((id(self._events), id(self._objtype), self._obj_id))
 
     def __getstate__(self):
-        raise ValueError, "Event objects are not pickleable"
+        raise ValueError("%s objects are not pickleable"
+                         % (self.__class__.__name__,))
 
     def _index_field(self, field):
         return self._events._obj_index_field(self._objtype,
@@ -589,6 +601,21 @@ class _Obj(object):
 
     has_key = __contains__
 
+    __repr__ = repr_pretty_delegate
+    # For the IPython pretty-printer:
+    #   http://ipython.org/ipython-doc/dev/api/generated/IPython.lib.pretty.html
+    def _repr_pretty_(self, p, cycle):
+        assert not cycle
+        if not self._events._obj_exists(self._objtype, self._obj_id):
+            p.text("<%s (deleted)>" % (self.__class__.__name__,))
+        else:
+            p.begin_group(2,
+                          "<%s %s:"
+                          % (self.__class__.__name__, self._repr_fragment()))
+            p.breakable()
+            p.pretty(dict(self.iteritems()))
+            p.end_group(2, ">")
+
 class Event(_Obj):
     def __init__(self, events, id):
         _Obj.__init__(self, events, events._objtypes["event"], id)
@@ -620,19 +647,6 @@ class Event(_Obj):
                     and self.start_idx < stop_idx
                     and start_idx < self.stop_idx)
 
-    __repr__ = repr_pretty_delegate
-    # For the IPython pretty-printer:
-    #   http://ipython.org/ipython-doc/dev/api/generated/IPython.lib.pretty.html
-    def _repr_pretty_(self, p, cycle):
-        assert not cycle
-        p.begin_group(2,
-                      "<%s in recspan %s, ticks %s-%s:"
-                      % (self.__class__.__name__,
-                         self.recspan_id, self.start_idx, self.stop_idx))
-        p.breakable()
-        p.pretty(dict(self.iteritems()))
-        p.end_group(2, ">")
-
     def relative(self, count, query={}):
         """Counts 'count' events forward or back from the current event (or
         optionally, only events that match 'query'), and returns that. Use
@@ -654,6 +668,10 @@ class Event(_Obj):
         forward, negative for backward)."""
         self._events._move_event(self._obj_id, offset)
 
+    def _repr_fragment(self):
+        return ("in recspan %s, ticks %s-%s"
+                % (self.recspan_id, self.start_idx, self.stop_idx))
+
 class Recspan(_Obj):
     def __init__(self, events, id):
         _Obj.__init__(self, events, events._objtypes["recspan"], id)
@@ -666,19 +684,8 @@ class Recspan(_Obj):
     def ticks(self):
         return self._index_field("ticks")
 
-    __repr__ = repr_pretty_delegate
-    # For the IPython pretty-printer:
-    #   http://ipython.org/ipython-doc/dev/api/generated/IPython.lib.pretty.html
-    def _repr_pretty_(self, p, cycle):
-        assert not cycle
-        p.begin_group(2,
-                      "<%s %s with %s ticks:"
-                      % (self.__class__.__name__,
-                         self._obj_id, self.ticks))
-        p.breakable()
-        p.pretty(dict(self.iteritems()))
-        p.end_group(2, ">")
-
+    def _repr_fragment(self):
+        return "%s with %s ticks" % (self._obj_id, self.ticks)
 
 ###############################################
 #
@@ -816,10 +823,10 @@ class Query(object):
                         "instead of a logical operator like "
                         "'and' 'or' 'not')")
 
-    def _value_type(self):
+    def _value_type(self): # pragma: no cover
         assert False
 
-    def _sql_where(self):
+    def _sql_where(self): # pragma: no cover
         assert False
 
     def __len__(self):
@@ -1164,7 +1171,10 @@ def _eval(events, tree):
     elif tree.type == "MAGIC_FIELD":
         return _magic_query_string_to_query(events, tree.token.extra,
                                             tree.origin)
-    else:
+    elif tree.type == "_RECSPAN":
+        raise EventsError("_RECSPAN must appear on the left side of '.'",
+                          tree.origin)
+    else: # pragma: no cover
         assert False
 
 def _query_from_string(events, string):

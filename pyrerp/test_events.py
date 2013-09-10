@@ -24,7 +24,7 @@ def test_Events_basic():
     assert r1["d"] is 1
     # Use same names, different types, to check that type constraints don't
     # apply between events and recspans
-    ev1 = e.add_event(0, 10, 11, {"a": 1, "b": "hello", "c": True})
+    ev1 = e.add_event(0, 10, 11, {"a": 1, "b": "hello", "c": True, "d": 1.5})
     assert ev1.recspan_id == 0
     assert ev1.start_idx == 10
     assert ev1.stop_idx == 11
@@ -33,10 +33,12 @@ def test_Events_basic():
     assert ev1["a"] == 1
     assert ev1["b"] == "hello"
     assert ev1["c"] == True
+    assert ev1["d"] == 1.5
     assert type(ev1["a"]) == int
     assert type(ev1["b"]) == str
     assert type(ev1["c"]) == bool
-    assert dict(ev1) == {"a": 1, "b": "hello", "c": True}
+    assert type(ev1["d"]) == float
+    assert dict(ev1) == {"a": 1, "b": "hello", "c": True, "d": 1.5}
     ev1["a"] = 2
     assert ev1["a"] == 2
     assert_raises(ValueError, e.add_event, 0, 20, 21, {"a": "string"})
@@ -45,6 +47,7 @@ def test_Events_basic():
     assert_raises(ValueError, e.add_event, 0, 20, 21, {"b": True})
     assert_raises(ValueError, e.add_event, 0, 20, 21, {"c": 10})
     assert_raises(ValueError, e.add_event, 0, 20, 21, {"c": "string"})
+    assert_raises(ValueError, e.add_event, 0, 20, 21, {"asdf": []})
     ev1["a"] = None
     assert ev1["a"] is None
     ev1["xxx"] = None
@@ -55,6 +58,9 @@ def test_Events_basic():
     assert ev2.start_idx == 11
     assert ev1["xxx"] is None
 
+    assert_raises(ValueError, cPickle.dumps, r1)
+    assert_raises(ValueError, cPickle.dumps, ev1)
+
     e_pick = cPickle.loads(cPickle.dumps(e))
     r1_pick, = e_pick.all_recspans()
     assert r1_pick.id == 0
@@ -64,11 +70,15 @@ def test_Events_basic():
     assert ev1_pick.recspan_id == 0
     assert ev1_pick.start_idx == 10
     assert ev1_pick.stop_idx == 11
-    assert ev1_pick.items() == ev1.items()
+    assert sorted(ev1_pick.items()) == sorted(ev1.items())
     assert ev2_pick.recspan_id == 0
     assert ev2_pick.start_idx == 11
     assert ev2_pick.stop_idx == 12
-    assert ev2_pick.items() == ev2.items()
+    assert sorted(ev2_pick.items()) == sorted(ev2.items())
+
+    assert_raises(ValueError, e.add_event, 0, 20, 20, {})
+    assert_raises(ValueError, e.add_event, 0, 20, 19, {})
+    assert_raises(ValueError, e.add_event, 0, -10, 10, {})
 
 def test_Event():
     # set/get/del, index
@@ -120,6 +130,14 @@ def test_Event():
     # Nothing overlaps an empty interval
     assert not ev1.overlaps(0, 11, 11)
 
+    # Check .update
+    ev1.update({"new1": "asdf", "new2": 3.14})
+    assert ev1["new1"] == "asdf"
+    assert ev1["new2"] == 3.14
+
+    # smoke test
+    repr(ev1)
+
     assert len(e.as_query(True)) == 1
     ev1.delete()
     assert len(e.as_query(True)) == 0
@@ -127,6 +145,10 @@ def test_Event():
     # whether the event object itself exists in __getitem__ is extra work that
     # doesn't seem worth bothering with.
     assert_raises(KeyError, ev1.__getitem__, "a")
+    assert_raises(EventsError, ev1.__setitem__, "a", 1)
+
+    # smoke test for deleted one
+    repr(ev1)
 
 def test_misc_queries():
     # ANY, at, __iter__, __len__
@@ -208,6 +230,11 @@ def test_as_query():
 
     assert [ev.start_idx for ev in e.as_query(e.placeholder["a"] == 1)] == [10]
 
+    assert_raises(ValueError, e.as_query, [])
+
+    e2 = Events()
+    assert_raises(ValueError, e.as_query, e2.as_query(True))
+
 def test_python_query():
     # all operators
     # types (esp. including None)
@@ -225,6 +252,9 @@ def test_python_query():
     p = e.placeholder
     def t(q, expected):
         assert [ev.start_idx for ev in q] == expected
+
+    assert_raises(TypeError, lambda q: not q, e.as_query(True))
+    assert_raises(EventsError, p.start_idx.__eq__, [])
 
     t(p.start_idx == 10, [10])
     t(p.start_idx != 10, [21, 20])
@@ -308,6 +338,8 @@ def test_python_query():
     t(~((p.start_idx < 21) & (p["a"] == 1)), [21, 20])
     t(~((p.start_idx < 21) | (p["a"] == 1)), [])
 
+    t(p.stop_idx == 26, [21])
+
     t(p.overlaps(ev10), [10])
     t(p.overlaps(ev20), [20])
     t(p.overlaps(ev21), [21])
@@ -317,6 +349,8 @@ def test_python_query():
     t(p.overlaps(0, 11, 100), [21])
     for i in xrange(20, 25):
         t(p.overlaps(1, i, i + 1), [20])
+
+    assert_raises(ValueError, p.overlaps, p)
 
     t(p.recspan["recspan_zero"], [10, 21])
     t(~p.recspan["recspan_zero"], [20])
@@ -351,11 +385,13 @@ def test_string_query():
     e.add_recspan(0, 100, {"recspan_attr1": 33})
     e.add_recspan(1, 100, {"recspan_attr2": "hello"})
     e.add_event(0, 10, 12,
-                {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None})
+                {"a": 1, "b": "asdf", "c": True, "d": 1.5, "e": None,
+                 "backslash": "nope"})
     e.add_event(1, 20, 25,
                 {"a": 2, "b": "fdsa", "c": False, "d": 5.1, "e": 22,
                  "f": "stuff", "_START_IDX": 10,
-                 "and": 33})
+                 "and": 33,
+                 "backslash": "\\"})
 
     def t(s, expected_start_indices):
         start_indices = [ev.start_idx for ev in e.as_query(s)]
@@ -372,16 +408,33 @@ def test_string_query():
     t("c", [10])
     t("not c", [20])
     t("has f", [20])
+    assert_raises(EventsError, e.as_query, "has \"asdf\"")
     t("a == 1 and d > 1", [10])
     t("a == 1 and d > 2", [])
     t("a == 1 or d > 2", [10, 20])
     t("1 == 1", [10, 20])
+
+    # floats
+    t("d == 5.1", [20])
+    t("d == 51e-1", [20])
+    t("d > -1e2", [10, 20])
+
+    # none (case-insensitive)
+    t("e == NoNe", [10])
+
+    # bools (case-insensitive)
+    t("c == tRUe", [10])
+    t("c == FAlsE", [20])
 
     # quoting
     t("b == \"asdf\"", [10])
     t("b == \'asdf\'", [10])
     t("`a` == 1", [10])
     assert_raises(EventsError, e.as_query, "a == \"1\"")
+    t(r"backslash == '\\'", [20])
+    assert_raises(EventsError, e.as_query, "a == \"trailing")
+    assert_raises(EventsError, e.as_query, "a == \"bad escape\\n\"")
+    assert_raises(EventsError, e.as_query, "a == \"trailing escape\\")
 
     # _RECSPAN_ID and friends
     t("_RECSPAN_ID == 1", [20])
@@ -391,7 +444,35 @@ def test_string_query():
     t("_RECSPAN.recspan_attr1 == 20", [])
     t("has _RECSPAN.recspan_attr1", [10])
 
+    assert_raises(EventsError, e.as_query, "foo.bar == 1")
+    assert_raises(EventsError, e.as_query, "_RECSPAN == 1")
+    assert_raises(EventsError, e.as_query, "_RECSPAN._RECSPAN == 1")
+    assert_raises(EventsError, e.as_query, "_RECSPAN.\"asdf\" == 1")
+
     # backquotes
     t("`_START_IDX` == 10", [20])
     t("`and` == 33", [20])
     t("not has `and`", [10])
+
+def test_recspan():
+    e = Events()
+    r0 = e.add_recspan(0, 100, {"a": 1})
+    r1 = e.add_recspan(1, 200, {"a": 2, "b": "hi"})
+    assert e.recspan(0).id == 0
+    assert e.recspan(0).ticks == 100
+    assert e.recspan(0)["a"] == 1
+    assert_raises(KeyError, e.recspan(0).__getitem__, "b")
+    assert e.recspan(1).id == 1
+    assert e.recspan(1).ticks == 200
+    assert e.recspan(1)["a"] == 2
+    assert e.recspan(1)["b"] == "hi"
+
+    assert list(e.all_recspans()) == [r0, r1]
+
+    assert r0 != r1
+
+    # smoke test
+    repr(r0)
+
+def test_merge_df():
+    assert False
