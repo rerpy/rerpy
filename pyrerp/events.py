@@ -247,8 +247,17 @@ class Events(object):
                   "ON sys_events (recspan_id, "
                                  "interval_magnitude, stop_idx);")
 
-    def _execute(self, c, sql, args):
-        return c.execute(sql, [_encode_sql_value(arg) for arg in args])
+    def _execute(self, sql, args):
+        c = self._connection.cursor()
+        c.execute(sql, [_encode_sql_value(arg) for arg in args])
+        # Weird things can happen to a cursor when other changes are made to
+        # the db; e.g., merge_df sets new event attributes while iterating
+        # over a query result, and it when this happened the cursor just
+        # mysteriously stopped returning results. I don't understand the exact
+        # situations under which this occurs, so to be safe, we just always
+        # read out all db data immediately instead of letting iterators
+        # escape.
+        return list(c), c.lastrowid
 
     # WARNING: this should not be called inside a transaction, it might commit
     # it.
@@ -273,11 +282,9 @@ class Events(object):
     # it's your job to call _ensure_table_for_key and start a transaction
     # before calling this, and maybe call _incr_op_count after
     def _obj_setitem_core(self, objtype, id, key, value):
-        c = self._connection.cursor()
         table = objtype.table_name(key)
         objtype.observe_value_for_key(key, value)
-        self._execute(c,
-                      "INSERT OR REPLACE INTO %s (obj_id, value) "
+        self._execute("INSERT OR REPLACE INTO %s (obj_id, value) "
                       "VALUES (?, ?);"
                       % (table,), (id, value))
 
@@ -293,16 +300,14 @@ class Events(object):
         interval_magnitude = approx_interval_magnitude(stop_idx - start_idx)
         self._interval_magnitudes.add(interval_magnitude)
         with self._connection:
-            c = self._connection.cursor()
             try:
-                self._execute(c,
+                _, event_id = self._execute(
                   "INSERT INTO sys_events "
                   "  (recspan_id, start_idx, stop_idx, interval_magnitude) "
                   "values (?, ?, ?, ?)",
                   [recspan_id, start_idx, stop_idx, interval_magnitude])
             except sqlite3.IntegrityError:
                 raise EventsError("undefined recspan")
-            event_id = c.lastrowid
             for key, value in attributes.iteritems():
                 self._obj_setitem_core(objtype, event_id, key, value)
         self._incr_op_count()
@@ -314,8 +319,7 @@ class Events(object):
         for key in attributes:
             self._ensure_table_for_key(objtype, key)
         with self._connection:
-            c = self._connection.cursor()
-            self._execute(c,
+            self._execute(
               "INSERT INTO sys_recspans (id, ticks) values (?, ?)",
               [recspan_id, ticks])
             for key, value in attributes.iteritems():
@@ -325,21 +329,19 @@ class Events(object):
 
     def _delete_obj(self, objtype, obj_id):
         with self._connection:
-            c = self._connection.cursor()
             for key in objtype.key_types:
-                self._execute(c,
-                              "DELETE FROM %s WHERE obj_id = ?;"
-                                % (objtype.table_name(key),),
+                self._execute("DELETE FROM %s WHERE obj_id = ?;"
+                              % (objtype.table_name(key),),
                               (obj_id,))
-            self._execute(c, "DELETE FROM %s WHERE id = ?;"
+            self._execute("DELETE FROM %s WHERE id = ?;"
                           % (objtype.sys_table,), (obj_id,))
         self._incr_op_count()
 
     def _obj_index_field(self, objtype, id, field):
-        c = self._connection.cursor()
         code = "SELECT %s FROM %s WHERE id = ?;" % (field, objtype.sys_table)
-        self._execute(c, code, (id,))
-        return _decode_sql_value(c.fetchone()[0])
+        results, _ = self._execute(code, (id,))
+        assert len(results) == 1
+        return _decode_sql_value(results[0][0])
 
     def _obj_setitem(self, objtype, id, key, value):
         self._ensure_table_for_key(objtype, key)
@@ -351,37 +353,33 @@ class Events(object):
         self._incr_op_count()
 
     def _obj_getitem(self, objtype, id, key):
-        c = self._connection.cursor()
         table = objtype.table_name(key)
         code = "SELECT value FROM %s WHERE obj_id = ?;" % (table,)
         try:
-            self._execute(c, code, (id,))
-            row = c.fetchone()
+            results, _ = self._execute(code, (id,))
         except sqlite3.OperationalError:
             # The table doesn't exist:
             raise KeyError, key
         # The table exists, but has no entry with the given obj_id:
-        if row is None:
+        if not results:
             raise KeyError, key
-        return _sql_value_to_value_type(_decode_sql_value(row[0]),
+        return _sql_value_to_value_type(_decode_sql_value(results[0][0]),
                                         objtype.key_types[key])
 
     def _obj_delitem(self, objtype, id, key):
         # Raise a KeyError if it doesn't exist:
         self._obj_getitem(objtype, id, key)
         # Okay, now delete it
-        c = self._connection.cursor()
         table = objtype.table_name(key)
         code = "DELETE FROM %s WHERE obj_id = ?;" % (table,)
         with self._connection:
-            self._execute(c, code, (id,))
+            self._execute(code, (id,))
         self._incr_op_count()
 
     def _obj_exists(self, objtype, id):
-        c = self._connection.cursor()
         code = "SELECT COUNT(*) FROM %s WHERE id = ?" % (objtype.sys_table,)
-        self._execute(c, code, (id,))
-        return bool(c.fetchone()[0])
+        results, _ = self._execute(code, (id,))
+        return bool(results[0][0])
 
     def _move_event(self, id, offset):
         # Fortunately, this operation doesn't change the magnitude of the
@@ -389,9 +387,7 @@ class Events(object):
         # the start_idx and stop_idx directly without having to worry about
         # the complexities of interval_magnitudes.
         with self._connection:
-            c = self._connection.cursor()
-            self._execute(c,
-                          "UPDATE sys_events "
+            self._execute("UPDATE sys_events "
                           "SET start_idx = start_idx + ?, "
                           "    stop_idx = stop_idx + ? "
                           "WHERE id = ?",
@@ -443,18 +439,14 @@ class Events(object):
         if joins:
             code += " AND (%s)" % (" AND ".join(joins),)
         code += "ORDER BY sys_events.recspan_id, sys_events.start_idx"
-        c = self._connection.cursor()
-        self._execute(c, code, sql_where.args)
-        return c
+        return self._execute(code, sql_where.args)[0]
 
     def recspan(self, recspan_id):
         return Recspan(self, recspan_id)
 
     def all_recspans(self):
-        c = self._connection.cursor()
-        for row in self._execute(c,
-                                 "SELECT id FROM sys_recspans ORDER BY id",
-                                 ()):
+        for row in self._execute("SELECT id FROM sys_recspans ORDER BY id",
+                                 ())[0]:
             yield Recspan(self, _decode_sql_value(row[0]))
 
     def at(self, recspan_id, start_idx, stop_idx=None):
@@ -480,15 +472,25 @@ class Events(object):
         query = subset
         if query is None:
             query = self.as_query(True)
-        for row_idx in df.index:
-            row = df.xs(row_idx)
+        else:
+            query = self.as_query(query)
+        NOTHING = object()
+        for _, row in df.iterrows():
             this_query = query
             for df_key, db_key in on.iteritems():
                 this_query &= (p[db_key] == row[df_key])
             for ev in this_query:
                 for df_key in row.index:
                     if df_key not in on:
-                        ev[df_key] = row[df_key]
+                        current_value = ev.get(df_key, NOTHING)
+                        if current_value is NOTHING:
+                            ev[df_key] = row[df_key]
+                        else:
+                            if current_value != row[df_key]:
+                                raise EventsError(
+                                    "event already has a value for key %r, "
+                                    "%r, which does not match new value %r"
+                                    % (df_key, current_value, row[df_key]))
 
     # Pickling
     def __getstate__(self):
@@ -839,10 +841,10 @@ class Query(object):
     def __iter__(self):
         if self._value_type() is not _BOOL:
             raise EventsError("top-level query must be boolean", self)
-        c = self._events._query(self._sql_where(),
-                                ["sys_events"],
-                                ["sys_events.id"])
-        for (db_id,) in c:
+        db_ids = self._events._query(self._sql_where(),
+                                     ["sys_events"],
+                                     ["sys_events.id"])
+        for (db_id,) in db_ids:
             yield Event(self._events, _decode_sql_value(db_id))
 
 class LiteralQuery(Query):

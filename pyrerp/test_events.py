@@ -4,6 +4,7 @@
 
 import cPickle
 import numpy as np
+import pandas
 from pyrerp.events import Events, EventsError
 from nose.tools import assert_raises
 
@@ -475,4 +476,76 @@ def test_recspan():
     repr(r0)
 
 def test_merge_df():
-    assert False
+    def make_events():
+        e = Events()
+        e.add_recspan(0, 100, {})
+        ev1 = e.add_event(0, 10, 11, {"code": 10, "code2": 20})
+        ev2 = e.add_event(0, 20, 21, {"code": 10, "code2": 21})
+        ev3 = e.add_event(0, 30, 31, {"code": 11, "code2": 20})
+        return e, ev1, ev2, ev3
+
+    e, ev1, ev2, ev3 = make_events()
+    e.merge_df(pandas.DataFrame({"code": [10, 11], "foo": ["a", "b"]}),
+               on="code")
+    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
+    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "a"}
+    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "b"}
+
+    e, ev1, ev2, ev3 = make_events()
+    e.merge_df(pandas.DataFrame({"code": [10, 11], "foo": ["a", "b"]}),
+               on=["code"])
+    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
+    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "a"}
+    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "b"}
+
+    e, ev1, ev2, ev3 = make_events()
+    e.merge_df(pandas.DataFrame({"code": [10, 11], "foo": ["a", "b"]}),
+               on={"code": "code"})
+    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
+    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "a"}
+    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "b"}
+
+    e, ev1, ev2, ev3 = make_events()
+    e.merge_df(pandas.DataFrame(
+            {"code": [10, 11], "code2": [20, 20], "foo": ["a", "b"]}),
+               on=["code", "code2"])
+    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
+    assert dict(ev2) == {"code": 10, "code2": 21}
+    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "b"}
+
+    # Trying to overwrite existing fields
+    e, ev1, ev2, ev3 = make_events()
+    assert_raises(EventsError,
+                  e.merge_df,
+                  pandas.DataFrame({"code": [10, 11],
+                                    "code2": [20, 20],
+                                    "foo": ["a", "b"]}),
+                  on=["code"])
+
+    e, ev1, ev2, ev3 = make_events()
+    e.merge_df(pandas.DataFrame({"THECODE": [10, 11], "foo": ["a", "b"]}),
+               on={"THECODE": "code"})
+    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
+    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "a"}
+    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "b"}
+
+    e, ev1, ev2, ev3 = make_events()
+    e.merge_df(
+        pandas.DataFrame({"code": [20, 21, 20],
+                          "code2": [10, 10, 11],
+                          "foo": ["a", "b", "c"]}),
+        on={"code": "code2", "code2": "code"})
+    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
+    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "b"}
+    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "c"}
+
+    e, ev1, ev2, ev3 = make_events()
+    e.merge_df(
+        pandas.DataFrame({"code": [20, 21, 20],
+                          "code2": [10, 10, 11],
+                          "foo": ["a", "b", "c"]}),
+        on={"code": "code2", "code2": "code"},
+        subset="code == 10")
+    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
+    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "b"}
+    assert dict(ev3) == {"code": 11, "code2": 20}
