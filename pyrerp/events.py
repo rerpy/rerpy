@@ -220,9 +220,10 @@ class Events(object):
         c = self._connection.cursor()
         c.execute("PRAGMA case_sensitive_like = true;")
         c.execute("PRAGMA foreign_keys = on;")
-        self._objtypes["recspan"] = ObjType("recspan",
-                                            "sys_recspans", "recspan_id")
-        c.execute("CREATE TABLE sys_recspans "
+        self._objtypes["recspan_info"] = ObjType("recspan_info",
+                                                 "sys_recspan_infos",
+                                                 "recspan_id")
+        c.execute("CREATE TABLE sys_recspan_infos "
                   "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
                   "ticks INTEGER NOT NULL)"
                   );
@@ -230,22 +231,22 @@ class Events(object):
         c.execute("CREATE TABLE sys_events "
                   "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
                   "recspan_id INTEGER NOT NULL, "
-                  "start_idx NUMERIC NOT NULL, "
-                  "stop_idx NUMERIC NOT NULL, "
+                  "start_tick NUMERIC NOT NULL, "
+                  "stop_tick NUMERIC NOT NULL, "
                   "interval_magnitude INTEGER NOT NULL, "
-                  "FOREIGN KEY(recspan_id) REFERENCES sys_recspans(id))"
+                  "FOREIGN KEY(recspan_id) REFERENCES sys_recspan_infos(id))"
                   );
-        c.execute("CREATE INDEX sys_events_by_start_idx "
-                  "ON sys_events (recspan_id, start_idx);")
-        c.execute("CREATE INDEX sys_events_by_stop_idx "
-                  "ON sys_events (recspan_id, stop_idx);")
+        c.execute("CREATE INDEX sys_events_by_start_tick "
+                  "ON sys_events (recspan_id, start_tick);")
+        c.execute("CREATE INDEX sys_events_by_stop_tick "
+                  "ON sys_events (recspan_id, stop_tick);")
         # The special indices used to make overlaps queries fast
-        c.execute("CREATE INDEX sys_events_interval_start_idx "
+        c.execute("CREATE INDEX sys_events_interval_start_tick "
                   "ON sys_events (recspan_id, "
-                                 "interval_magnitude, start_idx);")
-        c.execute("CREATE INDEX sys_events_interval_stop_idx "
+                                 "interval_magnitude, start_tick);")
+        c.execute("CREATE INDEX sys_events_interval_stop_tick "
                   "ON sys_events (recspan_id, "
-                                 "interval_magnitude, stop_idx);")
+                                 "interval_magnitude, stop_tick);")
 
     def _execute(self, sql, args):
         c = self._connection.cursor()
@@ -288,24 +289,24 @@ class Events(object):
                       "VALUES (?, ?);"
                       % (table,), (id, value))
 
-    def add_event(self, recspan_id, start_idx, stop_idx, attributes):
+    def add_event(self, recspan_id, start_tick, stop_tick, attributes):
         objtype = self._objtypes["event"]
         # Create tables up front before entering transaction:
         for key in attributes:
             self._ensure_table_for_key(objtype, key)
-        if not start_idx < stop_idx:
-            raise ValueError, "start_idx must be < stop_idx"
-        if not start_idx >= 0:
-            raise ValueError, "start_idx must be >= 0"
-        interval_magnitude = approx_interval_magnitude(stop_idx - start_idx)
+        if not start_tick < stop_tick:
+            raise ValueError, "start_tick must be < stop_tick"
+        if not start_tick >= 0:
+            raise ValueError, "start_tick must be >= 0"
+        interval_magnitude = approx_interval_magnitude(stop_tick - start_tick)
         self._interval_magnitudes.add(interval_magnitude)
         with self._connection:
             try:
                 _, event_id = self._execute(
                   "INSERT INTO sys_events "
-                  "  (recspan_id, start_idx, stop_idx, interval_magnitude) "
+                  "  (recspan_id, start_tick, stop_tick, interval_magnitude) "
                   "values (?, ?, ?, ?)",
-                  [recspan_id, start_idx, stop_idx, interval_magnitude])
+                  [recspan_id, start_tick, stop_tick, interval_magnitude])
             except sqlite3.IntegrityError:
                 raise EventsError("undefined recspan")
             for key, value in attributes.iteritems():
@@ -313,19 +314,19 @@ class Events(object):
         self._incr_op_count()
         return Event(self, event_id)
 
-    def add_recspan(self, recspan_id, ticks, attributes):
-        objtype = self._objtypes["recspan"]
+    def add_recspan_info(self, recspan_id, ticks, attributes):
+        objtype = self._objtypes["recspan_info"]
         # Create tables up front before entering transaction:
         for key in attributes:
             self._ensure_table_for_key(objtype, key)
         with self._connection:
             self._execute(
-              "INSERT INTO sys_recspans (id, ticks) values (?, ?)",
+              "INSERT INTO sys_recspan_infos (id, ticks) values (?, ?)",
               [recspan_id, ticks])
             for key, value in attributes.iteritems():
                 self._obj_setitem_core(objtype, recspan_id, key, value)
         self._incr_op_count()
-        return Recspan(self, recspan_id)
+        return RecspanInfo(self, recspan_id)
 
     def _delete_obj(self, objtype, obj_id):
         with self._connection:
@@ -384,37 +385,39 @@ class Events(object):
     def _move_event(self, id, offset):
         # Fortunately, this operation doesn't change the magnitude of the
         # span, so it's relatively simple to implement -- we can just update
-        # the start_idx and stop_idx directly without having to worry about
+        # the start_tick and stop_tick directly without having to worry about
         # the complexities of interval_magnitudes.
         with self._connection:
             self._execute("UPDATE sys_events "
-                          "SET start_idx = start_idx + ?, "
-                          "    stop_idx = stop_idx + ? "
+                          "SET start_tick = start_tick + ?, "
+                          "    stop_tick = stop_tick + ? "
                           "WHERE id = ?",
                           [offset, offset, id])
 
-    @property
-    def placeholder(self):
+    def placeholder_event(self):
         return PlaceholderEvent(self)
 
-    def as_query(self, query_like):
-        """query_like can be {"a": 1, "b": 2} or a Query or a string or a bool
+    def events_query(self, subset=None):
+        """subset can be {"a": 1, "b": 2} or a Query or a string or a bool
+        or None to mean "all"
         """
-        if isinstance(query_like, dict):
-            p = self.placeholder
+        if isinstance(subset, dict):
+            p = self.placeholder_event()
             query = LiteralQuery(self, True)
             equalities = []
-            for query_name in _magic_query_strings.intersection(query_like):
+            for query_name in _magic_query_strings.intersection(subset):
                 q = _magic_query_string_to_query(self, query_name)
-                query &= (q == query_like.pop(query_name))
-            for k, v in query_like.iteritems():
+                query &= (q == subset.pop(query_name))
+            for k, v in subset.iteritems():
                 query &= (p[k] == v)
-        elif isinstance(query_like, basestring):
-            query = _query_from_string(self, query_like)
-        elif isinstance(query_like, bool):
-            query = LiteralQuery(self, query_like)
+        elif isinstance(subset, basestring):
+            query = _query_from_string(self, subset)
+        elif isinstance(subset, bool):
+            query = LiteralQuery(self, subset)
+        elif subset is None:
+            query = LiteralQuery(self, True)
         else:
-            query = query_like
+            query = subset
 
         if not isinstance(query, Query):
             raise ValueError, "expected a query object, not %r" % (query,)
@@ -438,68 +441,27 @@ class Events(object):
                    sql_where.code))
         if joins:
             code += " AND (%s)" % (" AND ".join(joins),)
-        code += "ORDER BY sys_events.recspan_id, sys_events.start_idx"
+        code += "ORDER BY sys_events.recspan_id, sys_events.start_tick"
         return self._execute(code, sql_where.args)[0]
 
-    def recspan(self, recspan_id):
-        return Recspan(self, recspan_id)
-
-    def all_recspans(self):
-        for row in self._execute("SELECT id FROM sys_recspans ORDER BY id",
+    # This is called directly by the test code, but is not really public.
+    def _all_recspan_infos(self):
+        for row in self._execute("SELECT id FROM sys_recspan_infos ORDER BY id",
                                  ())[0]:
-            yield Recspan(self, _decode_sql_value(row[0]))
-
-    def at(self, recspan_id, start_idx, stop_idx=None):
-        if stop_idx is None:
-            stop_idx = start_idx + 1
-        p = self.placeholder
-        q = p.overlaps(recspan_id, start_idx, stop_idx)
-        return list(q)
+            yield RecspanInfo(self, _decode_sql_value(row[0]))
 
     def __repr__(self):
         return "<%s object with %s entries>" % (self.__class__.__name__,
                                                 len(self))
 
-    def merge_df(self, df, on, subset=None):
-        # 'on' is like {df_colname: event_key}
-        # or just [colname]
-        # or just colname
-        if isinstance(on, basestring):
-            on = [on]
-        if not isinstance(on, dict):
-            on = dict([(key, key) for key in on])
-        p = self.placeholder
-        query = subset
-        if query is None:
-            query = self.as_query(True)
-        else:
-            query = self.as_query(query)
-        NOTHING = object()
-        for _, row in df.iterrows():
-            this_query = query
-            for df_key, db_key in on.iteritems():
-                this_query &= (p[db_key] == row[df_key])
-            for ev in this_query:
-                for df_key in row.index:
-                    if df_key not in on:
-                        current_value = ev.get(df_key, NOTHING)
-                        if current_value is NOTHING:
-                            ev[df_key] = row[df_key]
-                        else:
-                            if current_value != row[df_key]:
-                                raise EventsError(
-                                    "event already has a value for key %r, "
-                                    "%r, which does not match new value %r"
-                                    % (df_key, current_value, row[df_key]))
-
     # Pickling
     def __getstate__(self):
         recspans = []
-        for recspan in self.all_recspans():
+        for recspan in self._all_recspan_infos():
             recspans.append((recspan.id, recspan.ticks, dict(recspan)))
         events = []
-        for ev in self.as_query(True):
-            events.append((ev.recspan_id, ev.start_idx, ev.stop_idx, dict(ev)))
+        for ev in self.events_query(True):
+            events.append((ev.recspan_id, ev.start_tick, ev.stop_tick, dict(ev)))
         # 0 as an ad-hoc version number in case we need to change this later
         return (0, recspans, events)
 
@@ -509,9 +471,9 @@ class Events(object):
         self.__init__()
         _, recspans, events = state
         for recspan_id, ticks, attrs in recspans:
-            self.add_recspan(recspan_id, ticks, attrs)
-        for recspan_id, start_idx, stop_idx, attrs in events:
-            self.add_event(recspan_id, start_idx, stop_idx, attrs)
+            self.add_recspan_info(recspan_id, ticks, attrs)
+        for recspan_id, start_tick, stop_tick, attrs in events:
+            self.add_event(recspan_id, start_tick, stop_tick, attrs)
 
 ################################################################
 ## Objects representing single events/recspans
@@ -628,41 +590,41 @@ class Event(_Obj):
 
     @property
     def recspan(self):
-        return Recspan(self._events, self._index_field("recspan_id"))
+        return RecspanInfo(self._events, self._index_field("recspan_id"))
 
     @property
-    def start_idx(self):
-        return self._index_field("start_idx")
+    def start_tick(self):
+        return self._index_field("start_tick")
 
     @property
-    def stop_idx(self):
-        return self._index_field("stop_idx")
+    def stop_tick(self):
+        return self._index_field("stop_tick")
 
     def overlaps(self, *args):
         if len(args) == 1:
             ev = args[0]
             return self.overlaps(ev.recspan_id,
-                                 ev.start_idx, ev.stop_idx)
+                                 ev.start_tick, ev.stop_tick)
         else:
-            (recspan_id, start_idx, stop_idx) = args
+            (recspan_id, start_tick, stop_tick) = args
             return (self.recspan_id == recspan_id
-                    and self.start_idx < stop_idx
-                    and start_idx < self.stop_idx)
+                    and self.start_tick < stop_tick
+                    and start_tick < self.stop_tick)
 
-    def relative(self, count, query={}):
+    def relative(self, count, subset=None):
         """Counts 'count' events forward or back from the current event (or
-        optionally, only events that match 'query'), and returns that. Use
+        optionally, only events that match 'subset'), and returns that. Use
         negative for backwards."""
         if count == 0:
             raise IndexError, "count must be non-zero"
-        query = self._events.as_query(query)
-        p = self._events.placeholder
+        query = self._events.events_query(subset)
+        p = self._events.placeholder_event()
         query &= (p.recspan_id == self.recspan_id)
         if count > 0:
-            query &= (p.start_idx > self.start_idx)
+            query &= (p.start_tick > self.start_tick)
             return list(query)[count - 1]
         else:
-            query &= (p.start_idx < self.start_idx)
+            query &= (p.start_tick < self.start_tick)
             return list(query)[count]
 
     def move(self, offset):
@@ -672,11 +634,11 @@ class Event(_Obj):
 
     def _repr_fragment(self):
         return ("in recspan %s, ticks %s-%s"
-                % (self.recspan_id, self.start_idx, self.stop_idx))
+                % (self.recspan_id, self.start_tick, self.stop_tick))
 
-class Recspan(_Obj):
+class RecspanInfo(_Obj):
     def __init__(self, events, id):
-        _Obj.__init__(self, events, events._objtypes["recspan"], id)
+        _Obj.__init__(self, events, events._objtypes["recspan_info"], id)
 
     @property
     def id(self):
@@ -701,7 +663,7 @@ class Recspan(_Obj):
 # backquotes, i.e.,:
 #   "_RECSPAN_ID == 1"   <-> placeholder.recspan_id == 1
 #   "`_RECSPAN_ID` == 1" <-> placeholder["_RECSPAN_ID"] == 1
-_magic_query_strings = set(["_RECSPAN_ID", "_START_IDX", "_STOP_IDX"])
+_magic_query_strings = set(["_RECSPAN_ID", "_START_TICK", "_STOP_TICK"])
 def _magic_query_string_to_query(events, name, origin=None):
     return IndexFieldQuery(events, name[1:].lower(), origin)
 
@@ -728,16 +690,16 @@ class PlaceholderEvent(_PlaceholderObj):
         return IndexFieldQuery(self._events, "recspan_id")
 
     @property
-    def start_idx(self):
-        return IndexFieldQuery(self._events, "start_idx")
+    def start_tick(self):
+        return IndexFieldQuery(self._events, "start_tick")
 
     @property
-    def stop_idx(self):
-        return IndexFieldQuery(self._events, "stop_idx")
+    def stop_tick(self):
+        return IndexFieldQuery(self._events, "stop_tick")
 
     @property
-    def recspan(self):
-        return PlaceholderRecspan(self._events)
+    def recspan_info(self):
+        return PlaceholderRecspanInfo(self._events)
 
     def overlaps(self, *args):
         if len(args) == 1:
@@ -745,15 +707,15 @@ class PlaceholderEvent(_PlaceholderObj):
             if isinstance(ev, PlaceholderEvent):
                 raise ValueError, "cannot test for overlap between two placeholders"
             return self.overlaps(ev.recspan_id,
-                                 ev.start_idx, ev.stop_idx)
+                                 ev.start_tick, ev.stop_tick)
         else:
-            (recspan_id, start_idx, stop_idx) = args
+            (recspan_id, start_tick, stop_tick) = args
             return OverlapsQuery(self._events,
-                                 recspan_id, start_idx, stop_idx)
+                                 recspan_id, start_tick, stop_tick)
 
-class PlaceholderRecspan(_PlaceholderObj):
+class PlaceholderRecspanInfo(_PlaceholderObj):
     def __init__(self, events):
-        _PlaceholderObj.__init__(self, events, events._objtypes["recspan"])
+        _PlaceholderObj.__init__(self, events, events._objtypes["recspan_info"])
 
 SqlWhere = namedtuple("SqlWhere", ["code", "attr_tables", "args"])
 
@@ -918,9 +880,9 @@ class HasKeyQuery(Query):
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self._key)
 
-# For now we only support queries on Event index fields, not Recspan index
-# fields. The only Recspan index field is 'ticks', and can't really see why
-# that would be useful, so whatever.
+# For now we only support queries on Event index fields, not RecspanInfo index
+# fields. The only RecspanInfo index field is 'ticks', and can't really see
+# why that would be useful, so whatever.
 class IndexFieldQuery(Query):
     def __init__(self, events, field, origin=None):
         Query.__init__(self, events, origin)
@@ -939,11 +901,11 @@ class IndexFieldQuery(Query):
 
 class OverlapsQuery(Query):
     def __init__(self, events,
-                 recspan_id, start_idx, stop_idx, origin=None):
+                 recspan_id, start_tick, stop_tick, origin=None):
         Query.__init__(self, events, origin)
         self._recspan_id = recspan_id
-        self._start_idx = start_idx
-        self._stop_idx = stop_idx
+        self._start_tick = start_tick
+        self._stop_tick = stop_tick
 
     def _sql_where(self):
         args = []
@@ -952,13 +914,13 @@ class OverlapsQuery(Query):
             constraints = [
                 "sys_events.recspan_id == ?",
                 "sys_events.interval_magnitude == ?",
-                "((sys_events.start_idx < ? AND (? - ?) < sys_events.start_idx)"
-                  " OR (sys_events.stop_idx < (? + ?) AND ? < sys_events.stop_idx))",
+                "((sys_events.start_tick < ? AND (? - ?) < sys_events.start_tick)"
+                  " OR (sys_events.stop_tick < (? + ?) AND ? < sys_events.stop_tick))",
                 ]
             args += [self._recspan_id,
                      magnitude,
-                     self._stop_idx, self._start_idx, magnitude,
-                     self._stop_idx, magnitude, self._start_idx]
+                     self._stop_tick, self._start_tick, magnitude,
+                     self._stop_tick, magnitude, self._start_tick]
             possibilities.append(" AND ".join(constraints))
         return SqlWhere(" OR ".join(possibilities), {}, args)
 
@@ -968,7 +930,7 @@ class OverlapsQuery(Query):
     def __repr__(self):
         return ("<%s %r %r [%r, %r)>"
                 % (self.__class__.__name__, self._recspan_id,
-                   self._start_idx, self._stop_idx))
+                   self._start_tick, self._stop_tick))
 
 class QueryOperator(Query):
     def __init__(self, events, sql_op, children, origin=None):
@@ -1027,7 +989,7 @@ _text_ops = [
     ]
 _ops = _punct_ops + _text_ops
 
-_atomic = ["ATTR", "LITERAL", "MAGIC_FIELD", "_RECSPAN"]
+_atomic = ["ATTR", "LITERAL", "MAGIC_FIELD", "_RECSPAN_INFO"]
 
 def _read_quoted_string(string, i):
     start = i
@@ -1115,8 +1077,8 @@ def _tokenize(string):
                 yield Token("LITERAL", origin, None)
             elif token in _magic_query_strings:
                 yield Token("MAGIC_FIELD", origin, token)
-            elif token == "_RECSPAN":
-                yield Token("_RECSPAN", origin, token)
+            elif token == "_RECSPAN_INFO":
+                yield Token("_RECSPAN_INFO", origin, token)
             else:
                 yield Token("ATTR", origin, token)
             i = match.end()
@@ -1150,13 +1112,13 @@ def _eval(events, tree):
         eval_args = [_eval(events, arg) for arg in tree.args]
         return getattr(eval_args[0], _op_to_pymethod[tree.type])(*eval_args[1:])
     elif tree.type == ".":
-        if tree.args[0].type != "_RECSPAN":
-            raise EventsError("left argument of '.' must be _RECSPAN",
+        if tree.args[0].type != "_RECSPAN_INFO":
+            raise EventsError("left argument of '.' must be _RECSPAN_INFO",
                               tree.args[0].origin)
         if tree.args[1].type != "ATTR":
             raise EventsError("right arguments of '.' must be attribute",
                               tree.args[1].origin)
-        return AttrQuery(events, events._objtypes["recspan"],
+        return AttrQuery(events, events._objtypes["recspan_info"],
                          tree.args[1].token.extra, tree.origin)
     elif tree.type == "has":
         assert len(tree.args) == 1
@@ -1173,8 +1135,8 @@ def _eval(events, tree):
     elif tree.type == "MAGIC_FIELD":
         return _magic_query_string_to_query(events, tree.token.extra,
                                             tree.origin)
-    elif tree.type == "_RECSPAN":
-        raise EventsError("_RECSPAN must appear on the left side of '.'",
+    elif tree.type == "_RECSPAN_INFO":
+        raise EventsError("_RECSPAN_INFO must appear on the left side of '.'",
                           tree.origin)
     else: # pragma: no cover
         assert False

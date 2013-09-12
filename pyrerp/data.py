@@ -167,25 +167,27 @@ class DataSet(object):
         # Eventually, add a way to load these on the fly, and to apply
         # transformations on the fly.
         self._recspans = []
+        self.recspan_infos = []
 
-    def add_recspan(self, recspan, metadata):
-        if not isinstance(recspan, pandas.DataFrame):
-            raise ValueError("recspan must be a DataFrame")
-        if list(recspan.columns) != self.data_format.channel_names:
-            raise ValueError("recspan columns don't match channel names")
-        recspan.index = (np.arange(recspan.shape[0])
+    def add_recspan(self, data, metadata):
+        if not isinstance(data, pandas.DataFrame):
+            raise ValueError("data must be a DataFrame")
+        if list(data.columns) != self.data_format.channel_names:
+            raise ValueError("data columns don't match channel names")
+        recspan_id = len(self._recspans)
+        recspan_info = self._events.add_recspan_info(recspan_id,
+                                                     data.shape[0],
+                                                     metadata)
+        self.recspan_infos.append(recspan_info)
+        # Be careful to ensure this is always a floating point dtype; that way
+        # we can be sure that when indexing, floats will be treated as times,
+        # and integers will be treated as ticks.
+        data.index = (np.arange(data.shape[0], dtype=float)
                          * self.data_format.approx_sample_period_ms)
-        self._recspans.append(recspan)
-        assert False, "need metadata"
-        assert False, "need length metadata"
+        data.recspan_info = recspan_info
+        self._recspans.append(data)
 
-    def add_dataset(self, dataset):
-        assert False
-
-    def events(self, query_like={}):
-        return self._events.as_query(query_like)
-
-    # We act like a sequence of recspans
+    # We act like a sequence of recspan data objects
     def __len__(self):
         return len(self._recspans)
 
@@ -204,6 +206,76 @@ class DataSet(object):
 
     def __iter__(self):
         return self.iter()
+
+    ################################################################
+    # Event handling methods (mostly delegated to ._events)
+    ################################################################
+
+    def add_event(self, recspan_id, start_tick, stop_tick, attributes):
+        return self._events.add_event(recspan_id, start_tick, stop_tick,
+                                      attributes)
+
+    def placeholder_event(self):
+        return self._events.placeholder_event()
+
+    def events_query(self, subset=None):
+        return self._events.events_query(subset)
+
+    def events(self, subset=None):
+        return list(self.events_query(subset))
+
+    def events_at_query(self, recspan_id, start_tick, stop_tick=None,
+                        subset=None):
+        if stop_tick is None:
+            stop_tick = start_tick + 1
+        p = self.placeholder_event()
+        q = p.overlaps(recspan_id, start_tick, stop_tick)
+        q &= self.events_query(subset)
+        return q
+
+    def events_at(self, recspan_id, start_tick, stop_tick=None,
+                  subset=None):
+        return list(self.events_at_query(recspan_id, start_tick,
+                                         stop_tick, subset))
+
+    ################################################################
+    # Convenience methods
+    ################################################################
+
+    def add_dataset(self, dataset):
+        assert False
+
+    def merge_df(self, df, on, subset=None):
+        # 'on' is like {df_colname: event_key}
+        # or just [colname]
+        # or just colname
+        if isinstance(on, basestring):
+            on = [on]
+        if not isinstance(on, dict):
+            on = dict([(key, key) for key in on])
+        p = self.placeholder_event()
+        query = self.events(subset)
+        NOTHING = object()
+        for _, row in df.iterrows():
+            this_query = query
+            for df_key, db_key in on.iteritems():
+                this_query &= (p[db_key] == row[df_key])
+            for ev in this_query:
+                for df_key in row.index:
+                    if df_key not in on:
+                        current_value = ev.get(df_key, NOTHING)
+                        if current_value is NOTHING:
+                            ev[df_key] = row[df_key]
+                        else:
+                            if current_value != row[df_key]:
+                                raise EventsError(
+                                    "event already has a value for key %r, "
+                                    "%r, which does not match new value %r"
+                                    % (df_key, current_value, row[df_key]))
+
+    ################################################################
+    # rERP
+    ################################################################
 
     # let's make the return value a list of rerp objects
     # where each has a ref to an analysis-global-info object
