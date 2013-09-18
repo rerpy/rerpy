@@ -163,12 +163,6 @@ def test_misc_queries():
     assert len(e.events_query(True)) == 4
     # Always sorted by index:
     assert [ev.start_tick for ev in e.events_query(True)] == [10, 20, 30, 15]
-    assert len(e.at(0, 10)) == 1
-    assert e.at(0, 10)[0]["a"] == 1
-    assert len(e.at(0, 20)) == 1
-    assert e.at(0, 20)[0]["a"] == -1
-    assert len(e.at(0, 15)) == 0
-    assert len(e.at(0, 15, 40)) == 2
 
 def test_Event_relative():
     e = Events()
@@ -232,10 +226,10 @@ def test_events_method():
 
     assert [ev.start_tick for ev in e.events_query(e.placeholder_event()["a"] == 1)] == [10]
 
-    assert_raises(ValueError, e.events, [])
+    assert_raises(ValueError, e.events_query, [])
 
     e2 = Events()
-    assert_raises(ValueError, e.events, e2.events_query(True))
+    assert_raises(ValueError, e.events_query, e2.events_query(True))
 
 def test_python_query():
     # all operators
@@ -410,7 +404,7 @@ def test_string_query():
     t("c", [10])
     t("not c", [20])
     t("has f", [20])
-    assert_raises(EventsError, e.events, "has \"asdf\"")
+    assert_raises(EventsError, e.events_query, "has \"asdf\"")
     t("a == 1 and d > 1", [10])
     t("a == 1 and d > 2", [])
     t("a == 1 or d > 2", [10, 20])
@@ -432,11 +426,11 @@ def test_string_query():
     t("b == \"asdf\"", [10])
     t("b == \'asdf\'", [10])
     t("`a` == 1", [10])
-    assert_raises(EventsError, e.events, "a == \"1\"")
+    assert_raises(EventsError, e.events_query, "a == \"1\"")
     t(r"backslash == '\\'", [20])
-    assert_raises(EventsError, e.events, "a == \"trailing")
-    assert_raises(EventsError, e.events, "a == \"bad escape\\n\"")
-    assert_raises(EventsError, e.events, "a == \"trailing escape\\")
+    assert_raises(EventsError, e.events_query, "a == \"trailing")
+    assert_raises(EventsError, e.events_query, "a == \"bad escape\\n\"")
+    assert_raises(EventsError, e.events_query, "a == \"trailing escape\\")
 
     # _RECSPAN_ID and friends
     t("_RECSPAN_ID == 1", [20])
@@ -446,10 +440,10 @@ def test_string_query():
     t("_RECSPAN_INFO.recspan_attr1 == 20", [])
     t("has _RECSPAN_INFO.recspan_attr1", [10])
 
-    assert_raises(EventsError, e.events, "foo.bar == 1")
-    assert_raises(EventsError, e.events, "_RECSPAN_INFO == 1")
-    assert_raises(EventsError, e.events, "_RECSPAN_INFO._RECSPAN_INFO == 1")
-    assert_raises(EventsError, e.events, "_RECSPAN_INFO.\"asdf\" == 1")
+    assert_raises(EventsError, e.events_query, "foo.bar == 1")
+    assert_raises(EventsError, e.events_query, "_RECSPAN_INFO == 1")
+    assert_raises(EventsError, e.events_query, "_RECSPAN_INFO._RECSPAN_INFO == 1")
+    assert_raises(EventsError, e.events_query, "_RECSPAN_INFO.\"asdf\" == 1")
 
     # backquotes
     t("`_START_TICK` == 10", [20])
@@ -475,78 +469,3 @@ def test_recspan():
 
     # smoke test
     repr(r0)
-
-def test_merge_df():
-    def make_events():
-        e = Events()
-        e.add_recspan_info(0, 100, {})
-        ev1 = e.add_event(0, 10, 11, {"code": 10, "code2": 20})
-        ev2 = e.add_event(0, 20, 21, {"code": 10, "code2": 21})
-        ev3 = e.add_event(0, 30, 31, {"code": 11, "code2": 20})
-        return e, ev1, ev2, ev3
-
-    e, ev1, ev2, ev3 = make_events()
-    e.merge_df(pandas.DataFrame({"code": [10, 11], "foo": ["a", "b"]}),
-               on="code")
-    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
-    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "a"}
-    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "b"}
-
-    e, ev1, ev2, ev3 = make_events()
-    e.merge_df(pandas.DataFrame({"code": [10, 11], "foo": ["a", "b"]}),
-               on=["code"])
-    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
-    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "a"}
-    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "b"}
-
-    e, ev1, ev2, ev3 = make_events()
-    e.merge_df(pandas.DataFrame({"code": [10, 11], "foo": ["a", "b"]}),
-               on={"code": "code"})
-    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
-    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "a"}
-    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "b"}
-
-    e, ev1, ev2, ev3 = make_events()
-    e.merge_df(pandas.DataFrame(
-            {"code": [10, 11], "code2": [20, 20], "foo": ["a", "b"]}),
-               on=["code", "code2"])
-    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
-    assert dict(ev2) == {"code": 10, "code2": 21}
-    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "b"}
-
-    # Trying to overwrite existing fields
-    e, ev1, ev2, ev3 = make_events()
-    assert_raises(EventsError,
-                  e.merge_df,
-                  pandas.DataFrame({"code": [10, 11],
-                                    "code2": [20, 20],
-                                    "foo": ["a", "b"]}),
-                  on=["code"])
-
-    e, ev1, ev2, ev3 = make_events()
-    e.merge_df(pandas.DataFrame({"THECODE": [10, 11], "foo": ["a", "b"]}),
-               on={"THECODE": "code"})
-    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
-    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "a"}
-    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "b"}
-
-    e, ev1, ev2, ev3 = make_events()
-    e.merge_df(
-        pandas.DataFrame({"code": [20, 21, 20],
-                          "code2": [10, 10, 11],
-                          "foo": ["a", "b", "c"]}),
-        on={"code": "code2", "code2": "code"})
-    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
-    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "b"}
-    assert dict(ev3) == {"code": 11, "code2": 20, "foo": "c"}
-
-    e, ev1, ev2, ev3 = make_events()
-    e.merge_df(
-        pandas.DataFrame({"code": [20, 21, 20],
-                          "code2": [10, 10, 11],
-                          "foo": ["a", "b", "c"]}),
-        on={"code": "code2", "code2": "code"},
-        subset="code == 10")
-    assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
-    assert dict(ev2) == {"code": 10, "code2": 21, "foo": "b"}
-    assert dict(ev3) == {"code": 11, "code2": 20}

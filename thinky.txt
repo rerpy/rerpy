@@ -1,3 +1,18 @@
+todo:
+- get DataSet into shape
+- and kutaslab loader
+- then adjust rerp to match
+  - mock DataSet for tests
+  - new return type
+  - use rERPInfo
+
+never mind, write random access code for kutaslab reader
+scan (but don't decompress) the file first, which will be very fast,
+and then can find any block in constant time. or scan on demand even.
+   and maybe have a little global LRU cache to store records so even
+     scrolling will be fast (or wait until we need scrolling)
+still have a DataSource, but now it just has __getitem__
+
 new plan: operation F it
   still have an iteration interface to DataSets but
     for now store the arrays in memory
@@ -45,13 +60,15 @@ event. Don't need extra storage costs and possible rounding headaches
 involved in storing/search floating point times arrays because can
 calculate them on the fly...
 
-
 formats:
   Python code for reading .cnt (NeuroScan) files (no license but could
   easily rewrite or email about):
     https://github.com/UMDLinguistics/eeg-cnt/blob/master/cnt2h5.py
+    -- uncompressed, allows random seeks (and even mmap as int16 I guess)
   EDF/BDF (C code, BSD):
     http://www.teuniz.net/edflib/
+    or trivial to reimplement: http://www.biosemi.com/faq/file_format.htm
+    -- uncompresed, allows random seeks (and EDF allows int16 mmap I guess)
   ERPLAB (b/c it would be an excellent first demo to import these and
   let people reproduce their previous analysis):
     http://erpinfo.org/erplab/erplab-documentation/manual/Binlister.html
@@ -83,8 +100,47 @@ results:
 df is 981504 x 32. So the theoretical cost for row indexes is:
   32 bit integer: 3.7 MiB
   64 bit integer: 7.5 MiB
+no idea what time index to use in pandas... floats *sort* of work --
+stored as objects, if __getitem__ a Series with a float span then it does
+pick out everything in that range. But it will try converting floats
+to ints for example if the floats are integers.
 
 
+qt plotting
+drawing:
+qpainterpath stores: vector of <double x, double y, small-enum mode>,
+so I guess 24 bytes/point, or a factor of 3 expansion over raw data.
+display coordinate cache has various fancy stuff in it now (stores
+only part of the item, redraws only part), but given the above this
+may not be enough to solve the problem directly for giant lines. but
+it is the case that all cached stuff goes into the global
+QPixmapCache. so i guess probably the thing to do is to have multiple
+items, each of which builds a path and then renders it every time it's
+painted, and enable the cache for each.
+what might work out the same is to just have one giant item, enable
+caching (with some caveat about whether this actually works for large
+items? there's some code I don't quite understand to silently disable
+caching sometimes), and then when redrawing just create the given path
+and draw it. Or equivalently, make it part of the background and
+enable background caching in the view, which does in fact save just
+what's visible, and requests a draw of just the newly exposed part if
+the scene shifts. could cache the path too maybe.
+or can we listen to the view's motion and just always place a pathitem
+in front of it? That would take python out of the rendering loop
+entirely for big chunks of the time. I don't see an easy way to listen
+to the viewport rectangle (no signal e.g.) but a sneaky way would be
+to override the paint method...
+no easy way to do scrolling inside a qgraphicsscene, maybe put the
+fixed stuff in a different widget and just do the math? or else move
+it every time viewport moves? -- it looks like you can put child
+widgets on top of a qgraphicsview: http://stackoverflow.com/questions/3683565/how-to-anchor-qgraphicswidget-item-make-them-static-on-qgraphicsview
+or for non-interactive things, can just paint them in a qgraphicsview
+subclass (drawBackground, drawForeground)
+silly display ideas: tooltip giving channel name on each graph. always
+place the leftmost point in each line on the center, moving the rest
+of the display vertically to match (sort of continuous
+baselining). would be horrible for scrolling through quickly changing
+values though.
 
 have a special "cals" command that (1) arranges for the given events
 to be included in a special bin in all output files, (2) eliminates

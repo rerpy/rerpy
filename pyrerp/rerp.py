@@ -4,14 +4,96 @@
 
 import itertools
 from collections import namedtuple, OrderedDict
+import inspect
 
 import numpy as np
 import scipy.sparse as sp
 import pandas
-from patsy import dmatrices, ModelDesc, Term, build_design_matrices
+from patsy import (EvalEnvironment, dmatrices, ModelDesc, Term,
+                   build_design_matrices)
+from patsy.util import repr_pretty_delegate, repr_pretty_impl
 
 from pyrerp.incremental_ls import XtXIncrementalLS
 from pyrerp.parimap import parimap_unordered
+
+################################################################
+# Public interface
+################################################################
+
+# XX FIXME: add (and implement) bad_event_query and all_or_nothing arguments
+class rERPRequest(object):
+    def __init__(self, event_subset, start_time, stop_time,
+                 formula="~ 1", name=None, eval_env=0):
+        if name is None:
+            name = "%s: %s" % (event_query, formula)
+        self.event_subset = event_subset
+        self.start_time = start_time
+        self.stop_time = stop_time
+        self.formula = formula
+        self.name = name
+        self.eval_env = EvalEnvironment.capture(eval_env, reference=1)
+
+    __repr__ = repr_pretty_delegate
+    def _repr_pretty_(self, p, cycle):
+        assert not cycle
+        return repr_pretty_impl(p, self,
+                                [self.event_subset,
+                                 self.start_time, self.stop_time],
+                                {"formula": self.formula,
+                                 "name": self.name,
+                                 })
+
+class rERPInfo(object):
+    def __init__(self, **attrs):
+        self.__dict__.update(attrs)
+        self._attr_names = list(attrs)
+
+    __repr__ = repr_pretty_delegate
+    def _repr_pretty_(self, p, cycle):
+        assert not cycle
+        return repr_pretty_impl(p, self, [],
+                                dict([(attr, getattr(self, attr))
+                                      for attr in self._attr_names]))
+
+# TODO:
+# let's make the return value a list of rerp objects
+# where each has a ref to an analysis-global-info object
+# which itself has some weak record of all the results (rerp requests, but
+# not a circular link)
+# then rerp(...) can just return multi_rerp(...)[0]
+
+# regression_strategy can be "continuous", "by-epoch", or "auto". If
+# "continuous", we always build one giant regression model, treating the data
+# as continuous. If "auto", we use the (much faster) approach of generating a
+# single regression model and then applying it to each latency separately --
+# but *only* if this will produce the same result as doing the full
+# regression. If "epoch", then we either use the fast method, or else error
+# out. Changing this argument never affects the actual output of this
+# function. If it does, that's a bug! In general, we can do the fast thing if:
+# -- any artifacts affect either all or none of each
+#    epoch, and
+# -- either, overlap_correction=False,
+# -- or, overlap_correction=True and there are in fact no
+#    overlaps.
+def multi_rerp(data_set,
+               rerp_requests,
+               # Silly trick to implement kw-only args in python 2.
+               # Python 3 of course would use the native support.
+               # XX ARGH doesn't work!
+               #*REST_OF_ARGS_ARE_KW_ONLY,
+               artifact_query="has _ARTIFACT_TYPE",
+               artifact_type_field="_ARTIFACT_TYPE",
+               overlap_correction=True,
+               regression_strategy="auto"):
+    if REST_OF_ARGS_ARE_KW_ONLY:
+        raise TypeError("too many positional arguments")
+    return multi_rerp_impl(data_set, rerp_requests, artifact_query,
+                           artifact_type_field, overlap_correction,
+                           regression_strategy, eval_env)
+
+################################################################
+# Implementation
+################################################################
 
 # Can't use a namedtuple for this because we want __eq__ and __hash__ to use
 # identity semantics, not value semantics.
@@ -31,37 +113,19 @@ DataSpan = namedtuple("DataSpan", ["start", "stop", "epoch", "artifact"])
 DataSubSpan = namedtuple("DataSubSpan",
                          ["start", "stop", "epochs", "artifacts"])
 
-def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
-                    overlap_correction, regression_strategy,
-                    eval_env):
-    # We need to be able to refer to individual recording spans in a
-    # convenient, sortable way -- but Recording objects aren't sortable and
-    # are otherwise inconvenient to work with. So we represent each
-    # (Recording, span) pair by its index in the data_set.
-    recspan_lengths = data_set.span_lengths
-    recspan_intern_table = {}
-    for (i, recording_and_span_id) in enumerate(recspan_lengths):
-        recspan_intern_table[recording_and_span_id] = i
+def multi_rerp_impl(data_set, rerp_requests,
+                    artifact_query, artifact_type_field,
+                    overlap_correction, regression_strategy):
+    _check_unique_names(rerp_requests)
 
-    # This list contains 3-tuples that record the position of interesting
-    # events in the data, like epochs that are to be analyzed and
-    # artifacts that are to be rejected. Each entry is of the form:
-    #   (start, stop, tag)
-    # where tag is an arbitrary hashable object, and start and stop are
-    # pairs (interned recording span, offset). (Most code just cares that
-    # they sort correctly, though.) Artifacts use _Artifact objects,
-    # epochs use _Epoch objects.
+    # A bunch of DataSpan objects representing all relevant artifacts and
+    # epochs.
     spans = []
-
     # Get artifacts.
-    spans.extend(_artifact_spans(recspan_intern_table, data_set,
-                                 artifact_query, artifact_type_field))
-
-    # And now get the events themselves, and calculate the associated epochs
-    # (and any associated artifacts).
-    epoch_span_info = _epoch_spans(recspan_intern_table,
-                                   data_set, rerp_specs,
-                                   eval_env)
+    spans.extend(_artifact_spans(data_set, artifact_query, artifact_type_field))
+    # And get the events, and calculate the associated epochs (and any
+    # associated artifacts).
+    epoch_span_info = _epoch_spans(data_set, rerp_requests, eval_env)
     (rerp_infos, epoch_spans,
      design_width, expanded_design_width) = epoch_span_info
     spans.extend(epoch_spans)
@@ -147,33 +211,48 @@ def multi_rerp_impl(data_set, rerp_specs, artifact_query, artifact_type_field,
                         total_overlap_ticks, total_overlap_multiplicity,
                         artifact_counts, betas)
 
-def _artifact_spans(recspan_intern_table,
-                    data_set, artifact_query, artifact_type_field):
-    # Create "artifacts" to prevent us from trying to analyze any
-    # data the falls outwith the bounds of our recordings.
-    for recspan, length in data_set.span_lengths.iteritems():
-        recspan_intern = recspan_intern_table[recspan]
-        neg_inf = (recspan_intern, -2**31)
-        zero = (recspan_intern, 0)
-        end = (recspan_intern, length)
-        pos_inf = (recspan_intern, 2**31)
+def _check_unique_names(rerp_requests):
+    rerp_names = set()
+    for rerp_request in rerp_requests:
+        if rerp_request.name in rerp_names:
+            raise ValueError("name %r used for two different sub-analyses"
+                             % (rerp_request.name,))
+        rerp_names.add(rerp_request.name)
+
+def test__check_unique_names():
+    req1 = rERPRequest("asdf", -100, 1000, name="req1")
+    req1_again = rERPRequest("asdf", -100, 1000, name="req1")
+    req2 = rERPRequest("asdf", -100, 1000, name="req2")
+    from nose.tools import assert_raises
+    _check_unique_names([req1, req2])
+    _check_unique_names([req1_again, req2])
+    assert_raises(ValueError, _check_unique_names, [req1, req2, req1_again])
+
+def _artifact_spans(data_set, artifact_query, artifact_type_field):
+    # Create fake "artifacts" covering all regions where we don't actually
+    # have any recordings:
+    for recspan_info in data_set.recspan_infos:
+        neg_inf = (recspan_info.id, -2**31)
+        zero = (recspan_info.id, 0)
+        end = (recspan_info.id, recspan_info.ticks)
+        pos_inf = (recspan_info.id, 2**31)
         yield DataSpan(neg_inf, zero, None, "_NO_RECORDING")
         yield DataSpan(end, pos_inf, None, "_NO_RECORDING")
 
     # Now lookup the actual artifacts recorded in the events structure.
-    for artifact_event in data_set.events(artifact_query):
+    for artifact_event in data_set.events_query(artifact_query):
         artifact_type = artifact_event.get(artifact_type_field, "_UNKNOWN")
         if not isinstance(artifact_type, basestring):
             raise TypeError("artifact type must be a string, not %r"
                             % (artifact_type,))
-        recspan = (artifact_event.recording, artifact_event.span_id)
-        recspan_intern = recspan_intern_table[recspan]
-        yield DataSpan((recspan_intern, artifact_event.start_tick),
-                       (recspan_intern, artifact_event.stop_tick),
+        yield DataSpan((artifact_event.recspan_id, artifact_event.start_tick),
+                       (artifact_event.recspan_id, artifact_event.stop_tick),
                        None,
                        artifact_type)
 
-class _ArangeFactor(object):
+# A patsy "factor" that just returns arange(n); we use this as the LHS of our
+# formula.
+class _RangeFactor(object):
     def __init__(self, n):
         self._n = n
         self.origin = None
@@ -188,14 +267,14 @@ class _ArangeFactor(object):
         return np.arange(self._n)
 
 # Two little adapter classes to allow for rEPR formulas like
-#   ~ 1 + stimulus_type + _RECSPAN.subject
+#   ~ 1 + stimulus_type + _RECSPAN_INFO.subject
 class _FormulaEnv(object):
     def __init__(self, events):
         self._events = events
 
     def __getitem__(self, key):
-        if key == "_RECSPAN":
-            return _FormulaRecspan([ev.recspan for ev in self._events])
+        if key == "_RECSPAN_INFO":
+            return _FormulaRecspanInfo([ev.recspan_info for ev in self._events])
         else:
             # This will raise a KeyError for any events where the field is
             # just undefined, and will return None otherwise. This could be
@@ -211,32 +290,31 @@ class _FormulaEnv(object):
             #   pandas.Series([None, "a", "b"]) -> [None, "a", "b"]
             pandas.Series([ev[key] for ev in self._events])
 
-class _FormulaRecspan(object):
-    def __init__(self, recspans):
-        self._recspans = recspans
+class _FormulaRecspanInfo(object):
+    def __init__(self, recspan_infos):
+        self._recspan_infos = recspan_infos
 
     def __getattr__(self, attr):
-        return pandas.Series([rs[attr] for rs in self._recspans])
+        return pandas.Series([ri[attr] for ri in self._recspan_infos])
 
-def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
+def _epoch_spans(data_set, rerp_requests, eval_env):
     rerp_infos = []
-    rerp_names = set()
     spans = []
     design_offset = 0
     expanded_design_offset = 0
     data_format = data_set.data_format
-    for rerp_idx, rerp_spec in enumerate(rerp_specs):
-        start_offset = data_format.ms_to_samples(rerp_spec.start_time)
+    for rerp_idx, rerp_request in enumerate(rerp_requests):
+        start_offset = data_format.ms_to_samples(rerp_request.start_time)
         # Offsets are half open: [start, stop)
         # But, it's more intuitive for times to be closed: [start, stop]
         # So we interpret the user times as a closed interval, and add 1
         # sample when converting to offsets.
-        stop_offset = 1 + data_format.ms_to_samples(rerp_spec.stop_time)
+        stop_offset = 1 + data_format.ms_to_samples(rerp_request.stop_time)
         if start_offset >= stop_offset:
             raise ValueError("Epochs must be >1 sample long!")
-        events = list(data_set.events(rerp_spec.event_query))
+        events = data_set.events(rerp_request.event_subset)
         # Tricky bit: the specifies a RHS-only formula, but really we have an
-        # implicit LHS (determined by the event_query). This makes things
+        # implicit LHS (determined by the event_subset). This makes things
         # complicated when it comes to e.g. keeping track of which items
         # survived NA removal, determining the number of rows in an
         # intercept-only formula, etc. Really we want patsy to just treat all
@@ -244,10 +322,10 @@ def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
         # formula. So, we convert our RHS formula into a LHS~RHS formula,
         # using a special LHS that represents each event by a placeholder
         # integer!
-        desc = ModelDesc.from_formula(rerp_spec.formula, eval_env)
+        desc = ModelDesc.from_formula(rerp_request.formula, eval_env)
         if desc.lhs_termlist:
             raise ValueError("Formula cannot have a left-hand side")
-        desc.lhs_termlist = [Term([_ArangeFactor(len(events))])]
+        desc.lhs_termlist = [Term([_RangeFactor(len(events))])]
         fake_lhs, design = dmatrices(desc, _FormulaEnv(events))
         surviving_event_idxes = np.asarray(fake_lhs, dtype=int).ravel()
         design_row_idxes = np.empty(len(events))
@@ -282,12 +360,8 @@ def _epoch_spans(recspan_intern_table, data_set, rerp_specs, eval_env):
                                   (recspan_intern, epoch_stop),
                                   epoch,
                                   None))
-        if rerp_spec.name in rerp_names:
-            raise ValueError("name %r used for two different sub-analyses"
-                             % (rerp_spec.name,))
-        rerp_names.add(rerp_spec.name)
         rerp_info = {
-            "spec": rerp_spec,
+            "spec": rerp_request,
             "design_info": design.design_info,
             "start_offset": start_offset,
             "stop_offset": stop_offset,

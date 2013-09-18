@@ -12,7 +12,7 @@ import bisect
 import numpy as np
 import pandas
 
-from pyrerp.data import SensorInfo, DataFormat, Recording
+from pyrerp.data import SensorInfo, DataFormat
 from pyrerp.util import maybe_open
 from pyrerp._kutaslab import _decompress_crw_chunk
 
