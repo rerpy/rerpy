@@ -12,7 +12,7 @@ import bisect
 import numpy as np
 import pandas
 
-from pyrerp.data import SensorInfo, DataFormat
+from pyrerp.data import DataFormat, DataSet
 from pyrerp.util import maybe_open
 from pyrerp._kutaslab import _decompress_crw_chunk
 
@@ -20,10 +20,7 @@ PAUSE_CODE = 49152
 
 # There are also read_avg and write_erp_as_avg functions in here, but their
 # API probably needs another look before anyone should use them.
-__all__ = ["KutaslabRecording", "KutaslabError"]
-
-class KutaslabError(Exception):
-    pass
+__all__ = []
 
 # Derived from erp/include/64header.h:
 _header_dtype = np.dtype([
@@ -104,17 +101,19 @@ def _read_header(stream):
         assert False, "Unrecognized file type"
     hz = 1 / (header["10usec_per_tick"] / 100000.0)
     if abs(hz - int(hz)) > 1e-6:
-        raise KutaslabError("file claims weird non-integer sample rate %shz"
-                            % hz)
+        raise ValueError("file claims weird non-integer sample rate %shz"
+                         % hz)
     hz = int(hz)
 
     channel_names = _channel_names_from_header(header)
 
-    # Also read out the various free-form informational strings:
+    # Also read out the various general informational bits:
     info = {}
     info["subject"] = header["subdes"]
     info["experiment"] = header["expdes"]
-    info["kutaslab_raw_header"] = header
+    info["odelay"] = header["odelay"]
+    # And save the raw header in case anyone wants it later (you never know)
+    info["kutaslab_raw_header"] = header_str
 
     return (reader, header["nchans"], hz, channel_names, info, header)
 
@@ -157,7 +156,7 @@ def _channel_names_to_header(channel_names, header):
         encoded_names = []
         for channel_name in channel_names:
             if len(channel_name) > 4:
-                raise KutaslabError("can't store channel names with >4 chars")
+                raise ValueError("can't store channel names with >4 chars")
             codes = [_char2code[char] for char in channel_name]
             codes += [0 * (4 - len(codes))]
             assert len(codes) == 4
@@ -325,104 +324,88 @@ def read_log(file_like):
     df["flag_polinv"] = np.asarray(df["flag"] & 0o20, dtype=bool)
     return df
 
-# XX no idea what this "loc" file thing is
-# really should learn to read a topofile (see topofiles(5) and lib/topo)
-def read_loc(file_like):
-    fo = maybe_open(file_like)
-    names = []
-    thetas = []
-    rs = []
-    for line in fo:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        (_, theta, r, name) = line.split()
-        # Strip trailing periods
-        while name.endswith("."):
-            name = name[:-1]
-        names.append(name)
-        thetas.append(theta)
-        rs.append(r)
-    return SensorInfo(names, thetas, rs)
-
 # XX someday should fix this so that it delays reading the actual data until
 # needed (to avoid the giant memory overhead of loading in lots of data sets
-# together). It really wouldn't be hard -- the log file tells you where all
-# the events are, and the length of each span. (You can even tell how many
-# samples there are total, because the last event in the log file is always a
-# pause code placed at the last sample of the data.)
-class KutaslabRecording(Recording):
-    def __init__(self, f_raw, f_log, name=None, f_loc=None,
-                 dtype=np.float64, calibration_condition=0):
-        if isinstance(f_raw, basestring) and name is None:
-            name = os.path.basename(f_raw)
-        if name is None:
-            raise ValueError("recording name must be supplied when loading "
-                             "from file object")
-        self.name = name
-        f_raw = maybe_open(f_raw)
-        f_log = maybe_open(f_log)
-        (hz, channel_names, raw_codes, data, metadata) = read_raw(f_raw, dtype)
-        self.metadata = metadata
-        # XX FIXME: build in the 26 and 64 channel cap info
-        if f_loc is not None:
-            self.electrode_info = read_loc(f_loc)
+# together). The way to do it for crw files is just to read through the file
+# once at load time (without decompressing) to find where each block is
+# located on disk, and then we can do random access after we know that.
+def load_kutaslab(raw, log, calibration_condition=0):
+    dtype = np.float64
+
+    metadata = {}
+    if isinstance(raw, basestring):
+        metadata["raw_file"] = os.path.abspath(f_raw)
+    if isinstance(log, basestring):
+        metadata["log_file"] = os.path.abspath(f_log)
+    metadata["calibration_condition"] = calibration_condition
+
+    raw = maybe_open(raw)
+    log = maybe_open(log)
+
+    (hz, channel_names, raw_codes, data, header_metadata) = read_raw(raw, dtype)
+    metadata.update(header_metadata)
+    data_format = DataFormat(hz, "RAW", channel_names)
+
+    raw_log_events = read_log(f_log)
+    expanded_log_codes = np.zeros(raw_codes.shape, dtype=int)
+    expanded_log_codes[raw_log_events.index] = raw_log_events["code"]
+    discrepancies = (expanded_log_codes != raw_codes)
+    if (not (expanded_log_codes[discrepancies] == 0).all()
+        or not (raw_codes[discrepancies] == 65535).all()):
+        raise ValueError("raw and log files have mismatched codes")
+    del raw_codes
+    del expanded_log_codes
+
+    pause_events = (raw_log_events["code"] == PAUSE_CODE)
+    pause_ticks = raw_log_events.index[pause_events]
+    # The pause code appears at the last sample of the old era, so if used
+    # directly, adjacent pause ticks give contiguous spans of recording as
+    # (pause1, pause2]. (Confirmed by checking by hand in a real recording
+    # that the data associated with the sample that has the pause code is
+    # contiguous with the sample before, but not the sample after.)
+    # Adding +1 to each of them then converts this to Python style
+    # [pause1, pause2) intervals. There is a pause code at the last record
+    # of the file, but not one at the first, so we add that in explicitly.
+    pause_ticks += 1
+    span_edges = np.concatenate(([0], pause_ticks))
+
+    span_slices = [(span_edges[i], span_edges[i + 1])
+                   for i in xrange(len(span_edges) - 1)]
+    data_source = KutaslabDataSource(data, span_slices)
+    span_ticks = [(stop - start) for (start, stop) in span_slices]
+
+    data_set = DataSet(data_format)
+    data_set.add_recspans(data_source,
+                          span_ticks,
+                          [metadata] * len(span_ticks))
+
+    span_starts = [start for (start, stop) in self._span_slices]
+    for tick, row in raw_log_events.iterrows():
+        if row["condition"] == calibration_condition:
+            attrs = {"calibration_pulse": True}
         else:
-            self.electrode_info = SensorInfo([], [], [])
-        self.data_format = DataFormat(hz, "RAW", channel_names)
+            attrs = row.to_dict()
+        span_id = bisect.bisect(span_starts, tick) - 1
+        span_start, span_stop = self._span_slices[span_id]
+        assert span_start <= tick < span_stop
 
-        raw_log_events = read_log(f_log)
-        expanded_log_codes = np.zeros(raw_codes.shape, dtype=int)
-        expanded_log_codes[raw_log_events.index] = raw_log_events["code"]
-        discrepancies = (expanded_log_codes != raw_codes)
-        if (not (expanded_log_codes[discrepancies] == 0).all()
-            or not (raw_codes[discrepancies] == 65535).all()):
-            raise KutaslabError("raw and log files have mismatched codes")
-        del raw_codes
-        del expanded_log_codes
+        data_set.add_event(span_id,
+                           tick - span_start, tick - span_start + 1,
+                           attrs)
 
-        pause_events = (raw_log_events["code"] == PAUSE_CODE)
-        pause_ticks = raw_log_events.index[pause_events]
-        # The pause code appears at the last sample of the old era, so if used
-        # directly, adjacent pause ticks give contiguous spans of recording as
-        # (pause1, pause2]. (Confirmed by checking by hand in a real recording
-        # that the data associated with the sample that has the pause code is
-        # contiguous with the sample before, but not the sample after.)
-        # Adding +1 to each of them then converts this to Python style
-        # [pause1, pause2) intervals. There is a pause code at the last record
-        # of the file, but not one at the first, so we add that in explicitly.
-        pause_ticks += 1
-        span_edges = np.concatenate(([0], pause_ticks))
+    return data_set
 
-        self._span_slices = [(span_edges[i], span_edges[i + 1])
-                             for i in xrange(len(span_edges) - 1)]
-        self.span_lengths = [(stop - start)
-                             for (start, stop) in self._span_slices]
+class KutaslabDataSource(object):
+    def __init__(self, concat_data, span_slices):
+        self._concat_data = data
+        self._span_slices = span_slices
 
-        self._data = data
-        self._raw_log_events = raw_log_events
-        self._calibration_condition = calibration_condition
+    def __getitem__(self, local_recspan_id):
+        return self._concat_data[self._span_slices[local_recspan_id], :]
 
-    def span_data(self, span_ids):
-        for span_id in span_ids:
-            start, stop = self._span_slices[span_id]
-            yield self._data[start:stop, :]
+    def transform(self, matrix):
+        self._concat_data = np.dot(self._concat_data, matrix.T)
 
-    def event_iter(self):
-        span_starts = [start for (start, stop) in self._span_slices]
-        for tick, row in self._raw_log_events.iterrows():
-            if row["condition"] == self._calibration_condition:
-                attrs = {"calibration_pulse": True}
-            else:
-                attrs = row.to_dict()
-            attrs["subject"] = self.metadata["subject"]
-            attrs["experiment"] = self.metadata["experiment"]
-
-            span_id = bisect.bisect(span_starts, tick) - 1
-            span_start, span_stop = self._span_slices[span_id]
-            assert span_start <= tick < span_stop
-
-            yield (span_id, tick - span_start, tick - span_start + 1, attrs)
 
 # To read multiple bins, call this repeatedly on the same stream
 def read_avg(stream, dtype):
@@ -466,12 +449,12 @@ def write_epoched_as_avg(epoched_data, stream, allow_resample=False):
             import scipy.signal
             data_array = scipy.signal.resample(data_array, samples, axis=1)
         else:
-            raise KutaslabError("kutaslab avg files must contain exactly "
-                                "256, 512, or 768 samples, but your data "
-                                "has %s. Use allow_resample=True if you "
-                                "want me to automatically resample your "
-                                "data to %s samples"
-                                % (epoched_data.num_samples, samples,))
+            raise ValueError("kutaslab avg files must contain exactly "
+                             "256, 512, or 768 samples, but your data "
+                             "has %s. Use allow_resample=True if you "
+                             "want me to automatically resample your "
+                             "data to %s samples"
+                             % (epoched_data.num_samples, samples,))
     assert data_array.shape[1] == samples
     times = epoched_data.data.major_axis
     actual_length = times.max() - times.min()
@@ -541,8 +524,8 @@ def write_epoched_as_avg(epoched_data, stream, allow_resample=False):
             header["rftypes"][i] = name[:8]
             header["rfcnts"][i] = count
 
-        if "kutaslab_raw_header" in metadata:
-            header["odelay"] = metadata["kutaslab_raw_header"]["odelay"]
+        # We don't write out odelay -- you're expected to have dealt with that
+        # already via .move_event() etc.
 
         _channel_names_to_header(epoched_data.channels, header)
 
