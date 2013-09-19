@@ -219,6 +219,13 @@ class DataSet(object):
         for i in xrange(len(self)):
             yield self[i]
 
+    def __repr__(self):
+        return ("<%s with %s recspans, %s events, and %s frames>"
+                % (self.__class__.__name__,
+                   len(self),
+                   len(self.events_query()),
+                   sum([ri.ticks for ri in self.recspan_infos])))
+
     ################################################################
     # Event handling methods (mostly delegated to ._events)
     ################################################################
@@ -254,27 +261,27 @@ class DataSet(object):
     # Convenience methods
     ################################################################
 
-    def add_dataset(self, data_set):
+    def add_dataset(self, dataset):
         # Metadata
-        if self.data_format != data_set.data_format:
+        if self.data_format != dataset.data_format:
             raise ValueError("data format mismatch")
-        self.sensor_info.update(data_set.sensor_info)
+        self.sensor_info.update(dataset.sensor_info)
         # Recspans
         our_recspan_id_base = len(self._recspans)
         recspan_source_info = {}
-        for i, (data_source, local_recspan_id) in enumerate(data_set._recspans):
+        for i, (data_source, local_recspan_id) in enumerate(dataset._recspans):
             recspan_source_info.setdefault(id(data_source), ([], []))
             tick_lengths, metadatas = recspan_source_info[id(data_source)]
             assert len(tick_lengths) == len(metadatas) == local_recspan_id
-            recspan_info = data_set.recspan_infos[i]
+            recspan_info = dataset.recspan_infos[i]
             tick_lengths.append(recspan_info.ticks)
             metadatas.append(dict(recspan_info))
-        for data_source in data_set._recspan_sources:
+        for data_source in dataset._recspan_sources:
             tick_lengths, metadatas = recspan_source_info[id(data_source)]
             self.add_recspan_source(data_source.copy(),
                                     tick_lengths, metadatas)
         # Events
-        for their_event in data_set.events_query():
+        for their_event in dataset.events_query():
             self.add_event(their_event.recspan_id + our_recspan_id_base,
                            their_event.start_tick,
                            their_event.stop_tick,
@@ -311,9 +318,9 @@ class DataSet(object):
 def mock_dataset(num_channels=4, num_recspans=4):
     data_format = DataFormat(250, "uV",
                              ["MOCK%s" % (i,) for i in xrange(num_channels)])
-    data_set = DataSet(data_format)
+    dataset = DataSet(data_format)
     r = np.random.RandomState(0)
     for i in xrange(num_recspans):
         data = r.normal(size=(100, num_channels))
-        data_set.add_recspan(data, {})
-    return data_set
+        dataset.add_recspan(data, {})
+    return dataset

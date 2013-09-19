@@ -17,10 +17,11 @@ from pyrerp.util import maybe_open
 from pyrerp.io._erpss import _decompress_crw_chunk
 
 PAUSE_CODE = 49152
+DELETE_CODE = 57344
 
 # There are also read_avg and write_erp_as_avg functions in here, but their
 # API probably needs another look before anyone should use them.
-__all__ = []
+__all__ = ["load_erpss"]
 
 # Derived from erp/include/64header.h:
 _header_dtype = np.dtype([
@@ -28,30 +29,30 @@ _header_dtype = np.dtype([
     ("epoch_len", "<i2"), # epoch length in msec
     ("nchans", "<i2"),
     ("sums", "<i2"), # 0 = ERP, 1 = single trial
-    # ^^ 8 bytes
+    # -- 8 bytes --
     ("tpfuncs", "<i2"), # number of processing funcs
     ("pp10uv", "<i2"), # points / 10 uV
     ("verpos", "<i2"), # 1 normally, -1 for sign inversion (I think?)
     ("odelay", "<i2"), # ms from trigger to stim (usually 8)
-    # ^^ 16 bytes
+    # -- 16 bytes --
     ("totevnt", "<i2"), # "total log events" (0 in mima217.avg)
     ("10usec_per_tick", "<i2"),
     ("time", "<i4"), # "time in sample clock ticks" (0 in mima217.avg)
-    # ^^ 24 bytes
+    # -- 24 bytes --
     ("cond_code", "<i2"), # (0 in mima217.avg)
     ("presam", "<i2"), # pre-event time in epoch in msec
     ("trfuncs", "<i2"), # "number of rejection functions"
     ("totrr", "<i2"), # "total raw records including rejects" (0 in mima217.avg)
-    # ^^ 32 bytes
+    # -- 32 bytes --
     ("totrej", "<i2"), # "total raw rejects" (0 in mima217.avg) (0 in mima217.avg)
     ("sbcode", "<i2"), # "subcondition number ( bin number )" (0 in mima217.avg)
     ("cprecis", "<i2"), # Our average contains cprecis * 256 samples
     ("dummy1", "<i2"),
-    # ^^ 40 bytes
+    # -- 40 bytes --
     ("decfact", "<i2"), # "decimation factor used in processing"
     ("dh_flag", "<i2"), # "see defines - sets time resolution" (0 in mima217.avg)
     ("dh_item", "<i4"), # "sequential item #" (0 in mima217.avg)
-    # ^^ 48 bytes
+    # -- 48 bytes --
     ("rfcnts", "<i2", (8,)), # "individual rejection counts 8 poss. rfs"
     ("rftypes", "S8", (8,)), # "8 char. descs for 8 poss. rfs"
     ("chndes", "S128"),
@@ -67,6 +68,7 @@ _header_dtype = np.dtype([
     ("idxofflow", "<u2"), # (0 in mima217.avg)
     ("idxoffhi", "<u2"), # (0 in mima217.avg)
     ("chndes3", "S24"),
+    # -- 512 bytes --
     ])
 
 # If, say, chndes has trailing null bytes, then rec["chndes"] will give us a
@@ -288,7 +290,7 @@ def test_read_raw_on_test_data():
         tested += 1
     # Cross-check, to make sure is actually finding the files... (bump up this
     # number if you add more test files):
-    assert tested == 4
+    assert tested == 5
 
 def test_64bit_channel_names():
     from pyrerp.test import test_data_path
@@ -305,38 +307,6 @@ def test_64bit_channel_names():
              "LDPa", "RDPa", "LCer", "RCer", "LMOc", "RMOc", "LMPP", "RMPP",
              "LMPa", "RMPa", "MiCe", "MiPa", "MiPP", "MiOc", "LLEy", "RLEy"]
             ).all()
-
-# For debugging:
-def compare_raw_to_crw(raw_stream, crw_stream): # pragma: no cover
-    raw_reader, raw_nchans, raw_hz, raw_names, raw_l, header = _read_header(raw_stream)
-    crw_reader, crw_nchans, crw_hz, crw_names, crw_l, header = _read_header(crw_stream)
-    assert raw_reader is _read_raw_chunk
-    assert crw_reader is _read_compressed_chunk
-    assert raw_nchans == crw_nchans
-    assert raw_hz == crw_hz
-    assert raw_names == crw_names
-    assert crw_l is None
-    while True:
-        raw_start = raw_stream.tell()
-        raw_chunk = _read_raw_chunk(raw_stream, raw_nchans)
-        raw_end = raw_stream.tell()
-        crw_start = crw_stream.tell()
-        crw_chunk = _read_compressed_chunk(crw_stream, crw_nchans)
-        crw_end = crw_stream.tell()
-        assert (raw_chunk is None) == (crw_chunk is None)
-        if raw_chunk is None:
-            break
-        (raw_codes, raw_data) = raw_chunk
-        (crw_codes, crw_data) = crw_chunk
-        problems = []
-        if raw_codes != crw_codes:
-            problems.append("codes")
-        if tuple(raw_data) != tuple(crw_data):
-            problems.append("data")
-        if problems:
-            print ("Bad %s! raw: [%s, %s], crw: [%s, %s]"
-                   % (problems, raw_start, raw_end, crw_start, crw_end))
-            assert False
 
 def read_log(file_like):
     fo = maybe_open(file_like)
@@ -356,6 +326,26 @@ def read_log(file_like):
     df["flag_rejected"] = np.asarray(df["flag"] & 0o40, dtype=bool)
     df["flag_polinv"] = np.asarray(df["flag"] & 0o20, dtype=bool)
     return df
+
+# Little hack useful for testing. AFAIK this is identical to the erpss
+# 'makelog' program, except that:
+# - 'makelog' throws away some events from the end of the file, including the
+# very helpful final "pause" marker
+# - 'makelog' "cooks" the log file, i.e., toggles the high bit of all events
+# that occur in a span ended by a "delete mark" (see logfile.5). We don't
+# bother. (Though could, I guess.)
+def make_log(raw, condition=64): # pragma: no cover
+    import warnings; warnings.warn("This code is not tested!")
+    codes = read_raw(maybe_open(raw), np.float64)[2]
+    log = []
+    for i in codes.nonzero()[0]:
+        log.append(struct.pack("<HHHBB",
+                               codes[i], (i & 0xffff0000) >> 16, i & 0xffff,
+                               condition,
+                               0))
+        if codes[i] in (PAUSE_CODE, DELETE_CODE):
+            condition += 1
+    return "".join(log)
 
 def test_read_log():
     def t(data, expected):
@@ -406,9 +396,9 @@ def load_erpss(raw, log, calibration_events="condition == 0"):
 
     metadata = {}
     if isinstance(raw, basestring):
-        metadata["raw_file"] = os.path.abspath(f_raw)
+        metadata["raw_file"] = os.path.abspath(raw)
     if isinstance(log, basestring):
-        metadata["log_file"] = os.path.abspath(f_log)
+        metadata["log_file"] = os.path.abspath(log)
     metadata["calibration_events"] = str(calibration_events)
 
     raw = maybe_open(raw)
@@ -418,60 +408,71 @@ def load_erpss(raw, log, calibration_events="condition == 0"):
     metadata.update(header_metadata)
     data_format = DataFormat(hz, "RAW", channel_names)
 
-    raw_log_events = read_log(f_log)
+    raw_log_events = read_log(log)
     expanded_log_codes = np.zeros(raw_codes.shape, dtype=int)
-    expanded_log_codes[raw_log_events.index] = raw_log_events["code"]
-    discrepancies = (expanded_log_codes != raw_codes)
-    if (not (expanded_log_codes[discrepancies] == 0).all()
-        or not (raw_codes[discrepancies] == 65535).all()):
+    try:
+        expanded_log_codes[raw_log_events.index] = raw_log_events["code"]
+    except IndexError as e:
+        raise ValueError("log file claims event at position where there is "
+                         "no data: %s" % (e,))
+    if np.any(expanded_log_codes != raw_codes):
         raise ValueError("raw and log files have mismatched codes")
     del raw_codes
     del expanded_log_codes
 
     pause_events = (raw_log_events["code"] == PAUSE_CODE)
-    pause_ticks = raw_log_events.index[pause_events]
-    # The pause code appears at the last sample of the old era, so if used
-    # directly, adjacent pause ticks give contiguous spans of recording as
-    # (pause1, pause2]. (Confirmed by checking by hand in a real recording
+    delete_events = (raw_log_events["code"] == DELETE_CODE)
+    break_events = pause_events | delete_events
+    break_ticks = raw_log_events.index[break_events]
+    # The pause/delete code appears at the last sample of the old era, so if
+    # used directly, adjacent pause ticks give contiguous spans of recording
+    # as (pause1, pause2]. (Confirmed by checking by hand in a real recording
     # that the data associated with the sample that has the pause code is
-    # contiguous with the sample before, but not the sample after.)
-    # Adding +1 to each of them then converts this to Python style
-    # [pause1, pause2) intervals. There is a pause code at the last record
-    # of the file, but not one at the first, so we add that in explicitly.
-    pause_ticks += 1
-    span_edges = np.concatenate(([0], pause_ticks))
+    # contiguous with the sample before, but not the sample after.)  Adding +1
+    # to each of them then converts this to Python style [pause1, pause2)
+    # intervals. There is a pause code at the last record of the file, but not
+    # one at the first, so we add that in explicitly.
+    break_ticks += 1
+    span_edges = np.concatenate(([0], break_ticks))
+    assert span_edges[0] == 0
+    assert span_edges[-1] == data.shape[0]
 
-    span_slices = [(span_edges[i], span_edges[i + 1])
+    span_slices = [slice(span_edges[i], span_edges[i + 1])
                    for i in xrange(len(span_edges) - 1)]
     data_source = ErpssDataSource(data, span_slices)
-    span_ticks = [(stop - start) for (start, stop) in span_slices]
+    span_ticks = [(s.stop - s.start) for s in span_slices]
 
-    data_set = DataSet(data_format)
-    data_set.add_recspans(data_source,
-                          span_ticks,
-                          [metadata] * len(span_ticks))
+    dataset = DataSet(data_format)
+    dataset.add_recspan_source(data_source,
+                                span_ticks,
+                                [metadata] * len(span_ticks))
 
-    span_starts = [start for (start, stop) in self._span_slices]
+    span_starts = [s.start for s in span_slices]
     for tick, row in raw_log_events.iterrows():
         attrs = row.to_dict()
         span_id = bisect.bisect(span_starts, tick) - 1
-        span_start, span_stop = self._span_slices[span_id]
+        span_slice = span_slices[span_id]
+        span_start = span_slice.start
+        span_stop = span_slice.stop
         assert span_start <= tick < span_stop
 
-        data_set.add_event(span_id,
+        dataset.add_event(span_id,
                            tick - span_start, tick - span_start + 1,
                            attrs)
 
-    for cal_event in data_set.events_query(calibration_events):
+        if attrs["code"] == DELETE_CODE:
+            dataset.recspan_infos[span_id]["deleted"] = True
+
+    for cal_event in dataset.events_query(calibration_events):
         for key in list(cal_event):
             del cal_event[key]
         cal_event["calibration_pulse"] = True
 
-    return data_set
+    return dataset
 
 class ErpssDataSource(object):
     def __init__(self, concat_data, span_slices):
-        self._concat_data = data
+        self._concat_data = concat_data
         self._span_slices = span_slices
 
     def __getitem__(self, local_recspan_id):
@@ -479,3 +480,98 @@ class ErpssDataSource(object):
 
     def transform(self, matrix):
         self._concat_data = np.dot(self._concat_data, matrix.T)
+
+def test_load_erpss():
+    from pyrerp.test import test_data_path
+    # This crw/log file is constructed to have a few features:
+    # - it only has 3 records, so it's tiny
+    # - the first two records are in one recspan, the last is in a second, so
+    #   we test the recspan splitting code
+    # - the first recspan ends in a PAUSE event, the second ends in a DELETE
+    #   event, so we test the deleted event handling.
+    # There are some weird things about it too:
+    # - several events in the first recspan have condition 0, to test
+    #   calibration pulse stuff. In a normal ERPSS file all events within a
+    #   single recspan would have the same condition number.
+    # - most of the event codes are >32767. In a normal ERPSS file such events
+    #   are supposed to be reserved for special stuff and deleted events, but
+    #   it happens the file I was using as a basis violated this rule. Oh
+    #   well.
+    dataset = load_erpss(test_data_path("tiny-complete.crw"),
+                          test_data_path("tiny-complete.log"))
+    assert len(dataset) == 2
+    assert dataset[0].shape == (512, 32)
+    assert dataset[1].shape == (256, 32)
+
+    assert dataset.data_format.exact_sample_rate_hz == 250
+    assert dataset.data_format.units == "RAW"
+    assert list(dataset.data_format.channel_names) == [
+        "lle", "lhz", "MiPf", "LLPf", "RLPf", "LMPf", "RMPf", "LDFr", "RDFr",
+        "LLFr", "RLFr", "LMFr", "RMFr", "LMCe", "RMCe", "MiCe", "MiPa", "LDCe",
+        "RDCe", "LDPa", "RDPa", "LMOc", "RMOc", "LLTe", "RLTe", "LLOc", "RLOc",
+        "MiOc", "A2", "HEOG", "rle", "rhz",
+        ]
+
+    for recspan_info in dataset.recspan_infos:
+        assert recspan_info["raw_file"].endswith("tiny-complete.crw")
+        assert recspan_info["log_file"].endswith("tiny-complete.log")
+        assert recspan_info["experiment"] == "brown-1"
+        assert recspan_info["subject"] == "Subject p3 2008-08-20"
+        assert recspan_info["odelay"] == 8
+        assert len(recspan_info["erpss_raw_header"]) == 512
+
+    assert dataset.recspan_infos[0].ticks == 512
+    assert dataset.recspan_infos[1].ticks == 256
+    assert dataset.recspan_infos[1]["deleted"]
+
+    assert len(dataset.events()) == 14
+    # 2 are calibration events
+    assert len(dataset.events("has code")) == 12
+    for ev in dataset.events("has code"):
+        assert ev["condition"] in (64, 65)
+        assert ev["flag"] == 0
+        assert not ev["flag_data_error"]
+        assert not ev["flag_polinv"]
+        assert not ev["flag_rejected"]
+    for ev in dataset.events("calibration_pulse"):
+        assert dict(ev) == {"calibration_pulse": True}
+    def check_ticks(query, recspan_ids, start_ticks):
+        events = dataset.events(query)
+        assert len(events) == len(recspan_ids) == len(start_ticks)
+        for ev, recspan_id, start_tick in zip(events, recspan_ids, start_ticks):
+            assert ev.recspan_id == recspan_id
+            assert ev.start_tick == start_tick
+            assert ev.stop_tick == start_tick + 1
+
+    check_ticks("condition == 64",
+                [0] * 8, [21, 221, 304, 329, 379, 458, 483, 511])
+    check_ticks("condition == 65",
+                [1] * 4,
+                [533 - 512, 733 - 512, 762 - 512, 767 - 512])
+    check_ticks("calibration_pulse", [0, 0], [250, 408])
+
+    # check calibration_events option
+    dataset2 = load_erpss(test_data_path("tiny-complete.crw"),
+                           test_data_path("tiny-complete.log"),
+                           calibration_events="condition == 65")
+    assert len(dataset2.events("condition == 65")) == 0
+    assert len(dataset2.events("condition == 0")) == 2
+    assert len(dataset2.events("calibration_pulse")) == 4
+
+    # check that we can load from file handles (not sure if anyone cares but
+    # hey you never know...)
+    assert len(load_erpss(open(test_data_path("tiny-complete.crw")),
+                          open(test_data_path("tiny-complete.log")))) == 2
+
+    # check that code/raw mismatch is detected
+    from nose.tools import assert_raises
+    for bad in ["bad-code", "bad-tick", "bad-tick2"]:
+        assert_raises(ValueError,
+                      load_erpss,
+                      test_data_path("tiny-complete.crw"),
+                      test_data_path("tiny-complete.%s.log" % (bad,)))
+
+    # test .transform and .copy
+    from pyrerp.test_data import check_transforms
+    check_transforms(load_erpss(test_data_path("tiny-complete.crw"),
+                                test_data_path("tiny-complete.log")))

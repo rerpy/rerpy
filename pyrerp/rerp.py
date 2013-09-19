@@ -75,7 +75,7 @@ class rERPInfo(object):
 # -- either, overlap_correction=False,
 # -- or, overlap_correction=True and there are in fact no
 #    overlaps.
-def multi_rerp(data_set,
+def multi_rerp(dataset,
                rerp_requests,
                # Silly trick to implement kw-only args in python 2.
                # Python 3 of course would use the native support.
@@ -87,7 +87,7 @@ def multi_rerp(data_set,
                regression_strategy="auto"):
     if REST_OF_ARGS_ARE_KW_ONLY:
         raise TypeError("too many positional arguments")
-    return multi_rerp_impl(data_set, rerp_requests, artifact_query,
+    return multi_rerp_impl(dataset, rerp_requests, artifact_query,
                            artifact_type_field, overlap_correction,
                            regression_strategy, eval_env)
 
@@ -113,7 +113,7 @@ DataSpan = namedtuple("DataSpan", ["start", "stop", "epoch", "artifact"])
 DataSubSpan = namedtuple("DataSubSpan",
                          ["start", "stop", "epochs", "artifacts"])
 
-def multi_rerp_impl(data_set, rerp_requests,
+def multi_rerp_impl(dataset, rerp_requests,
                     artifact_query, artifact_type_field,
                     overlap_correction, regression_strategy):
     _check_unique_names(rerp_requests)
@@ -122,10 +122,10 @@ def multi_rerp_impl(data_set, rerp_requests,
     # epochs.
     spans = []
     # Get artifacts.
-    spans.extend(_artifact_spans(data_set, artifact_query, artifact_type_field))
+    spans.extend(_artifact_spans(dataset, artifact_query, artifact_type_field))
     # And get the events, and calculate the associated epochs (and any
     # associated artifacts).
-    epoch_span_info = _epoch_spans(data_set, rerp_requests, eval_env)
+    epoch_span_info = _epoch_spans(dataset, rerp_requests, eval_env)
     (rerp_infos, epoch_spans,
      design_width, expanded_design_width) = epoch_span_info
     spans.extend(epoch_spans)
@@ -187,7 +187,7 @@ def multi_rerp_impl(data_set, rerp_requests,
         worker = _ContinuousWorker(expanded_design_width)
     else:
         assert False
-    jobs_iter = _analysis_jobs(data_set, analysis_spans)
+    jobs_iter = _analysis_jobs(dataset, analysis_spans)
     model = XtXIncrementalLS()
     for job_result in parimap_unordered(worker, jobs_iter):
         model.append_bottom_half(job_result)
@@ -203,9 +203,9 @@ def multi_rerp_impl(data_set, rerp_requests,
     #   ...
     #   predictor 2, latency n
     #   ...
-    betas = betas.reshape((-1, len(data_set.data_format.channel_names)))
+    betas = betas.reshape((-1, len(dataset.data_format.channel_names)))
 
-    return rERPAnalysis(data_set.data_format,
+    return rERPAnalysis(dataset.data_format,
                         rerp_infos, overlap_correction, regression_strategy,
                         total_wanted_ticks, total_good_ticks,
                         total_overlap_ticks, total_overlap_multiplicity,
@@ -228,10 +228,10 @@ def test__check_unique_names():
     _check_unique_names([req1_again, req2])
     assert_raises(ValueError, _check_unique_names, [req1, req2, req1_again])
 
-def _artifact_spans(data_set, artifact_query, artifact_type_field):
+def _artifact_spans(dataset, artifact_query, artifact_type_field):
     # Create fake "artifacts" covering all regions where we don't actually
     # have any recordings:
-    for recspan_info in data_set.recspan_infos:
+    for recspan_info in dataset.recspan_infos:
         neg_inf = (recspan_info.id, -2**31)
         zero = (recspan_info.id, 0)
         end = (recspan_info.id, recspan_info.ticks)
@@ -240,7 +240,7 @@ def _artifact_spans(data_set, artifact_query, artifact_type_field):
         yield DataSpan(end, pos_inf, None, "_NO_RECORDING")
 
     # Now lookup the actual artifacts recorded in the events structure.
-    for artifact_event in data_set.events_query(artifact_query):
+    for artifact_event in dataset.events_query(artifact_query):
         artifact_type = artifact_event.get(artifact_type_field, "_UNKNOWN")
         if not isinstance(artifact_type, basestring):
             raise TypeError("artifact type must be a string, not %r"
@@ -297,12 +297,12 @@ class _FormulaRecspanInfo(object):
     def __getattr__(self, attr):
         return pandas.Series([ri[attr] for ri in self._recspan_infos])
 
-def _epoch_spans(data_set, rerp_requests, eval_env):
+def _epoch_spans(dataset, rerp_requests, eval_env):
     rerp_infos = []
     spans = []
     design_offset = 0
     expanded_design_offset = 0
-    data_format = data_set.data_format
+    data_format = dataset.data_format
     for rerp_idx, rerp_request in enumerate(rerp_requests):
         start_offset = data_format.ms_to_samples(rerp_request.start_time)
         # Offsets are half open: [start, stop)
@@ -312,7 +312,7 @@ def _epoch_spans(data_set, rerp_requests, eval_env):
         stop_offset = 1 + data_format.ms_to_samples(rerp_request.stop_time)
         if start_offset >= stop_offset:
             raise ValueError("Epochs must be >1 sample long!")
-        events = data_set.events(rerp_request.event_subset)
+        events = dataset.events(rerp_request.event_subset)
         # Tricky bit: the specifies a RHS-only formula, but really we have an
         # implicit LHS (determined by the event_subset). This makes things
         # complicated when it comes to e.g. keeping track of which items
@@ -493,14 +493,14 @@ def _choose_strategy(requested_strategy,
                          "\"by-epoch\", \"continuous\", or \"auto\""
                          % (requested_strategy,))
 
-def _analysis_jobs(data_set, analysis_spans):
-    recspans = list(data_set.span_lengths)
+def _analysis_jobs(dataset, analysis_spans):
+    recspans = list(dataset.span_lengths)
     wanted_recspans = []
     for start, stop, epochs in analysis_spans:
         assert start[0] == stop[0]
         # Un-intern
         wanted_recspans.append(recspans[start[0]])
-    data_iter = data_set.span_values(wanted_recspans)
+    data_iter = dataset.span_values(wanted_recspans)
     for data, analysis_span in itertools.izip(data_iter, analysis_spans):
         start, stop, epochs = analysis_span
         yield data[start[1]:stop[1], :], start[1], epochs
