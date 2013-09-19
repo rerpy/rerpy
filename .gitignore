@@ -6,7 +6,7 @@ MANIFEST
 htmlcov/
 .tox
 
-pyrerp/_kutaslab.c
+pyrerp/io/_erpss.c
 pyrerp/_artifact.c
 
 # Cribbed from numpy's .gitignore:

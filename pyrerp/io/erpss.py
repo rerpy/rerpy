@@ -14,7 +14,7 @@ import pandas
 
 from pyrerp.data import DataFormat, DataSet
 from pyrerp.util import maybe_open
-from pyrerp._kutaslab import _decompress_crw_chunk
+from pyrerp.io._erpss import _decompress_crw_chunk
 
 PAUSE_CODE = 49152
 
@@ -97,7 +97,7 @@ def _read_header(stream):
     elif header["magic"] == 0x97a5:
         # Compressed file magic number:
         reader = _read_compressed_chunk
-    else:
+    else: # pragma: no cover
         assert False, "Unrecognized file type"
     hz = 1 / (header["10usec_per_tick"] / 100000.0)
     if abs(hz - int(hz)) > 1e-6:
@@ -113,7 +113,7 @@ def _read_header(stream):
     info["experiment"] = header["expdes"]
     info["odelay"] = header["odelay"]
     # And save the raw header in case anyone wants it later (you never know)
-    info["kutaslab_raw_header"] = header_str
+    info["erpss_raw_header"] = header_str
 
     return (reader, header["nchans"], hz, channel_names, info, header)
 
@@ -121,10 +121,12 @@ def _channel_names_from_header(header):
     if header["nchans"] <= 16:
         # For small montages, each channel gets 8 bytes of ascii, smushed
         # together into a single array:
-        return np.fromstring(_get_full_string(header, "chndes"), dtype="S8")
+        return np.fromstring(_get_full_string(header, "chndes"),
+                             dtype="S8")[:header["nchans"]]
     elif header["nchans"] <= 32:
         # For mid-size montages, each channel gets 4 bytes:
-        return np.fromstring(_get_full_string(header, "chndes"), dtype="S4")
+        return np.fromstring(_get_full_string(header, "chndes"),
+                             dtype="S4")[:header["nchans"]]
     else:
         # And for large montages, a complicated scheme is used.
         # First, pull out and combine all the relevant buffers:
@@ -144,22 +146,19 @@ def _channel_names_from_header(header):
                 ]
             chars = [_code2char[code] for code in codes if code != 0]
             channel_names_l.append("".join(chars))
-        return np.array(channel_names_l)
+        return np.array(channel_names_l[:header["nchans"]])
 
 def _channel_names_to_header(channel_names, header):
-    header["nchan"] = len(channel_names)
-    if len(erp.channel_names) <= 16:
+    header["nchans"] = len(channel_names)
+    if len(channel_names) <= 16:
         header["chndes"] = np.asarray(channel_names, dtype="S8").tostring()
-    elif len(erp.channel_names) <= 32:
+    elif len(channel_names) <= 32:
         header["chndes"] = np.asarray(channel_names, dtype="S4").tostring()
     else:
         encoded_names = []
         for channel_name in channel_names:
-            if len(channel_name) > 4:
-                raise ValueError("can't store channel names with >4 chars")
             codes = [_char2code[char] for char in channel_name]
-            codes += [0 * (4 - len(codes))]
-            assert len(codes) == 4
+            codes += [0] * (4 - len(codes))
             char0 = ((codes[0] << 2) | (codes[1] >> 4)) & 0xff
             char1 = ((codes[1] << 4) | (codes[2] >> 2)) & 0xff
             char2 = ((codes[2] << 6) | codes[3]) & 0xff
@@ -168,7 +167,41 @@ def _channel_names_to_header(channel_names, header):
         header["chndes"] = concat_buf[:128]
         header["chndes2"] = concat_buf[128:128 + 40]
         header["chndes3"] = concat_buf[128 + 40:]
-    assert np.all(_channel_names_from_header(header) == channel_names)
+    if not np.all(_channel_names_from_header(header) == channel_names):
+        raise ValueError("failed to encode channel names in header -- maybe "
+                         "some names are too long?")
+
+def test_channel_names_roundtrip():
+    # Try 1 char, 2 char, 3 char, 4 char names
+    # Try all letters in 6-bit character set (digits, lowercase, uppercase)
+    names = ["A", "a", "1", "Aa", "Aa1", "Aa1A"]
+    import itertools
+    for char, digit in itertools.izip(itertools.cycle(string.uppercase),
+                                      itertools.cycle(string.digits)):
+        names.append(char + char.lower() + digit)
+        if len(names) == 64:
+            break
+    def t(test_names):
+        header = np.zeros(1, dtype=_header_dtype)[0]
+        _channel_names_to_header(test_names, header)
+        got_names = _channel_names_from_header(header)
+        assert np.all(got_names == test_names)
+    # skip names == [], b/c we hit https://github.com/numpy/numpy/issues/3764
+    # and anyway, who cares about the nchans=0 case
+    for i in xrange(1, len(names)):
+        # Try all lengths
+        t(names[:i])
+    # Also try some long names for small headers where they're allowed
+    long_names = ["a" * i for i in xrange(8)] * 2
+    t(long_names)
+    from nose.tools import assert_raises
+    header = np.zeros(1, dtype=_header_dtype)[0]
+    # But even for small headers, only 8 chars are allowed
+    assert_raises(ValueError, _channel_names_to_header, ["a" * 9], header)
+    # And for larger headers, only 4 chars are allowed
+    for i in xrange(17, 64):
+        assert_raises(ValueError,
+                      _channel_names_to_header, ["a" * 5] * i, header)
 
 def read_raw(stream, dtype):
     (reader, nchans, hz, channel_names, info, header) = _read_header(stream)
@@ -241,7 +274,7 @@ def assert_files_match(p1, p2):
     assert (codes1 == codes2).all()
     assert (data1 == data2).all()
     for k in set(info1.keys() + info2.keys()):
-        if k != "kutaslab_raw_header":
+        if k != "erpss_raw_header":
             assert info1[k] == info2[k]
 
 def test_read_raw_on_test_data():
@@ -274,7 +307,7 @@ def test_64bit_channel_names():
             ).all()
 
 # For debugging:
-def compare_raw_to_crw(raw_stream, crw_stream):
+def compare_raw_to_crw(raw_stream, crw_stream): # pragma: no cover
     raw_reader, raw_nchans, raw_hz, raw_names, raw_l, header = _read_header(raw_stream)
     crw_reader, crw_nchans, crw_hz, crw_names, crw_l, header = _read_header(crw_stream)
     assert raw_reader is _read_raw_chunk
@@ -324,12 +357,51 @@ def read_log(file_like):
     df["flag_polinv"] = np.asarray(df["flag"] & 0o20, dtype=bool)
     return df
 
+def test_read_log():
+    def t(data, expected):
+        from cStringIO import StringIO
+        got = read_log(StringIO(data))
+        # .sort() is a trick to make sure columns line up
+        assert np.all(expected.sort(axis=1) == got.sort(axis=1))
+
+    # The first 80 bytes of arquan25.log (from Delong, Urbach & Kutas 2005)
+    data = "01000000ec01010001000000e103010001000000f50601004b00000044070100010000007b0701004b000000ca07010001000000010801004b0000004f08010001000000860801004b000000d5080100".decode("hex")
+    # From 'logexam arquan25.log 1' (1 means, measure time in ticks)
+    # then 'l 0 9'
+    expected = pandas.DataFrame(
+        {"code": [1, 1, 1, 75, 1, 75, 1, 75, 1, 75],
+         "condition": [1] * 10,
+         "flag": [0] * 10,
+         "flag_data_error": [False] * 10,
+         "flag_rejected": [False] * 10,
+         "flag_polinv": [False] * 10,
+         },
+        index=[492, 993, 1781, 1860, 1915, 1994, 2049, 2127, 2182, 2261],
+        )
+    t(data, expected)
+
+    # 80 bytes from arquan25.log, starting at 8080*8 bytes into the file
+    data = "01000e00d39b010000c00e00ff9e010023010e005a9f000023010e00dc9f000023010e005da0000023010e00dea0000023010e005fa1000023010e00e1a1000023010e0062a2000023010e00e3a20000".decode("hex")
+    # from logexam, 'l 8080 8089'
+    expected = pandas.DataFrame(
+        {"code": [1, 49152, 291, 291, 291, 291, 291, 291, 291, 291],
+         "condition": [1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+         "flag": [0] * 10,
+         "flag_data_error": [False] * 10,
+         "flag_rejected": [False] * 10,
+         "flag_polinv": [False] * 10,
+         },
+        index=[957395, 958207, 958298, 958428, 958557,
+               958686, 958815, 958945, 959074, 959203],
+        )
+    t(data, expected)
+
 # XX someday should fix this so that it has the option to delay reading the
 # actual data until needed (to avoid the giant memory overhead of loading in
 # lots of data sets together). The way to do it for crw files is just to read
 # through the file without decompressing to find where each block is located
 # on disk, and then we can do random access after we know that.
-def load_kutaslab(raw, log, calibration_events="condition == 0"):
+def load_erpss(raw, log, calibration_events="condition == 0"):
     dtype = np.float64
 
     metadata = {}
@@ -371,7 +443,7 @@ def load_kutaslab(raw, log, calibration_events="condition == 0"):
 
     span_slices = [(span_edges[i], span_edges[i + 1])
                    for i in xrange(len(span_edges) - 1)]
-    data_source = KutaslabDataSource(data, span_slices)
+    data_source = ErpssDataSource(data, span_slices)
     span_ticks = [(stop - start) for (start, stop) in span_slices]
 
     data_set = DataSet(data_format)
@@ -397,7 +469,7 @@ def load_kutaslab(raw, log, calibration_events="condition == 0"):
 
     return data_set
 
-class KutaslabDataSource(object):
+class ErpssDataSource(object):
     def __init__(self, concat_data, span_slices):
         self._concat_data = data
         self._span_slices = span_slices
@@ -407,175 +479,3 @@ class KutaslabDataSource(object):
 
     def transform(self, matrix):
         self._concat_data = np.dot(self._concat_data, matrix.T)
-
-
-# To read multiple bins, call this repeatedly on the same stream
-def read_avg(stream, dtype):
-    # Ignore the 'reader' field -- avg files always have the same magic number
-    # as whatever type of raw file was used to create them -- and they're
-    # always in their own format, regardless.
-    (_, nchans, hz, channel_names, info, header) = _read_header(stream)
-    assert header["cprecis"] > 0
-    data_chunks = []
-    for i in xrange(header["cprecis"]):
-        data_bytes = stream.read(512 * nchans)
-        data_chunk = np.fromstring(data_bytes, dtype="<i2")
-        data_chunk.resize((256, nchans))
-        data_chunks.append(np.asarray(data_chunk, dtype=dtype))
-    return np.vstack(data_chunks), hz, channel_names, info, header
-
-# You can write multiple bins to the same file by calling this function
-# repeatedly on the same open file handle.
-def write_epoched_as_avg(epoched_data, stream, allow_resample=False):
-
-    assert False, ("this code won't work; the data structures have been "
-                   "rewritten multiple times since it was last used. "
-                   "But it could be fixed up without too much work...")
-
-    stream = maybe_open(stream, "ab")
-    data_array = np.asarray(epoched_data.data)
-    # One avg record is always exactly 256 * cprecis samples long, with
-    # cprecis = 1, 2, 3 (a limitation of the data format).  So we pick the
-    # smallest cprecis that is >= our actual number of samples (maximum 3),
-    # and then we resample to have that many samples exactly.  (I.e., we try
-    # to resample up when possible.)
-    if epoched_data.num_samples <= 1 * 256:
-        cprecis = 1
-    elif epoched_data.num_samples <= 2 * 256:
-        cprecis = 2
-    else:
-        cprecis = 3
-    samples = cprecis * 256
-    if epoched_data.num_samples != samples:
-        if allow_resample:
-            import scipy.signal
-            data_array = scipy.signal.resample(data_array, samples, axis=1)
-        else:
-            raise ValueError("kutaslab avg files must contain exactly "
-                             "256, 512, or 768 samples, but your data "
-                             "has %s. Use allow_resample=True if you "
-                             "want me to automatically resample your "
-                             "data to %s samples"
-                             % (epoched_data.num_samples, samples,))
-    assert data_array.shape[1] == samples
-    times = epoched_data.data.major_axis
-    actual_length = times.max() - times.min()
-    presam = 0 - times.min()
-    # Compute closest internally-consistent approximations to the timing
-    # information that can be represented in this data format. The two things
-    # we get to store are:
-    #   the sampling period measured as an integer multiple of 10us
-    #   the epoch length measured as an integer number of ms
-    sample_period_in_10us = int(round(actual_length * 100. / samples))
-    epoch_len_ms = int(round(samples * sample_period_in_10us / 100.))
-    # Need to convert data from floats to s16's. To preserve as much
-    # resolution as possible, we use the full s16 range, minus a bit to make
-    # sure we don't run into any overflow issues.
-    s16_max = 2 ** 15 - 10
-    # Same as np.abs(data).max(), but without copying the whole array:
-    data_max = max(data_array.max(), np.abs(data_array.min()))
-    # We have to write the conversion factor as an integer, so we round it
-    # *down* here (to avoid overflow), and then use the *rounded* version to
-    # actually convert the data.
-    s16_per_10uV = int(s16_max / (data_max / 10))
-    # Except that if our conversion factor itself overflows, then we have to
-    # truncate it back down (and lose a bit of resolution in the process, oh
-    # well):
-    if s16_per_10uV > s16_max:
-        s16_per_10uV = s16_max
-    metadata = epoched_data.recording_info.metadata
-    for i in xrange(epoched_data.num_epochs):
-        header = np.zeros(1, dtype=_header_dtype)[0]
-        header["magic"] = 0x97a5
-        header["verpos"] = 1
-        integer_data = np.asarray(np.round(s16_per_10uV
-                                           * data_array[i, :, :] / 10.),
-                                  dtype="<i2")
-
-        header["epoch_len"] = epoch_len_ms
-        header["nchans"] = integer_data.shape[1]
-        # "pf" = "processing function", i.e., something like "averaging" or
-        # "standard error" that describes how raw data was analyzed to create
-        # this curve.
-        header["tpfuncs"] = 1
-        header["pftypes"] = "pyrERP"
-        header["pp10uv"] = s16_per_10uV
-        header["10usec_per_tick"] = sample_period_in_10us
-        header["presam"] = presam
-        header["cprecis"] = cprecis
-        # Supposedly this should be used to write down resampling information.
-        # The kutaslab tools only do integer-factor downsampling (decimation),
-        # and they write the decimation factor to the file here.  I don't see
-        # how it matters for the .avg file to retain the decimation
-        # information, and the file won't let us write down upsampling
-        # (especially non-integer upsampling!), so we just pretend our
-        # decimation factor is 1 and be done with it.
-        header["decfact"] = 1
-
-        used_trials = metadata.get("ERP_num_used_trials",
-                                   metadata.get("rERP_num_used_trials",
-                                                0))
-        rejected_counts = metadata.get("rejected_counts", {})
-        total_rejected = np.sum(rejected_counts.values())
-        header["totrr"] = used_trials + total_rejected
-        header["totrej"] = total_rejected
-        header["trfuncs"] = min(8, len(rejected_counts))
-        for i, (name, count) in enumerate(rejected_counts.iteritems()):
-            if i >= header["trfuncs"]:
-                break
-            header["rftypes"][i] = name[:8]
-            header["rfcnts"][i] = count
-
-        # We don't write out odelay -- you're expected to have dealt with that
-        # already via .move_event() etc.
-
-        _channel_names_to_header(epoched_data.channels, header)
-
-        if "experiment" in metadata:
-            header["expdes"] = metadata["experiment"]
-        if "subject" in metadata:
-            header["subdes"] = metadata["subject"]
-        header["condes"] = str(epoched_data.data.entries[i])
-
-        header.tofile(stream)
-        # avg files omit the mark track.  And, all the data for a single
-        # channel goes together in a single chunk, rather than interleaving
-        # all channels.  THIS IS TOTALLY DIFFERENT FROM RAW FILES, DON'T GET
-        # CONFUSED!
-        for i in xrange(integer_data.shape[1]):
-            integer_data[:, i].tofile(stream)
-
-# From looking at:
-#   plot(data[:,
-#             np.add.outer(np.arange(-100, 100),
-#                          (marks == 1).nonzero()[0]).squeeze()].mean(axis=2).transpose())
-# It looks like the high part of the cal is about code_idx+15:code_idx+45, and
-# the low part is -60:-10
-
-# class BadChannels(Exception):
-#     pass
-
-# def calibrate_in_place(data, codes,
-#                        before=np.arange(-40, -10), after=np.arange(15, 45),
-#                        pulse_size=10, # true pulse size measured in uV
-#                        stddev_limit=3,
-#                        cal_code=1):
-#     assert len(before) == len(after)
-#     cal_codes = (codes == cal_code).nonzero()[0]
-#     # Trim off the first and last few cals, because there may be truncation
-#     # effects:
-#     cal_codes = cal_codes[2:-2]
-#     before_cals = data[np.add.outer(cal_codes, before).ravel(), :]
-#     after_cals = data[np.add.outer(cal_codes, after).ravel(), :]
-#     deltas = before_cals - after_cals
-#     bad_channels = (deltas.std(axis=0) > stddev_limit)
-#     if bad_channels.any():
-#         raise BadChannels, bad_channels.nonzero()[0]
-#     delta = deltas.mean(axis=0)
-#     assert (delta > 0).all() or (delta < 0).all()
-#     delta = np.abs(delta)
-#     data *= pulse_size / delta
-
-if __name__ == "__main__":
-    import nose
-    nose.runmodule()

@@ -11,7 +11,7 @@ cdef unsigned char _nibble_at(np.uint16_t * data, int i):
     cdef int word_offset = i // 4
     cdef int in_word_offset = i % 4
     return (data[word_offset] >> ((3 - in_word_offset) * 4)) & 0x0f
-        
+
 def test__nibble_at():
     cdef np.ndarray[np.uint16_t] data = np.array([0x3412, 0x659f],
                                                  dtype=np.uint16)
@@ -130,4 +130,3 @@ def test__decompress_crw_chunk():
                               0xe000 | (-1 & 0x0fff),
                               0xe000 | (-1 & 0x0fff))
     assert (_decompress_crw_chunk(test_vector, 2, 1, chunk_samples=2) == [-1, -1]).all()
-

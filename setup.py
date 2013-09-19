@@ -34,8 +34,8 @@ setup(
         "Topic :: Scientific/Engineering",
         ],
     ext_modules = [
-        Extension("pyrerp._kutaslab",
-                  ["pyrerp/_kutaslab.pyx"],
+        Extension("pyrerp.io._erpss",
+                  ["pyrerp/io/_erpss.pyx"],
                   include_dirs=[np.get_include()],
                   ),
         Extension("pyrerp._artifact",
