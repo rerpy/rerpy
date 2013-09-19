@@ -256,7 +256,7 @@ class Events(object):
         # over a query result, and it when this happened the cursor just
         # mysteriously stopped returning results. I don't understand the exact
         # situations under which this occurs, so to be safe, we just always
-        # read out all db data immediately instead of letting iterators
+        # read out all db data immediately instead of letting true iterators
         # escape.
         return list(c), c.lastrowid
 

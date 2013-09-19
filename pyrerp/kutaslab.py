@@ -324,12 +324,12 @@ def read_log(file_like):
     df["flag_polinv"] = np.asarray(df["flag"] & 0o20, dtype=bool)
     return df
 
-# XX someday should fix this so that it delays reading the actual data until
-# needed (to avoid the giant memory overhead of loading in lots of data sets
-# together). The way to do it for crw files is just to read through the file
-# once at load time (without decompressing) to find where each block is
-# located on disk, and then we can do random access after we know that.
-def load_kutaslab(raw, log, calibration_condition=0):
+# XX someday should fix this so that it has the option to delay reading the
+# actual data until needed (to avoid the giant memory overhead of loading in
+# lots of data sets together). The way to do it for crw files is just to read
+# through the file without decompressing to find where each block is located
+# on disk, and then we can do random access after we know that.
+def load_kutaslab(raw, log, calibration_events="condition == 0"):
     dtype = np.float64
 
     metadata = {}
@@ -337,7 +337,7 @@ def load_kutaslab(raw, log, calibration_condition=0):
         metadata["raw_file"] = os.path.abspath(f_raw)
     if isinstance(log, basestring):
         metadata["log_file"] = os.path.abspath(f_log)
-    metadata["calibration_condition"] = calibration_condition
+    metadata["calibration_events"] = str(calibration_events)
 
     raw = maybe_open(raw)
     log = maybe_open(log)
@@ -381,10 +381,7 @@ def load_kutaslab(raw, log, calibration_condition=0):
 
     span_starts = [start for (start, stop) in self._span_slices]
     for tick, row in raw_log_events.iterrows():
-        if row["condition"] == calibration_condition:
-            attrs = {"calibration_pulse": True}
-        else:
-            attrs = row.to_dict()
+        attrs = row.to_dict()
         span_id = bisect.bisect(span_starts, tick) - 1
         span_start, span_stop = self._span_slices[span_id]
         assert span_start <= tick < span_stop
@@ -392,6 +389,11 @@ def load_kutaslab(raw, log, calibration_condition=0):
         data_set.add_event(span_id,
                            tick - span_start, tick - span_start + 1,
                            attrs)
+
+    for cal_event in data_set.events_query(calibration_events):
+        for key in list(cal_event):
+            del cal_event[key]
+        cal_event["calibration_pulse"] = True
 
     return data_set
 
