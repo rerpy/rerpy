@@ -283,7 +283,7 @@ def test_read_raw_on_test_data():
     import glob
     from pyrerp.test import test_data_path
     tested = 0
-    for rawp in glob.glob(test_data_path("*.raw")):
+    for rawp in glob.glob(test_data_path("erpss/*.raw")):
         crwp = rawp[:-3] + "crw"
         print rawp, crwp
         assert_files_match(rawp, crwp)
@@ -294,7 +294,7 @@ def test_read_raw_on_test_data():
 
 def test_64bit_channel_names():
     from pyrerp.test import test_data_path
-    stream = open(test_data_path("two-chunks-64chan.raw"))
+    stream = open(test_data_path("erpss/two-chunks-64chan.raw"))
     (hz, channel_names, codes, data, info) = read_raw(stream, int)
     # "Correct" channel names as listed by headinfo(1):
     assert (channel_names ==
@@ -497,8 +497,8 @@ def test_load_erpss():
     #   are supposed to be reserved for special stuff and deleted events, but
     #   it happens the file I was using as a basis violated this rule. Oh
     #   well.
-    dataset = load_erpss(test_data_path("tiny-complete.crw"),
-                          test_data_path("tiny-complete.log"))
+    dataset = load_erpss(test_data_path("erpss/tiny-complete.crw"),
+                          test_data_path("erpss/tiny-complete.log"))
     assert len(dataset) == 2
     assert dataset[0].shape == (512, 32)
     assert dataset[1].shape == (256, 32)
@@ -551,27 +551,27 @@ def test_load_erpss():
     check_ticks("calibration_pulse", [0, 0], [250, 408])
 
     # check calibration_events option
-    dataset2 = load_erpss(test_data_path("tiny-complete.crw"),
-                           test_data_path("tiny-complete.log"),
-                           calibration_events="condition == 65")
+    dataset2 = load_erpss(test_data_path("erpss/tiny-complete.crw"),
+                          test_data_path("erpss/tiny-complete.log"),
+                          calibration_events="condition == 65")
     assert len(dataset2.events("condition == 65")) == 0
     assert len(dataset2.events("condition == 0")) == 2
     assert len(dataset2.events("calibration_pulse")) == 4
 
     # check that we can load from file handles (not sure if anyone cares but
     # hey you never know...)
-    assert len(load_erpss(open(test_data_path("tiny-complete.crw")),
-                          open(test_data_path("tiny-complete.log")))) == 2
+    assert len(load_erpss(open(test_data_path("erpss/tiny-complete.crw")),
+                          open(test_data_path("erpss/tiny-complete.log")))) == 2
 
     # check that code/raw mismatch is detected
     from nose.tools import assert_raises
     for bad in ["bad-code", "bad-tick", "bad-tick2"]:
         assert_raises(ValueError,
                       load_erpss,
-                      test_data_path("tiny-complete.crw"),
-                      test_data_path("tiny-complete.%s.log" % (bad,)))
+                      test_data_path("erpss/tiny-complete.crw"),
+                      test_data_path("erpss/tiny-complete.%s.log" % (bad,)))
 
     # test .transform and .copy
     from pyrerp.test_data import check_transforms
-    check_transforms(load_erpss(test_data_path("tiny-complete.crw"),
-                                test_data_path("tiny-complete.log")))
+    check_transforms(load_erpss(test_data_path("erpss/tiny-complete.crw"),
+                                test_data_path("erpss/tiny-complete.log")))
