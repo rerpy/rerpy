@@ -29,8 +29,8 @@ def test_Events_basic():
     assert ev1.recspan_id == 0
     assert ev1.start_tick == 10
     assert ev1.stop_tick == 11
-    assert ev1.recspan.id == 0
-    assert ev1.recspan == r1
+    assert ev1.recspan_info.id == 0
+    assert ev1.recspan_info == r1
     assert ev1["a"] == 1
     assert ev1["b"] == "hello"
     assert ev1["c"] == True

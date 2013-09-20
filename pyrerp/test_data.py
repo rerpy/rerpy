@@ -6,7 +6,18 @@ import numpy as np
 import pandas
 from nose.tools import assert_raises
 
-from pyrerp.data import DataSet, DataFormat, mock_dataset
+from pyrerp.data import DataSet, DataFormat
+
+def mock_dataset(num_channels=4, num_recspans=4, ticks_per_recspan=100,
+                 hz=250):
+    data_format = DataFormat(hz, "uV",
+                             ["MOCK%s" % (i,) for i in xrange(num_channels)])
+    dataset = DataSet(data_format)
+    r = np.random.RandomState(0)
+    for i in xrange(num_recspans):
+        data = r.normal(size=(ticks_per_recspan, num_channels))
+        dataset.add_recspan(data, {})
+    return dataset
 
 class MockDataSource(object):
     def __init__(self, tick_lengths):

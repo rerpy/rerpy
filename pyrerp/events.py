@@ -589,7 +589,7 @@ class Event(_Obj):
         return self._index_field("recspan_id")
 
     @property
-    def recspan(self):
+    def recspan_info(self):
         return RecspanInfo(self._events, self._index_field("recspan_id"))
 
     @property

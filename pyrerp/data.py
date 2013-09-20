@@ -57,8 +57,17 @@ class DataFormat(object):
     def __ne__(self, other):
         return not (self == other)
 
-    def ms_to_ticks(self, ms):
-        return int(round(ms * self.exact_sample_rate_hz / 1000.0))
+    def ms_to_ticks(self, ms, round="nearest"):
+        float_tick = ms * self.exact_sample_rate_hz / 1000.0
+        if round == "nearest":
+            tick = np.round(float_tick)
+        elif round == "down":
+            tick = np.floor(float_tick)
+        elif round == "up":
+            tick = np.ceil(float_tick)
+        else:
+            raise ValueError("round= must be \"nearest\", \"up\", or \"down\"")
+        return int(tick)
 
     def ticks_to_ms(self, ticks):
         return ticks * 1000.0 / self.exact_sample_rate_hz
@@ -103,6 +112,18 @@ def test_DataFormat():
 
     assert df.ms_to_ticks(1000) == 1024
     assert df.ticks_to_ms(1024) == 1000
+
+    assert df.ms_to_ticks(1000.1) == 1024
+    assert df.ms_to_ticks(1000.9) == 1025
+    assert df.ms_to_ticks(1000, round="nearest") == 1024
+    assert df.ms_to_ticks(1000.1, round="nearest") == 1024
+    assert df.ms_to_ticks(1000.9, round="nearest") == 1025
+    assert df.ms_to_ticks(1000, round="down") == 1024
+    assert df.ms_to_ticks(1000.1, round="down") == 1024
+    assert df.ms_to_ticks(1000.9, round="down") == 1024
+    assert df.ms_to_ticks(1000, round="up") == 1024
+    assert df.ms_to_ticks(1000.1, round="up") == 1025
+    assert df.ms_to_ticks(1000.9, round="up") == 1025
 
     assert df == df
     assert not (df != df)
@@ -316,13 +337,3 @@ class DataSet(object):
                                     "event already has a value for key %r, "
                                     "%r, which does not match new value %r"
                                     % (df_key, current_value, row[df_key]))
-
-def mock_dataset(num_channels=4, num_recspans=4, ticks_per_recspan=100):
-    data_format = DataFormat(250, "uV",
-                             ["MOCK%s" % (i,) for i in xrange(num_channels)])
-    dataset = DataSet(data_format)
-    r = np.random.RandomState(0)
-    for i in xrange(num_recspans):
-        data = r.normal(size=(ticks_per_recspan, num_channels))
-        dataset.add_recspan(data, {})
-    return dataset
