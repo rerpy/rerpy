@@ -469,3 +469,14 @@ def test_recspan():
 
     # smoke test
     repr(r0)
+
+def test_None_types():
+    e = Events()
+    e.add_recspan_info(0, 100, {})
+    # This used to be broken for bools in particular
+    e1 = e.add_event(0, 10, 11, {"bool": None, "num": None, "blob": None})
+    e2 = e.add_event(0, 11, 12, {"bool": True, "num": 15, "blob": "asdf"})
+    e3 = e.add_event(0, 12, 13, {"bool": None, "num": None, "blob": None})
+    assert dict(e1) == {"bool": None, "num": None, "blob": None}
+    assert dict(e2) == {"bool": True, "num": 15, "blob": "asdf"}
+    assert dict(e3) == {"bool": None, "num": None, "blob": None}

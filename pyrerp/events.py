@@ -114,7 +114,7 @@ def _value_type(value):
 def _sql_value_to_value_type(sql_value, value_type):
     # SQLite's type system discards the distinction between bools and
     # ints, so we have to recover it on the way out.
-    if value_type is _BOOL:
+    if value_type is _BOOL and sql_value is not None:
         return bool(sql_value)
     else:
         return sql_value
