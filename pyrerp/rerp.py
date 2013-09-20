@@ -99,7 +99,7 @@ def multi_rerp(dataset,
                regression_strategy="auto"):
     return multi_rerp_impl(dataset, rerp_requests, artifact_query,
                            artifact_type_field, overlap_correction,
-                           regression_strategy, eval_env)
+                           regression_strategy)
 
 ################################################################
 # Implementation
@@ -139,7 +139,7 @@ def multi_rerp_impl(dataset, rerp_requests,
     spans.extend(_artifact_spans(dataset, artifact_query, artifact_type_field))
     # And get the events, and calculate the associated epochs (and any
     # associated artifacts).
-    epoch_span_info = _epoch_spans(dataset, rerp_requests, eval_env)
+    epoch_span_info = _epoch_spans(dataset, rerp_requests)
     (rerp_infos, epoch_spans,
      design_width, expanded_design_width) = epoch_span_info
     spans.extend(epoch_spans)
@@ -403,15 +403,15 @@ def test__rerp_design():
                         [1, 0, 1, 40, 4]])
     assert_array_equal(design_row_idxes, [-1, -1, 0, -1, 1])
 
-def _epoch_info_and_spans(dataset, rerp_request, eval_env):
+def _epoch_info_and_spans(dataset, rerp_request):
     spans = []
     data_format = dataset.data_format
     # We interpret the time interval as a closed interval [start, stop],
     # just like pandas.
     start_tick = data_format.ms_to_ticks(rerp_request.start_time,
                                          round="up")
-    stop_tick = data_format.ms_to_samples(rerp_request.stop_time,
-                                          round="down")
+    stop_tick = data_format.ms_to_ticks(rerp_request.stop_time,
+                                        round="down")
     # Convert closed tick interval to half-open tick interval [start, stop)
     stop_tick += 1
     # This is actually still needed even though rERPRequest also checks for
@@ -425,7 +425,8 @@ def _epoch_info_and_spans(dataset, rerp_request, eval_env):
                             rerp_request.stop_time))
     events = dataset.events(rerp_request.event_query)
     design, design_row_idxes = _rerp_design(rerp_request.formula,
-                                            events, eval_env)
+                                            events,
+                                            rerp_request.eval_env)
     rerp_info = {
         "request": rerp_request,
         "design_info": design.design_info,
@@ -455,7 +456,7 @@ def _epoch_info_and_spans(dataset, rerp_request, eval_env):
             # this epoch, not anything else. (We still want to treat
             # it as an artifact though so we get proper accounting at
             # the end.)
-            intrinsic_artifacts.append(["_MISSING_PREDICTOR"])
+            intrinsic_artifacts.append("_MISSING_PREDICTOR")
         epoch = _Epoch(epoch_start, epoch_stop - epoch_start,
                        design_row, rerp_info, intrinsic_artifacts)
         spans.append(_DataSpan((event.recspan_id, epoch_start),
@@ -466,7 +467,66 @@ def _epoch_info_and_spans(dataset, rerp_request, eval_env):
 
 def test__epoch_info_and_spans():
     from pyrerp.test_data import mock_dataset
+    ds = mock_dataset(num_recspans=2, hz=250)
+    ds.add_event(0, 0, 1, {"include": True, "a": 1})
+    ds.add_event(0, 10, 11, {"include": True, "a": 2})
+    ds.add_event(0, 20, 21, {"include": False, "a": 3})
+    ds.add_event(0, 30, 31, {"a": 4}) # include unspecified
+    ds.add_event(1, 40, 41, {"include": True, "a": None}) # missing predictor
+    ds.add_event(1, 50, 51, {"include": True, "a": 6})
 
+    req = rERPRequest("include", -10, 10, formula="a")
+    rerp_info, spans = _epoch_info_and_spans(ds, req)
+    # [-10 ms, 10 ms] -> [-8 ms, 8 ms] -> [-2 tick, 2 tick] -> [-2 tick, 3 tick)
+    assert rerp_info["start_tick"] == -2
+    assert rerp_info["stop_tick"] == 3
+    assert rerp_info["total_epochs"] == 4
+    assert [s.start for s in spans] == [
+        (0, 0 - 2), (0, 10 - 2), (1, 40 - 2), (1, 50 - 2),
+        ]
+    assert [s.stop for s in spans] == [
+        (0, 0 + 3), (0, 10 + 3), (1, 40 + 3), (1, 50 + 3),
+        ]
+    assert [s.artifact for s in spans] == [None] * 4
+    assert [s.epoch.start_tick for s in spans] == [
+        0 - 2, 10 - 2, 40 - 2, 50 - 2,
+        ]
+    assert [s.epoch.ticks for s in spans] == [5] * 4
+    for span in spans:
+        assert span.epoch.rerp_info is rerp_info
+    from numpy.testing import assert_array_equal
+    assert_array_equal(spans[0].epoch.design_row, [1, 1])
+    assert_array_equal(spans[1].epoch.design_row, [1, 2])
+    assert spans[2].epoch.design_row is None
+    assert_array_equal(spans[3].epoch.design_row, [1, 6])
+    assert [s.epoch.intrinsic_artifacts for s in spans] == [
+        [], [], ["_MISSING_PREDICTOR"], [],
+        ]
+
+    # Check that rounding works right. Recall that our test dataset is 250
+    # Hz.
+    for times, exp_ticks in [[(-10, 10), (-2, 3)],
+                             [(-11.99, 11.99), (-2, 3)],
+                             [(-12, 12), (-3, 4)],
+                             [(-20, 20), (-5, 6)],
+                             [(18, 22), (5, 6)],
+                             [(20, 20), (5, 6)],
+                             ]:
+        req = rERPRequest("include", times[0], times[1], formula="a")
+        rerp_info, _ = _epoch_info_and_spans(ds, req)
+        assert rerp_info["start_tick"] == exp_ticks[0]
+        assert rerp_info["stop_tick"] == exp_ticks[1]
+
+    # No samples -> error
+    from nose.tools import assert_raises
+    req_tiny = rERPRequest("include", 1, 3, formula="a")
+    assert_raises(ValueError, _epoch_info_and_spans, ds, req_tiny)
+    # But the same req it's fine with a higher-res data set
+    ds_high_hz = mock_dataset(hz=1000)
+    ds_high_hz.add_event(0, 0, 1, {"include": True, "a": 1})
+    rerp_info, _ = _epoch_info_and_spans(ds_high_hz, req_tiny)
+    assert rerp_info["start_tick"] == 1
+    assert rerp_info["stop_tick"] == 4
 
 def _epoch_spans(dataset, rerp_requests, eval_env):
     rerp_infos = []
