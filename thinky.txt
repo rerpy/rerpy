@@ -1,6 +1,6 @@
 todo:
-- get DataSet into shape
-- and kutaslab loader
+- get DataSet into shape (DONE)
+- and kutaslab loader (DONE)
 - then adjust rerp to match
   - mock DataSet for tests
   - new return type
@@ -13,12 +13,6 @@ and then can find any block in constant time. or scan on demand even.
      scrolling will be fast (or wait until we need scrolling)
 still have a DataSource, but now it just has __getitem__
 
-new plan: operation F it
-  still have an iteration interface to DataSets but
-    for now store the arrays in memory
-    apply transforms immediately
-    leave full sensor metadata for later
-
 need a way to save DataSets
   either with or without data
   without data: ask each Recording for an object that when unpickled
@@ -26,15 +20,9 @@ need a way to save DataSets
   with data: for each recording dump the data out and use a special
     InOurProprietaryDataFormatRecording
 
-not sure the recording/dataset divide is really making sense
-maybe we should have recspan metadata, and have recspans directly in
-datasets (possibly with a hidden on-demand loader layer)
-and have datasets
-and make span metadata available via events (because every event is in
-exactly one span so not so hard) for both search and formulas
 
 
-two levels of metadata:
+two levels of metadata on sensors/channels:
   sensor info: position, type, maybe intrinsic units (or implied by
     type)
   channel info:
@@ -43,8 +31,28 @@ two levels of metadata:
       ref'ed (e.g. EEG): one privileged sensor whose name we share,
        plus some linear transformation of other sensor values
       arbitrary linear function: ICA components
+    transformations should alter this stuff -- need some way to say
+    that channels are changing when calling .transform I guess?
 
-dataset itself just gives id to each recspan
+
+it would be nice to support fancy "nearby" type queries, like cdbl and
+Binlister[1]
+[1] http://erpinfo.org/erplab/erplab-documentation/manual/Binlister.html
+they can't *directly* replace what cdbl does, because to do that we
+would need access to this kind of information in both the query and
+the formula, and it's hard to imagine how to extend the formula stuff
+to write these kinds of expressions directly in it.
+but there should be some nice way to at least find the events so you
+can add attributes to them
+p.previous_matches(<query>, ignore=<query>, limit=(min_ms, max_ms))
+p.next_matches(<query>, ignore=<query>, limit=(min_ms, max_ms))
+meaning: the immediately previous/next event (ignoring the ones in
+ignore) must match <query>, and occur within the time limits (if
+given). (need to put ms into events, but that's no problem. could add
+start_time field next to start_tick etc. for querying.)
+then these of course could be embedded, inverted, etc.
+for the string syntax... probably need to add function call syntax for
+this to be reasonable. at least , doesn't mean anything else for us.
 
 
 if we ever want to support recordings that are aligned but without a
@@ -85,25 +93,6 @@ formats:
 
   Channel location files (with samples!):
     http://sccn.ucsd.edu/eeglab/channellocation.html
-
-pandas memory overhead:
-created some pickle files containing a full multiindex+colnames data
-set, the same as a raw ndarray, and the same with colname
-only. Loaded the pickle files one at time into a new python process
-and checked RSS in top:
-  python -c 'import cPickle; import resource; d = cPickle.load(open("df-colnames-only.pickle", "rb")); import time; time.sleep(100)'
-results:
-  ndarray: 253 megabytes
-  colnames: 265 megabytes
-  multiindex: 416 megabytes
-    with pandas 0.8: 296. Okay, that's more like it.
-df is 981504 x 32. So the theoretical cost for row indexes is:
-  32 bit integer: 3.7 MiB
-  64 bit integer: 7.5 MiB
-no idea what time index to use in pandas... floats *sort* of work --
-stored as objects, if __getitem__ a Series with a float span then it does
-pick out everything in that range. But it will try converting floats
-to ints for example if the floats are integers.
 
 
 qt plotting

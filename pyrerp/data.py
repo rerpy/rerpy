@@ -23,6 +23,8 @@ from pyrerp.rerp import multi_rerp_impl
 # http://sccn.ucsd.edu/eeglab/channellocation.html
 # kutaslab: topo.1, topofiles.5 (this latter has the actual data embedded in it)
 # spherical griddata (use s=0): http://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.RectSphereBivariateSpline.html
+# some MEG sensors:
+#   https://wiki.umd.edu/meglab/images/6/61/KIT_sensor_pos.txt
 class SensorInfo(object):
     def __init__(self):
         pass
@@ -315,12 +317,12 @@ class DataSet(object):
                                     "%r, which does not match new value %r"
                                     % (df_key, current_value, row[df_key]))
 
-def mock_dataset(num_channels=4, num_recspans=4):
+def mock_dataset(num_channels=4, num_recspans=4, ticks_per_recspan=100):
     data_format = DataFormat(250, "uV",
                              ["MOCK%s" % (i,) for i in xrange(num_channels)])
     dataset = DataSet(data_format)
     r = np.random.RandomState(0)
     for i in xrange(num_recspans):
-        data = r.normal(size=(100, num_channels))
+        data = r.normal(size=(ticks_per_recspan, num_channels))
         dataset.add_recspan(data, {})
     return dataset
