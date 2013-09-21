@@ -11,7 +11,7 @@ before_install:
   - echo Preinstalled
   - pip freeze
   - sudo apt-get install -qq python-scipy python-pandas
-  - pip install coverage pandas patsy cython
+  - pip install --use-mirrors coverage patsy cython
   - echo Final installation
   - pip freeze
   - which nosetests
@@ -34,3 +34,5 @@ script:
 notifications:
   email:
     - njs@pobox.com
+after_success:
+  - pip install --use-mirrors coveralls && coveralls
