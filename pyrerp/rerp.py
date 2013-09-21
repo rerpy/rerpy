@@ -20,10 +20,11 @@ from pyrerp.parimap import parimap_unordered
 # Public interface
 ################################################################
 
-# XX FIXME: add (and implement) bad_event_query and all_or_nothing arguments
+# XX FIXME: add (and implement) bad_event_query argument using Event.matches
 class rERPRequest(object):
     def __init__(self, event_query, start_time, stop_time,
-                 formula="~ 1", name=None, eval_env=0):
+                 formula="~ 1", name=None, eval_env=0,
+                 all_or_nothing=False):
         if name is None:
             name = "%s: %s" % (event_query, formula)
         if stop_time < start_time:
@@ -35,6 +36,7 @@ class rERPRequest(object):
         self.formula = formula
         self.name = name
         self.eval_env = EvalEnvironment.capture(eval_env, reference=1)
+        self.all_or_nothing = all_or_nothing
 
     __repr__ = repr_pretty_delegate
     def _repr_pretty_(self, p, cycle):
@@ -132,25 +134,39 @@ def multi_rerp_impl(dataset, rerp_requests,
                     overlap_correction, regression_strategy):
     _check_unique_names(rerp_requests)
 
-    # A bunch of _DataSpan objects representing all relevant artifacts and
-    # epochs.
+    # First, we find where all the artifacts and desired epochs are, and
+    # represent each of them by a _DataSpan object in this list:
     spans = []
     # Get artifacts.
     spans.extend(_artifact_spans(dataset, artifact_query, artifact_type_field))
-    # And get the events, and calculate the associated epochs (and any
-    # associated artifacts).
-    epoch_span_info = _epoch_spans(dataset, rerp_requests)
-    (rerp_infos, epoch_spans,
-     design_width, expanded_design_width) = epoch_span_info
-    spans.extend(epoch_spans)
-    del epoch_spans, epoch_span_info
+    # And get the events, and build the associated epoch objects.
+    rerp_infos = []
+    for rerp_request in rerp_requests:
+        rerp_info, epoch_spans = _epoch_info_and_spans(dataset, rerp_request)
+        rerp_infos.append(rerp_info)
+        spans.extend(epoch_spans)
+
+    # Work out the size of the full design matrices, and fill in the offset
+    # fields in rerp_infos. NB: modifies rerp_infos.
+    (by_epoch_design_width,
+     continuous_design_width) = _layout_design_matrices(rerp_infos)
 
     # Now we have a list of all interesting events, and where they occur, but
-    # it's organized so that for each event we can see where in the data it
-    # happened. What we need is for each (interesting) position in the data,
-    # to be see all events that are happening then. _epoch_subspans pulls out
-    # subspans of the epoch spans, and annotates each with the epochs and
-    # artifacts that apply to it.
+    # it's organized by event: for each event, we know where it happend. Now
+    # we need to flip that around, and organize it by position: for each
+    # interesting position in the data, what events are relevant?
+    # _epoch_subspans takes our spans and produces a sequence of subspans such
+    # that (a) over all points within a single subspan, the same epochs and
+    # artifacts are "live", and (b) gives us each of these subspans along with
+    # the epochs and artifacts that apply to each. (If you know some
+    # algorithms theory, this is equivalent to a "segment tree", but we don't
+    # actually build the tree, we just iterate over the leaves -- the
+    # canonical subsets.)
+
+    _propagate_all_or_nothing(spans, overlap_correction)
+
+    # XX in accounting, need special rule: if any artifacts *except*
+    # _ALL_OR_NOTHING are in effect, then ignore _ALL_OR_NOTHING.
 
     epochs_with_data = set()
     epochs_with_artifacts = set()
@@ -267,7 +283,8 @@ def _artifact_spans(dataset, artifact_query, artifact_type_field):
 def test__artifact_spans():
     from pyrerp.test_data import mock_dataset
     ds = mock_dataset(num_recspans=2, ticks_per_recspan=30)
-    ds.add_event(0, 5, 10, {"_ARTIFACT_TYPE": "just-bad"})
+    ds.add_event(0, 5, 10, {"_ARTIFACT_TYPE": "just-bad",
+                            "number": 1, "string": "a"})
     ds.add_event(1, 15, 20, {"_ARTIFACT_TYPE": "even-worse"})
     ds.add_event(1, 10, 20, {"not-an-artifact": "nope"})
 
@@ -280,6 +297,20 @@ def test__artifact_spans():
             _DataSpan((0, 5), (0, 10), None, "just-bad"),
             _DataSpan((1, 15), (1, 20), None, "even-worse"),
             ])
+
+    spans = list(_artifact_spans(ds, "has _ARTIFACT_TYPE", "string"))
+    assert sorted(spans) == sorted([
+            _DataSpan((0, -2**31), (0, 0), None, "_NO_RECORDING"),
+            _DataSpan((0, 30), (0, 2**31), None, "_NO_RECORDING"),
+            _DataSpan((1, -2**31), (1, 0), None, "_NO_RECORDING"),
+            _DataSpan((1, 30), (1, 2**31), None, "_NO_RECORDING"),
+            _DataSpan((0, 5), (0, 10), None, "a"),
+            _DataSpan((1, 15), (1, 20), None, "_UNKNOWN"),
+            ])
+
+    from nose.tools import assert_raises
+    assert_raises(TypeError,
+                  list, _artifact_spans, ds, "has _ARTIFACT_TYPE", "number")
 
 # A patsy "factor" that just returns arange(n); we use this as the LHS of our
 # formula.
@@ -403,6 +434,10 @@ def test__rerp_design():
                         [1, 0, 1, 40, 4]])
     assert_array_equal(design_row_idxes, [-1, -1, 0, -1, 1])
 
+    # LHS not allowed
+    from nose.tools import assert_raises
+    assert_raises(ValueError, _rerp_design, "a ~ b", ds.events(), eval_env)
+
 def _epoch_info_and_spans(dataset, rerp_request):
     spans = []
     data_format = dataset.data_format
@@ -434,8 +469,8 @@ def _epoch_info_and_spans(dataset, rerp_request):
         "stop_tick": stop_tick,
         "total_epochs": len(events),
         # Filled in later
-        "design_offset": None,
-        "expanded_design_offset": None,
+        "by_epoch_design_offset": None,
+        "continuous_design_offset": None,
         # XX something about counting epochs with no/partial/all rejections,
         # and also by data point
         }
@@ -528,105 +563,74 @@ def test__epoch_info_and_spans():
     assert rerp_info["start_tick"] == 1
     assert rerp_info["stop_tick"] == 4
 
-def _epoch_spans(dataset, rerp_requests, eval_env):
-    rerp_infos = []
-    spans = []
-    design_offset = 0
-    expanded_design_offset = 0
-    data_format = dataset.data_format
-    for rerp_idx, rerp_request in enumerate(rerp_requests):
-        start_tick = data_format.ms_to_samples(rerp_request.start_time)
-        # Offsets are half open: [start, stop)
-        # But, it's more intuitive for times to be closed: [start, stop]
-        # So we interpret the user times as a closed interval, and add 1
-        # sample when converting to offsets.
-        stop_tick = 1 + data_format.ms_to_samples(rerp_request.stop_time)
-        if start_tick >= stop_tick:
-            raise ValueError("Epochs must be >1 sample long!")
-        events = dataset.events(rerp_request.event_query)
-        design, design_row_idxes = _rerp_design(rerp_request.formula,
-                                                events, eval_env)
-        # design_row_idxes[i] is -1 if event i was thrown out, and otherwise
-        # gives the row in 'design' which refers to event 'i'.
-        for i in xrange(len(events)):
-            event = events[i]
-            # -1 for non-existent
-            design_row_idx = design_row_idxes[i]
-            recspan = (event.recording, event.span_id)
-            recspan_intern = recspan_intern_table[recspan]
-            epoch_start = start_tick + event.start_tick
-            epoch_stop = stop_tick + event.start_tick
-            if design_row_idx == -1:
-                design_row = None
-            else:
-                design_row = design[design_row_idx, :]
-            epoch = _Epoch(epoch_start, epoch_stop - epoch_start,
-                           design_row, rerp_info, [])
-            if design_row is None:
-                # Event thrown out due to missing predictors; this
-                # makes its whole epoch into an artifact -- but if overlap
-                # correction is disabled, then this artifact only affects
-                # this epoch, not anything else. (We still want to treat
-                # it as an artifact though so we get proper accounting at
-                # the end.)
-                epoch.intrinsic_artifacts.append("_MISSING_PREDICTOR")
-            spans.append(_DataSpan((recspan_intern, epoch_start),
-                                   (recspan_intern, epoch_stop),
-                                   epoch,
-                                   None))
-        rerp_info = {
-            "spec": rerp_request,
-            "design_info": design.design_info,
-            "start_tick": start_tick,
-            "stop_tick": stop_tick,
-            "design_offset": design_offset,
-            "expanded_design_offset": expanded_design_offset,
-            "total_epochs": len(events),
-            "epochs_with_data": 0,
-            "epochs_with_artifacts": 0,
-            }
-        rerp_infos.append(rerp_info)
-        design_offset += design.shape[1]
-        epoch_samples = stop_tick - start_tick
-        expanded_design_offset += epoch_samples * design.shape[1]
+# Work out the size of the full design matrices, and fill in the offset fields
+# in rerp_infos
+def _layout_design_matrices(rerp_infos):
+    by_epoch_design_width = 0
+    continuous_design_width = 0
+    for rerp_info in rerp_infos:
+        # However many columns have been seen so far, that's the offset of
+        # this rerp's design columns within the larger design matrix
+        rerp_info["by_epoch_design_offset"] = by_epoch_design_width
+        rerp_info["continuous_design_offset"] = continuous_design_width
+        # Now figure out how many columns it takes up
+        ticks = rerp_info["stop_tick"] - rerp_info["start_tick"]
+        this_design_width = len(rerp_info["design_info"].column_names)
+        by_epoch_design_width += this_design_width
+        continuous_design_width += this_design_width * ticks
+    return by_epoch_design_width, continuous_design_width
 
-    return rerp_infos, spans, design_offset, expanded_design_offset
+def test__layout_design_matrices():
+    from patsy import DesignInfo
+    fake_rerp_infos = [
+        {"start_tick": -2,
+         "stop_tick": 8,
+         "design_info": DesignInfo.from_array(np.ones((1, 3))),
+         },
+        {"start_tick": 10,
+         "stop_tick": 20,
+         "design_info": DesignInfo.from_array(np.ones((1, 5))),
+         },
+        ]
+    (by_epoch_design_width,
+     continuous_design_width) = _layout_design_matrices(fake_rerp_infos)
+    assert fake_rerp_infos[0]["by_epoch_design_offset"] == 0
+    assert fake_rerp_infos[0]["continuous_design_offset"] == 0
+    assert fake_rerp_infos[1]["by_epoch_design_offset"] == 3
+    assert fake_rerp_infos[1]["continuous_design_offset"] == 3 * 10
+    assert by_epoch_design_width == 3 + 5
+    assert continuous_design_width == 3 * 10 + 5 * 10
 
-################################################################
-# These span handling functions are rather confusing at first glance.
+# _epoch_subspans theory of operation:
 #
-# General theory of operation:
+# To generate the "canonical subspans", we convert our span-based
+# representation ("at positions n1-n2, this epoch/artifact applies") into an
+# event-based representation ("at position n1, this epoch/artifact starts
+# applying", "at position n2, this epoch/artifact stops applying"). Then we
+# can easily sort these events (a cheap O(n log n) operation), and iterate
+# through them in O(n) time. Each event in the sorted events marks the edge of
+# one subspan, as the set of epochs/artifacts changes at each moment.
 #
-# We have a list of when each artifact starts and stops, and when each
-# analysis epoch starts and stops.
+# Subtlety that applies when overlap_correction=False: In this mode, then we
+# want to act as if each epoch gets its own copy of the data. This function
+# takes care of that -- if two epochs overlap, then it will generate two
+# subspan objects that refer to the same portion of the data, and each will
+# say that only one of the epochs applies. So effectively each subspan
+# represents a private copy of that bit of data.
 #
-# We want to know:
-# 1) Which spans of data are viable for analysis, and which events are live in
-#    each? (This lets us construct the regression design matrix.)
-# 2) Which spans of data do we want to analyze, but can't because of
-#    artifacts? And which artifacts? (This lets us keep track of which
-#    artifacts are making us throw out data.)
-# 3) Are there any epochs in which some-but-not-all points are viable for
-#    analysis? (This is needed to know whether the by-epoch regression
-#    strategy is possible.)
-# 4) If overlap_correction=True, are there any epochs that do in fact overlap?
-#    (This is needed to know whether the by-epoch regression
-#    strategy is possible.)
-#
-# Annoying wrinkles that apply when overlap_correction=False:
-# In this mode, then each epoch effectively gets its own copy of the
-# data. Also, in this mode, most artifacts are shared across this virtual
-# copies, but there are some "artifacts" that are specific to a particular
-# epoch (specifically, those that have something to do with the event itself,
-# such as missing data).
-#
-# Our strategy:
-# Convert our input span-based representation into an event-based
-# representation, where an event is "such-and-such starts happening at
-# position p" or "such-and-such stops happening at position p". Then, we can
-# scan all such events from left to right, and incrementally generate a
-# representation of *all* epochs/artifacts are happening at each position.
-
+# Second subtlety around overlap_correction=False: the difference between a
+# regular artifact (as generated by _artifact_spans) and an "intrinsic"
+# artifact (as noted in an epoch objects's .intrinsic_artifacts field) is that
+# a regular artifact is considered to be a property of the *data*, and so in
+# overlap_correction=False mode, when we make a "virtual copy" of the data for
+# each epoch, these artifacts get carried along to all of the copies and
+# effect all of the artifacts. An "intrinsic" artifact, by contrast, is
+# considered to be a property of the epoch, and so it applies to that epoch's
+# copy of the data, but not to any other possibly overlapping epochs. Of
+# course, in overlap_correction=True mode, there is only one copy of the data,
+# so both types of artifacts must be treated the same. This function also
+# takes care of setting the artifact field of returned subspans appropriately
+# in each case.
 def _epoch_subspans(spans, overlap_correction):
     state_changes = []
     for span in spans:
@@ -637,7 +641,7 @@ def _epoch_subspans(spans, overlap_correction):
     last_position = None
     current_epochs = {}
     current_artifacts = {}
-    for position, epoch, artifact, change in state_changes:
+    for position, state_epoch, state_artifact, change in state_changes:
         if (last_position is not None
             and position != last_position
             and current_epochs):
@@ -646,24 +650,152 @@ def _epoch_subspans(spans, overlap_correction):
                 for epoch in current_epochs:
                     effective_artifacts.update(epoch.intrinsic_artifacts)
                 yield _DataSubSpan(last_position, position,
-                                   tuple(current_epochs),
-                                   tuple(effective_artifacts))
+                                   set(current_epochs),
+                                   effective_artifacts)
             else:
-                for epoch in current_epochs:
+                # Sort epochs to ensure determinism for testing
+                for epoch in sorted(current_epochs,
+                                    key=lambda e: e.start_tick):
                     effective_artifacts = set(current_artifacts)
                     effective_artifacts.update(epoch.intrinsic_artifacts)
                     yield _DataSubSpan(last_position, position,
-                                       (epoch,),
-                                       tuple(effective_artifacts))
-        for (state, state_dict) in [(epoch, current_epochs),
-                                    (artifact, current_artifacts)]:
-            if change == +1 and state not in state_dict:
-                state_dict[state] = 0
-            state_dict[state] += change
-            if change == -1 and state_dict[state] == 0:
-                del state_dict[state]
+                                       set([epoch]),
+                                       effective_artifacts)
+        for (state, state_dict) in [(state_epoch, current_epochs),
+                                    (state_artifact, current_artifacts)]:
+            if state is not None:
+                if change == +1 and state not in state_dict:
+                    state_dict[state] = 0
+                state_dict[state] += change
+                if change == -1 and state_dict[state] == 0:
+                    del state_dict[state]
         last_position = position
     assert current_epochs == current_artifacts == {}
+
+def test__epoch_subspans():
+    def e(start_tick, intrinsic_artifacts=[]):
+        return _Epoch(start_tick, None, None, {}, intrinsic_artifacts)
+    e0, e1, e2 = [e(i) for i in xrange(3)]
+    e_ia0 = e(10, intrinsic_artifacts=["ia0"])
+    e_ia0_ia1 = e(11, intrinsic_artifacts=["ia0", "ia1"])
+    s = _DataSpan
+    def t(spans, overlap_correction, expected):
+        got = list(_epoch_subspans(spans, overlap_correction))
+        # This is a verbose way of writing 'assert got == expected' (but
+        # if there's a problem it locates it for debugging, instead of just
+        # saying 'probably somewhere')
+        assert len(got) == len(expected)
+        for i in xrange(len(got)):
+            got_subspan = got[i]
+            expected_subspan = expected[i]
+            assert got_subspan == expected_subspan
+    t([s(-5, 10, e0, None),
+       s( 0, 15, e1, None),
+       s( 5, 10, None, "a1"),
+       s(12, 20, e_ia0, None),
+       ],
+      True,
+      [(-5,  0, {e0}, set()),
+       ( 0,  5, {e0, e1}, set()),
+       ( 5, 10, {e0, e1}, {"a1"}),
+       (10, 12, {e1}, set()),
+       (12, 15, {e1, e_ia0}, {"ia0"}),
+       (15, 20, {e_ia0}, {"ia0"}),
+       ])
+    t([s(-5, 10, e0, None),
+       s( 0, 15, e1, None),
+       s( 5, 10, None, "a1"),
+       s(12, 20, e_ia0, None),
+       ],
+      False,
+      [(-5,  0, {e0}, set()),
+       ( 0,  5, {e0}, set()),
+       ( 0,  5, {e1}, set()),
+       ( 5, 10, {e0}, {"a1"}),
+       ( 5, 10, {e1}, {"a1"}),
+       (10, 12, {e1}, set()),
+       (12, 15, {e1}, set()),
+       (12, 15, {e_ia0}, {"ia0"}),
+       (15, 20, {e_ia0}, {"ia0"}),
+       ])
+
+def _propagate_all_or_nothing(spans, overlap_correction):
+    # we need to find all epochs that have some artifact on them and
+    # all_or_nothing requested, and mark the entire epoch as bad. and then we
+    # need to apply this rule recursively in case we've just marked any epochs
+    # that overlap with epochs that have all_or_nothing requested, etc.
+    # Both of these data structures will contain only epochs that have
+    # all_or_nothing requested.
+    overlap_graph = {}
+    epochs_needing_artifact = set()
+    for _, _, epochs, artifacts in _epoch_subspans(spans, overlap_correction):
+        relevant_epochs = [epoch for epoch in epochs
+                           if epoch.rerp_info["request"].all_or_nothing]
+        for epoch_a in relevant_epochs:
+            for epoch_b in relevant_epochs:
+                if epoch_a is not epoch_b:
+                    overlap_graph.setdefault(epoch_a, set()).add(epoch_b)
+        if artifacts:
+            for epoch in relevant_epochs:
+                if not epoch.intrinsic_artifacts:
+                    epochs_needing_artifact.add(epoch)
+    while epochs_needing_artifact:
+        epoch = epochs_needing_artifact.pop()
+        assert not epoch.intrinsic_artifacts
+        epoch.intrinsic_artifacts.append("_ALL_OR_NOTHING")
+        for overlapped_epoch in overlap_graph.get(epoch, []):
+            if not overlapped_epoch.intrinsic_artifacts:
+                epochs_needing_artifact.add(overlapped_epoch)
+
+def test__propagate_all_or_nothing():
+    # convenience function for making mock epoch spans
+    def e(start, stop, all_or_nothing, expected_survival,
+          starts_with_intrinsic=False):
+        req = rERPRequest("asdf", -100, 1000, all_or_nothing=all_or_nothing)
+        i_a = []
+        if starts_with_intrinsic:
+            i_a.add("_BORN_BAD")
+        epoch = _Epoch(None, None, None, {"request": req}, i_a)
+        epoch.expected_survival = expected_survival
+        return _DataSpan(start, stop, epoch, None)
+    # convenience function for making mock artifact spans
+    def a(start, stop):
+        return _DataSpan(start, stop, None, "_MOCK_ARTIFACT")
+    def t(overlap_correction, spans):
+        _propagate_all_or_nothing(spans, overlap_correction)
+        for _, _, epoch, _ in spans:
+            if epoch is not None:
+                survived = "_ALL_OR_NOTHING" not in epoch.intrinsic_artifacts
+                assert epoch.expected_survival == survived
+    # One artifact at the beginning can knock out a whole string of
+    # all_or_nothing epochs
+    t(True, [e(0, 100, True, False),
+             e(50, 200, True, False),
+             e(150, 300, True, False),
+             e(250, 400, True, False),
+             a(10, 11)])
+    # Also true if the artifact appears at the end
+    t(True, [e(0, 100, True, False),
+             e(50, 200, True, False),
+             e(150, 300, True, False),
+             e(250, 400, True, False),
+             a(350, 360)])
+    # But if overlap correction turned off, then epochs directly overlapping
+    # artifacts get hit, but it doesn't spread
+    t(False, [e(0, 100, True, False),
+              e(50, 200, True, True),
+              e(150, 300, True, True),
+              e(250, 400, True, False),
+              a(10, 11),
+              a(300, 301)])
+    # Epochs with all_or_nothing=False break the chain -- even if they have
+    # artifacts on them directly
+    t(True, [e(0, 100, True, False),
+             e(50, 200, True, False),
+             e(150, 300, False, True),
+             e(250, 400, True, True),
+             a(10, 11),
+             a(200, 210)])
 
 def _count_artifacts(counts, num_points, artifacts):
     for artifact in artifacts:
