@@ -403,7 +403,12 @@ class Events(object):
         """subset can be {"a": 1, "b": 2} or a Query or a string or a bool
         or None to mean "all"
         """
-        if isinstance(subset, dict):
+        if isinstance(subset, Query):
+            if subset._events is not self:
+                raise ValueError("query object does not refer to this Events "
+                                 "object")
+            return subset
+        elif isinstance(subset, dict):
             p = self.placeholder_event()
             query = LiteralQuery(self, True)
             equalities = []
@@ -412,21 +417,16 @@ class Events(object):
                 query &= (q == subset.pop(query_name))
             for k, v in subset.iteritems():
                 query &= (p[k] == v)
+            return query
         elif isinstance(subset, basestring):
-            query = _query_from_string(self, subset)
+            return _query_from_string(self, subset)
         elif isinstance(subset, bool):
-            query = LiteralQuery(self, subset)
+            return LiteralQuery(self, subset)
         elif subset is None:
-            query = LiteralQuery(self, True)
+            return LiteralQuery(self, True)
         else:
-            query = subset
-
-        if not isinstance(query, Query):
-            raise ValueError, "expected a query object, not %r" % (query,)
-        if query._events is not self:
-            raise ValueError("query object does not refer to this Events "
-                             "object")
-        return query
+            raise ValueError("I don't know how to interpret %r as an event "
+                             "query" % (subset,))
 
     def _query(self, sql_where, query_tables, query_vals):
         tables = set(["sys_events"])
