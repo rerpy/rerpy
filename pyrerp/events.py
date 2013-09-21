@@ -613,6 +613,14 @@ class Event(_Obj):
                     and self.start_tick < stop_tick
                     and start_tick < self.stop_tick)
 
+    def matches(self, query):
+        # To find out whether this event is matched by the given query, we
+        # constrain the query to return only this event, and then see if it
+        # returns any events.
+        query = self._events.events_query(query)
+        query &= (IndexFieldQuery(self._events, "id") == self._obj_id)
+        return bool(len(query))
+
     def relative(self, count, subset=None):
         """Counts 'count' events forward or back from the current event (or
         optionally, only events that match 'subset'), and returns that. Use
@@ -714,6 +722,10 @@ class PlaceholderEvent(_PlaceholderObj):
             (recspan_id, start_tick, stop_tick) = args
             return OverlapsQuery(self._events,
                                  recspan_id, start_tick, stop_tick)
+
+    def matches(self, query):
+        # Not terribly useful but included for completeness.
+        return self._events.events_query(query)
 
 class PlaceholderRecspanInfo(_PlaceholderObj):
     def __init__(self, events):

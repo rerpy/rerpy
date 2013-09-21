@@ -480,3 +480,16 @@ def test_None_types():
     assert dict(e1) == {"bool": None, "num": None, "blob": None}
     assert dict(e2) == {"bool": True, "num": 15, "blob": "asdf"}
     assert dict(e3) == {"bool": None, "num": None, "blob": None}
+
+def test_matches():
+    e = Events()
+    e.add_recspan_info(0, 100, {})
+    e1 = e.add_event(0, 10, 11, {"a": 1, "b": "hi"})
+    e2 = e.add_event(0, 20, 21, {"a": 2, "b": "hi"})
+    assert e1.matches("a == 1")
+    assert not e1.matches("a == 2")
+    assert e2.matches("a == 2")
+    assert not e2.matches("a == 1")
+
+    p = e.placeholder_event()
+    assert list(p.matches("a == 1")) == [e1]
