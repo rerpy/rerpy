@@ -2,44 +2,58 @@
 # Copyright (C) 2012 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
-import pandas
+import os.path
+import functools
+import types
+
+from urlparse import urlparse
 
 def maybe_open(file_like, mode="rb"):
     # FIXME: have more formal checking of binary/text, given how important
     # that is in py3?
+    # FIXME: handle URLs? not sure how useful that would be given how huge
+    # data files are though.
     if isinstance(file_like, basestring):
         return open(file_like, mode)
     else:
         return file_like
 
-# For working on homogenous data frames in place. These are sometimes used
-# over pickle, hence the version number.
-def unpack_pandas(obj):
-    if isinstance(obj, pandas.Series):
-        info = {"type": "Series",
-                "name": obj.name, "index": obj.index}
-    elif isinstance(obj, pandas.DataFrame):
-        info = {"type": "DataFrame",
-                "index": obj.index, "columns": obj.columns}
-    elif isinstance(obj, pandas.PanelData):
-        info = {"type": "PanelData",
-                "items": obj.items, "major_axis": obj.major_axis,
-                "minor_axis": obj.minor_axis,
-                }
-    else:
-        raise ValueError, "don't recognize %s object" % (obj.__class__)
-    return (np.asarray(df), (0, info))
+def memoized_method(meth):
+    attr_name = "_memoized_method_cache_%s" % (meth.__name__,)
+    @functools.wraps(meth)
+    def memoized_wrapper(self, *args):
+        if not hasattr(self, attr_name):
+            setattr(self, attr_name, {})
+        if args not in getattr(self, attr_name):
+            value = meth(self, *args)
+            assert not isinstance(value, types.GeneratorType)
+            getattr(self, attr_name)[args] = value
+        return getattr(self, attr_name)[args]
+    return memoized_wrapper
 
-def pack_pandas(array, metadata):
-    version, info = metadata
-    if version != 0:
-        raise ValueError, "unrecognized dataframe metadata version"
-    obj_type = info.pop("type")
-    if obj_type == "Series":
-        return pandas.Series(array, **info)
-    elif obj_type == "DataFrame":
-        return pandas.DataFrame(array, **info)
-    elif obj_type == "PanelData":
-        return pandas.PanelData(array, **info)
-    else:
-        raise ValueError, "invalid pandas metadata"
+class _MemoizedTest(object):
+    def __init__(self):
+        self.x = 1
+
+    @memoized_method
+    def return_x(self):
+        return self.x
+
+    @memoized_method
+    def multiply_by_x(self, y):
+        return y * self.x
+
+def test_memoized_method():
+    t = _MemoizedTest()
+    assert t.return_x() == 1
+    assert t.multiply_by_x(3) == 3
+    t.x = 2
+    assert t.return_x() == 1
+    assert t.multiply_by_x(3) == 3
+    t2 = _MemoizedTest()
+    t2.x = 2
+    assert t2.return_x() == 2
+    assert t2.multiply_by_x(3) == 6
+    t2.x = 1
+    assert t2.return_x() == 2
+    assert t2.multiply_by_x(3) == 6

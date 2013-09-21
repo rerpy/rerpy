@@ -35,6 +35,8 @@ from patsy import PatsyError, Origin
 from patsy.infix_parser import Token, Operator, infix_parse
 from patsy.util import repr_pretty_delegate
 
+from pyrerp.util import memoized_method
+
 __all__ = ["Events", "EventsError"]
 
 class EventsError(PatsyError):
@@ -843,6 +845,7 @@ class AttrQuery(Query):
         return HasKeyQuery(self._events, self._objtype,
                            self._key, self.origin)
 
+    @memoized_method
     def _sql_where(self):
         table_id = self._objtype.table_name(self._key)
         return SqlWhere(table_id + ".value",
@@ -867,6 +870,7 @@ class HasKeyQuery(Query):
         # table by itself is a total no-op at the semantic level, so whatever.
         self._events._ensure_table_for_key(objtype, self._key)
 
+    @memoized_method
     def _sql_where(self):
         table = self._objtype.table_name(self._key)
         return SqlWhere("EXISTS (SELECT 1 FROM %s inner_table "
@@ -907,6 +911,7 @@ class OverlapsQuery(Query):
         self._start_tick = start_tick
         self._stop_tick = stop_tick
 
+    @memoized_method
     def _sql_where(self):
         args = []
         possibilities = []
@@ -939,6 +944,7 @@ class QueryOperator(Query):
         assert 1 <= len(children) <= 2
         self._children = children
 
+    @memoized_method
     def _sql_where(self):
         lhs_sqlwhere = self._children[0]._sql_where()
         if len(self._children) == 1:

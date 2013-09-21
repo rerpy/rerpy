@@ -12,7 +12,6 @@ import numpy as np
 import pandas
 from patsy import DesignInfo
 
-from pyrerp.util import unpack_pandas, pack_pandas
 import pyrerp.events
 from pyrerp.rerp import multi_rerp_impl
 
