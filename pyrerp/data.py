@@ -69,7 +69,7 @@ class DataFormat(object):
         return int(tick)
 
     def ticks_to_ms(self, ticks):
-        return ticks * 1000.0 / self.exact_sample_rate_hz
+        return np.asarray(ticks) * 1000.0 / self.exact_sample_rate_hz
 
     def compute_symbolic_transform(self, expression, exclude=[]):
         # This converts symbolic expressions like "-A1/2" into
@@ -111,6 +111,8 @@ def test_DataFormat():
 
     assert df.ms_to_ticks(1000) == 1024
     assert df.ticks_to_ms(1024) == 1000
+
+    assert np.array_equal(df.ticks_to_ms([512, 1024]), [500.0, 1000.0])
 
     assert df.ms_to_ticks(1000.1) == 1024
     assert df.ms_to_ticks(1000.9) == 1025
@@ -236,6 +238,7 @@ class DataSet(object):
         return pandas.DataFrame(data,
                                 columns=self.data_format.channel_names,
                                 index=index)
+
 
     def __iter__(self):
         for i in xrange(len(self)):
