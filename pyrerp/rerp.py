@@ -15,6 +15,7 @@ from patsy.util import repr_pretty_delegate, repr_pretty_impl
 
 from pyrerp.incremental_ls import XtXIncrementalLS
 from pyrerp.parimap import parimap_unordered
+from pyrerp.util import indent
 
 ################################################################
 # Public interface
@@ -133,6 +134,8 @@ _DataSubSpan = namedtuple("_DataSubSpan",
 def multi_rerp_impl(dataset, rerp_requests,
                     artifact_query, artifact_type_field,
                     overlap_correction, regression_strategy):
+    if not rerp_requests:
+        return []
     _check_unique_names(rerp_requests)
 
     # First, we find where all the artifacts and desired epochs are, and
@@ -170,10 +173,11 @@ def multi_rerp_impl(dataset, rerp_requests,
     accountant = _Accountant(rerps)
     analysis_subspans = []
     for subspan in _epoch_subspans(spans, overlap_correction):
-        accountant.count(subspan)
+        accountant.count(subspan.start[1] - subspan.stop[1],
+                         subspan.epoch, subspan.artifacts)
         if not subspan.artifacts:
             analysis_subspans.append(subspan)
-    accountant.close()
+    accountant.save()
 
     regression_strategy = _choose_strategy(regression_strategy, rerps)
     # Work out the size of the full design matrices, and fill in the offset
@@ -830,55 +834,135 @@ def test__propagate_all_or_nothing():
 
 ################################################################
 
-class ArtifactInfo(object):
+# Epochs:
+#   Requested: xx
+#     Accepted: xx (x%)
+#     Partially accepted: xx (x%)
+#     Rejected: xx (x%)
+# Ticks:
+#   Requested: xx
+#     Accepted: xx (x%)
+#     Rejected: xx (x%)
+#     Rejection causes:
+#       Artifact 1: xx (xx uniquely)
+#       Artifact 2: xx (xx uniquely)
+# Event x ticks:
+#   Requested: xx
+#     Accepted: xx (x%)
+#     Rejected: xx (x%)
+#     Rejection causes:
+#       ...
+# Average events per accepted tick (>1 indicates overlap): 1.xx
+
+def _break_down_rejections(superclass, subclasses):
+    total = np.sum(count for (_, count) in subclasses)
+    result = ("%s:\n" % (superclass,)
+           + "  Requested: %s" % (total,))
+    if total > 0:
+        result += "".join(["    %s: %s (%.1f%%)\n"
+                           % (name, value, value * 100. / total)
+                           for (name, value) in subclasses])
+    return result
+
+class EpochRejectionInfo(object):
     def __init__(self):
-        self.epochs_requested = 0
-        self.epochs_fully_accepted = 0
-        self.epochs_partially_accepted = 0
-        self.epochs_fully_rejected = 0
-        self.ticks_requested = 0
-        self.ticks_accepted = 0
-        self.event_ticks_requested = 0
-        self.event_ticks_accepted = 0
-        self.no_overlap_ticks_requested = 0
-        self.no_overlap_ticks_accepted = 0
+        self.fully_accepted = 0
+        self.partially_accepted = 0
+        self.fully_rejected = 0
+
+    @property
+    def requested(self):
+        return (self.fully_accepted
+                + self.partially_accepted
+                + self.fully_rejected)
+
+    def __repr__(self):
+        return _break_down_rejections(
+            "Epochs", [("Fully accepted", self.fully_accepted),
+                       ("Partially accepted", self.partially_accepted),
+                       ("Fully rejected", self.fully_rejected)])
+    def _repr_pretty_(self, p, cycle):
+        assert not cycle
+        p.text(indent(repr(self), p.indentation, indent_first=False))
+
+class PointRejectionInfo(object):
+    def __init__(self, name):
+        self.name = name
+        self.accepted = 0
+        self.rejected = 0
         self.artifacts = {}
+
+    @property
+    def requested(self):
+        return self.accepted + self.rejected
+
+    def __repr__(self):
+        result = _break_down_rejections(
+            self.name, [("Accepted", self.accepted),
+                        ("Rejected", self.rejected)])
+        if self.artifacts:
+            causes = []
+            for artifact, counts in self.artifacts.items():
+                causes.append("%s: %s (%s uniquely)"
+                              % (artifact,
+                                 counts["affected"],
+                                 counts["unique"]))
+            result += "\n"
+            result += indent("\n".join(causes), 6)
+        return result
+    def _repr_pretty_(self, p, cycle):
+        assert not cycle
+        p.text(indent(repr(self), p.indentation, indent_first=False))
+
+class RejectionOverlapInfo(object):
+    def __init__(self):
+        self.epochs = EpochRejectionInfo()
+        self.ticks = PointRejectionInfo("Ticks")
+        self.event_ticks = PointRejectionInfo("Event-ticks")
+        self.no_overlap_ticks = PointRejectionInfo("Ticks without overlap")
+
+    def __repr__(self):
+        chunks = [repr(self.epochs),
+                  repr(self.ticks),
+                  repr(self.event_ticks),
+                  repr(self.no_overlap_ticks)]
+        if self.ticks.accepted > 0:
+            chunks.append(
+                "Average events per accepted tick: %.2f\n"
+                " (>1 indicates overlap between the epochs included in this category)"
+                % (self.event_ticks.accepted * 1.0 / self.ticks.accepted))
+        return "\n".join(chunks)
+    def _repr_pretty_(self, p, cycle):
+        assert not cycle
+        p.text(indent(repr(self), p.indentation, indent_first=False))
 
 class _Accountant(object):
     def __init__(self, rerps):
         self._rerps = rerps
-        self._global_bucket = ArtifactInfo()
-        self._rerp_buckets = [ArtifactInfo() for _ in rerps]
+        self._global_bucket = RejectionOverlapInfo()
+        self._rerp_buckets = [RejectionOverlapInfo() for _ in rerps]
 
         self._epochs_with_artifacts = set()
         self._epochs_with_data = set()
 
-    def count(self, subspan):
-        if not subspan.epochs:
+    def count(self, ticks, epochs, artifacts):
+        if not epochs:
             return
-
-        ticks = subspan.stop[1] - subspan.start[1]
-        event_ticks = ticks * len(subspan.epochs)
-        if len(subspan.epochs) == 1:
+        if len(epochs) == 1:
             no_overlap_ticks = ticks
         else:
             no_overlap_ticks = 0
         bucket_events = {
-            self._global_bucket: len(subspan.epochs),
+            self._global_bucket: len(epochs),
             }
-        for epoch in subspan.epochs:
+        for epoch in epochs:
             bucket = self._rerp_buckets[epoch.rerp.this_rerp_idx]
-            bucket_epochs.setdefault(bucket, 0)
-            bucket_epochs[bucket] += 1
+            bucket_events.setdefault(bucket, 0)
+            bucket_events[bucket] += 1
 
-        for bucket, events in bucket_events.items():
-            bucket.ticks_requested += ticks
-            bucket.event_ticks_requested += ticks * events
-            bucket.no_overlap_ticks_requested += no_overlap_ticks
 
-        if subspan.artifacts:
-            self._epochs_with_artifacts.update(subspan.epochs)
-            artifacts = subspan.artifacts
+        if artifacts:
+            self._epochs_with_artifacts.update(epochs)
             # Special case: _ALL_OR_NOTHING artifacts should logically be seen
             # as covering over all the parts of an epoch that aren't
             # *otherwise* covered by a real artifact. So for accounting
@@ -888,38 +972,247 @@ class _Accountant(object):
                 artifacts = set(artifacts)
                 artifacts.remove("_ALL_OR_NOTHING")
             is_unique = (len(artifacts) == 1)
-            for artifact in artifacts:
-                for bucket in buckets:
-                    bucket.artifacts.setdefault(artifact,
-                                                {"affected_ticks": 0,
-                                                 "unique_ticks": 0})
-                    bucket.artifacts[artifact]["affected_ticks"] += ticks
-                    if is_unique:
-                        bucket.artifacts[artifact]["unique_ticks"] += ticks
-        else:
-            self._epochs_with_data.update(subspan.epochs)
+            def add_artifact(artifact, point_rej_info, points):
+                point_rej_info.artifacts.setdefault(artifact,
+                                                    {"affected": 0,
+                                                     "unique": 0})
+                point_rej_info.artifacts[artifact]["affected"] += points
+                if is_unique:
+                    point_rej_info.artifacts[artifact]["unique"] += points
             for bucket, events in bucket_events.items():
-                bucket.ticks_accepted += ticks
-                bucket.event_ticks_accepted += ticks * events
-                bucket.no_overlap_ticks_accepted += no_overlap_ticks
+                bucket.ticks.rejected += ticks
+                bucket.event_ticks.rejected += ticks * events
+                bucket.no_overlap_ticks.rejected += no_overlap_ticks
+            for artifact in artifacts:
+                for bucket, events in bucket_events.items():
+                    add_artifact(artifact, bucket.ticks, ticks)
+                    add_artifact(artifact, bucket.event_ticks, ticks * events)
+                    if len(epochs) == 1:
+                        add_artifact(artifact, bucket.no_overlap_ticks, ticks)
+        else:
+            self._epochs_with_data.update(epochs)
+            for bucket, events in bucket_events.items():
+                bucket.ticks.accepted += ticks
+                bucket.event_ticks.accepted += ticks * events
+                bucket.no_overlap_ticks.accepted += no_overlap_ticks
 
     def _set_epoch_stats(self, bucket, all_epochs, rerp):
         for epoch in all_epochs:
             if rerp is None or epoch.rerp is rerp:
-                bucket.epochs_requested += 1
-                if epoch not in epochs_with_artifacts:
-                    bucket.epochs_fully_accepted += 1
-                elif epoch not in epochs_with_data:
-                    bucket.epochs_fully_rejected += 1
+                if epoch not in self._epochs_with_artifacts:
+                    bucket.epochs.fully_accepted += 1
+                elif epoch not in self._epochs_with_data:
+                    bucket.epochs.fully_rejected += 1
                 else:
-                    bucket.epochs_partially_accepted += 1
+                    bucket.epochs.partially_accepted += 1
 
-    def close(self):
+    def save(self):
         all_epochs = self._epochs_with_data.union(self._epochs_with_artifacts)
         self._set_epoch_stats(self._global_bucket, all_epochs, None)
         for rerp, rerp_bucket in zip(self._rerps, self._rerp_buckets):
             self._set_epoch_stats(rerp_bucket, all_epochs, rerp)
             rerp._set_accounting(self._global_bucket, rerp_bucket)
+
+def test__Accountant():
+    def make_rerps(N):
+        rerps = [rERP(None, None, None, 0, 0) for i in xrange(N)]
+        for i, rerp in enumerate(rerps):
+            rerp._set_context(i, N)
+        return rerps
+    def e(rerps, i):
+        return _Epoch(None, None, None, None, rerps[i], None)
+    def make_infos(ticks_epochs_artifacts, rerps):
+        accountant = _Accountant(rerps)
+        for ticks, epoch_or_nums, artifacts in ticks_epochs_artifacts:
+            epochs = []
+            for epoch_or_num in epoch_or_nums:
+                if not isinstance(epoch_or_num, _Epoch):
+                    epoch_or_num = e(rerps, epoch_or_num)
+                epochs.append(epoch_or_num)
+            accountant.count(ticks, epochs, artifacts)
+        accountant.save()
+        for rerp in rerps:
+            assert rerp.global_artifact_info is rerps[0].global_artifact_info
+        return (rerps[0].global_artifact_info,
+                [rerp.this_artifact_info for rerp in rerps])
+
+    g, (r0, r1, r2) = make_infos(
+        [(1, [], []),
+         (2, [], ["blah"]),
+         (3, [0], []),
+         (4, [0, 1], []),
+         (5, [0, 2], ["a0"]),
+         (6, [0, 0], ["a0", "a1"]),
+         (7, [1], ["a2", "_ALL_OR_NOTHING"]),
+         (8, [1, 2], ["_ALL_OR_NOTHING"]),
+         ],
+        make_rerps(3))
+    assert g.epochs.requested == 10
+    assert g.epochs.fully_accepted == 3
+    assert g.epochs.partially_accepted == 0
+    assert g.epochs.fully_rejected == 7
+    assert g.ticks.requested == 3 + 4 + 5 + 6 + 7 + 8
+    assert g.ticks.accepted == 3 + 4
+    assert g.ticks.artifacts == {
+        "a0": {"affected": 5 + 6, "unique": 5},
+        "a1": {"affected": 6, "unique": 0},
+        # _ALL_OR_NOTHING ignored except when it occurs on its own
+        "a2": {"affected": 7, "unique": 7},
+        "_ALL_OR_NOTHING": {"affected": 8, "unique": 8}
+        }
+    assert g.event_ticks.requested == 3*1 + 4*2 + 5*2 + 6*2 + 7*1 + 8*2
+    assert g.event_ticks.accepted == 3*1 + 4*2
+    assert g.event_ticks.artifacts == {
+        "a0": {"affected": 5*2 + 6*2, "unique": 5*2},
+        "a1": {"affected": 6*2, "unique": 0},
+        "a2": {"affected": 7*1, "unique": 7*1},
+        "_ALL_OR_NOTHING": {"affected": 8*2, "unique": 8*2}
+        }
+    assert g.no_overlap_ticks.requested == 3 + 7
+    assert g.no_overlap_ticks.accepted == 3
+    assert g.no_overlap_ticks.artifacts == {
+        "a2": {"affected": 7*1, "unique": 7*1},
+        }
+
+    assert r0.epochs.requested == 5
+    assert r0.epochs.fully_accepted == 2
+    assert r0.epochs.partially_accepted == 0
+    assert r0.epochs.fully_rejected == 3
+    assert r0.ticks.requested == 3 + 4 + 5 + 6
+    assert r0.ticks.accepted == 3 + 4
+    assert r0.ticks.artifacts == {
+        "a0": {"affected": 5 + 6, "unique": 5},
+        "a1": {"affected": 6, "unique": 0},
+        }
+    assert r0.event_ticks.requested == 3*1 + 4*1 + 5*1 + 6*2
+    assert r0.event_ticks.accepted == 3*1 + 4*1
+    assert r0.event_ticks.artifacts == {
+        "a0": {"affected": 5*1 + 6*2, "unique": 5*1},
+        "a1": {"affected": 6*2, "unique": 0},
+        }
+    assert r0.no_overlap_ticks.requested == 3
+    assert r0.no_overlap_ticks.accepted == 3
+    assert r0.no_overlap_ticks.artifacts == {}
+
+    assert r1.epochs.requested == 3
+    assert r1.epochs.fully_accepted == 1
+    assert r1.epochs.partially_accepted == 0
+    assert r1.epochs.fully_rejected == 2
+    assert r1.ticks.requested == 4 + 7 + 8
+    assert r1.ticks.accepted == 4
+    assert r1.ticks.artifacts == {
+        "a2": {"affected": 7, "unique": 7},
+        "_ALL_OR_NOTHING": {"affected": 8, "unique": 8}
+        }
+    assert r1.event_ticks.requested == 4*1 + 7*1 + 8*1
+    assert r1.event_ticks.accepted == 4*1
+    assert r1.event_ticks.artifacts == {
+        "a2": {"affected": 7*1, "unique": 7*1},
+        "_ALL_OR_NOTHING": {"affected": 8*1, "unique": 8*1}
+        }
+    assert r1.no_overlap_ticks.requested == 7
+    assert r1.no_overlap_ticks.accepted == 0
+    assert r1.no_overlap_ticks.artifacts == {
+        "a2": {"affected": 7, "unique": 7},
+        }
+
+    assert r2.epochs.requested == 2
+    assert r2.epochs.fully_accepted == 0
+    assert r2.epochs.partially_accepted == 0
+    assert r2.epochs.fully_rejected == 2
+    assert r2.ticks.requested == 5 + 8
+    assert r2.ticks.accepted == 0
+    assert r2.ticks.artifacts == {
+        "a0": {"affected": 5, "unique": 5},
+        "_ALL_OR_NOTHING": {"affected": 8, "unique": 8}
+        }
+    assert r2.event_ticks.requested == 5*1 + 8*1
+    assert r2.event_ticks.accepted == 0
+    assert r2.event_ticks.artifacts == {
+        "a0": {"affected": 5*1, "unique": 5*1},
+        "_ALL_OR_NOTHING": {"affected": 8*1, "unique": 8*1}
+        }
+    assert r2.no_overlap_ticks.requested == 0
+    assert r2.no_overlap_ticks.accepted == 0
+    assert r2.no_overlap_ticks.artifacts == {}
+
+    # partial rejects
+    rerps = make_rerps(2)
+    e00 = e(rerps, 0)
+    e01 = e(rerps, 0)
+    e10 = e(rerps, 1)
+    g, (r0, r1) = make_infos(
+        [(1, [e00, e01], []),
+         (2, [e01], ["a0"]),
+         (3, [e01, e10], ["a1"])
+         ],
+        rerps)
+    assert g.epochs.requested == 3
+    assert g.epochs.fully_accepted == 1
+    assert g.epochs.partially_accepted == 1
+    assert g.epochs.fully_rejected == 1
+    assert g.ticks.requested == 1 + 2 + 3
+    assert g.ticks.accepted == 1
+    assert g.ticks.artifacts == {
+        "a0": {"affected": 2, "unique": 2},
+        "a1": {"affected": 3, "unique": 3},
+        }
+    assert g.event_ticks.requested == 1*2 + 2*1 + 3*2
+    assert g.event_ticks.accepted == 1*2
+    assert g.event_ticks.artifacts == {
+        "a0": {"affected": 2*1, "unique": 2*1},
+        "a1": {"affected": 3*2, "unique": 3*2},
+        }
+    assert g.no_overlap_ticks.requested == 2
+    assert g.no_overlap_ticks.accepted == 0
+    assert g.no_overlap_ticks.artifacts == {
+        "a0": {"affected": 2, "unique": 2},
+        }
+
+    assert r0.epochs.requested == 2
+    assert r0.epochs.fully_accepted == 1
+    assert r0.epochs.partially_accepted == 1
+    assert r0.epochs.fully_rejected == 0
+    assert r0.ticks.requested == 1 + 2 + 3
+    assert r0.ticks.accepted == 1
+    assert r0.ticks.artifacts == {
+        "a0": {"affected": 2, "unique": 2},
+        "a1": {"affected": 3, "unique": 3},
+        }
+    assert r0.event_ticks.requested == 1*2 + 2*1 + 3*1
+    assert r0.event_ticks.accepted == 1*2
+    assert r0.event_ticks.artifacts == {
+        "a0": {"affected": 2*1, "unique": 2*1},
+        "a1": {"affected": 3*1, "unique": 3*1},
+        }
+    assert r0.no_overlap_ticks.requested == 2
+    assert r0.no_overlap_ticks.accepted == 0
+    assert r0.no_overlap_ticks.artifacts == {
+        "a0": {"affected": 2, "unique": 2},
+        }
+
+    assert r1.epochs.requested == 1
+    assert r1.epochs.fully_accepted == 0
+    assert r1.epochs.partially_accepted == 0
+    assert r1.epochs.fully_rejected == 1
+    assert r1.ticks.requested == 3
+    assert r1.ticks.accepted == 0
+    assert r1.ticks.artifacts == {
+        "a1": {"affected": 3, "unique": 3},
+        }
+    assert r1.event_ticks.requested == 3*1
+    assert r1.event_ticks.accepted == 0
+    assert r1.event_ticks.artifacts == {
+        "a1": {"affected": 3*1, "unique": 3*1},
+        }
+    assert r1.no_overlap_ticks.requested == 0
+    assert r1.no_overlap_ticks.accepted == 0
+    assert r1.no_overlap_ticks.artifacts == {}
+
+    # smoke test
+    repr(g)
+    repr(r0)
+    repr(r1)
 
 ################################################################
 
@@ -931,10 +1224,10 @@ def _choose_strategy(requested_strategy, rerps):
     # happen to refer to the same data, so any overlap really is the sort of
     # overlap that prevents by-epoch regression from working.)
     gai = rerps[0].global_artifact_info
-    have_overlap = (gai.event_ticks_accepted > gai.ticks_accepted)
+    have_overlap = (gai.event_ticks.accepted > gai.ticks.accepted)
     # If there are any partially accepted, partially not-accepted epochs, then
     # by_epoch is impossible.
-    have_partial_epochs = (gai.epochs_partially_accepted > 0)
+    have_partial_epochs = (gai.epochs.partially_accepted > 0)
     by_epoch_possible = not (have_overlap or have_partial_epochs)
     if requested_strategy == "continuous":
         return requested_strategy
@@ -1043,38 +1336,7 @@ class _ContinuousWorker(object):
         y_strip = data
         return XtXIncrementalLS.append_top_half(x_strip, y_strip)
 
-class rERP(object):
-    def __init__(self, rerp_info, data_format, betas):
-        self.spec = rerp_info["spec"]
-        self.design_info = rerp_info["design_info"]
-        self.start_tick = rerp_info["start_tick"]
-        self.stop_tick = rerp_info["stop_tick"]
-        self.epochs_requested = rerp_info["epochs_requested"]
-        self.epochs_with_data = rerp_info["epochs_with_data"]
-        self.epochs_with_artifacts = rerp_info["epochs_with_artifacts"]
-        self.partial_epochs = ((self.epochs_with_data
-                                + self.epochs_with_artifacts)
-                               - self.epochs_requested)
-        self.data_format = data_format
-
-        self.epoch_ticks = self.stop_tick - self.start_tick
-        num_predictors = len(self.design_info.column_names)
-        num_channels = len(self.data_format.channel_names)
-        assert (num_predictors, self.epoch_ticks, num_channels) == betas.shape
-
-        # This is always floating point (even if in fact all the values are
-        # integers) which means that if you do regular [] indexing with
-        # integers, then you will always get by-location indexing, and if you
-        # use floating point values, you will always get by-label indexing.
-        latencies = np.linspace(self.spec.start_time, self.spec.stop_time,
-                                self.epoch_ticks)
-
-        self.data = pandas.Panel(betas,
-                                 items=self.design_info.column_names,
-                                 major_axis=latencies,
-                                 minor_axis=self.data_format.channel_names)
-        self.data.data_format = self.data_format
-
+################################################################
 
 class rERPAnalysis(object):
     def __init__(self, data_format,

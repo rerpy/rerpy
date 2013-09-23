@@ -6,8 +6,6 @@ import os.path
 import functools
 import types
 
-from urlparse import urlparse
-
 def maybe_open(file_like, mode="rb"):
     # FIXME: have more formal checking of binary/text, given how important
     # that is in py3?
@@ -57,3 +55,16 @@ def test_memoized_method():
     t2.x = 1
     assert t2.return_x() == 2
     assert t2.multiply_by_x(3) == 6
+
+def indent(string, chars, indent_first=True):
+    lines = string.split("\n")
+    indented = "\n".join([" " * chars + line for line in lines])
+    if not indent_first:
+        indented = indented[chars:]
+    return indented
+
+def test_indent():
+    assert indent("a\nb", 4) == "    a\n    b"
+    assert indent("a\nb", 2) == "  a\n  b"
+    assert indent("a\nb", 4, indent_first=False) == "a\n    b"
+    assert indent("a\nb", 2, indent_first=False) == "a\n  b"
