@@ -864,7 +864,7 @@ def _break_down_rejections(superclass, subclasses):
                            for (name, value) in subclasses])
     return result
 
-class EpochRejectionInfo(object):
+class EpochRejectionStats(object):
     def __init__(self):
         self.fully_accepted = 0
         self.partially_accepted = 0
@@ -885,7 +885,7 @@ class EpochRejectionInfo(object):
         assert not cycle
         p.text(indent(repr(self), p.indentation, indent_first=False))
 
-class PointRejectionInfo(object):
+class PointRejectionStats(object):
     def __init__(self, name):
         self.name = name
         self.accepted = 0
@@ -914,12 +914,12 @@ class PointRejectionInfo(object):
         assert not cycle
         p.text(indent(repr(self), p.indentation, indent_first=False))
 
-class RejectionOverlapInfo(object):
+class RejectionOverlapStats(object):
     def __init__(self):
-        self.epochs = EpochRejectionInfo()
-        self.ticks = PointRejectionInfo("Ticks")
-        self.event_ticks = PointRejectionInfo("Event-ticks")
-        self.no_overlap_ticks = PointRejectionInfo("Ticks without overlap")
+        self.epochs = EpochRejectionStats()
+        self.ticks = PointRejectionStats("Ticks")
+        self.event_ticks = PointRejectionStats("Event-ticks")
+        self.no_overlap_ticks = PointRejectionStats("Ticks without overlap")
 
     def __repr__(self):
         chunks = [repr(self.epochs),
@@ -939,8 +939,8 @@ class RejectionOverlapInfo(object):
 class _Accountant(object):
     def __init__(self, rerps):
         self._rerps = rerps
-        self._global_bucket = RejectionOverlapInfo()
-        self._rerp_buckets = [RejectionOverlapInfo() for _ in rerps]
+        self._global_bucket = RejectionOverlapStats()
+        self._rerp_buckets = [RejectionOverlapStats() for _ in rerps]
 
         self._epochs_with_artifacts = set()
         self._epochs_with_data = set()
