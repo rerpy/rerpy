@@ -1,7 +1,7 @@
 language: python
 virtualenv:
   # For scipy
-  system_site_packages: true
+  #system_site_packages: true
 python:
   # We rely on the Ubuntu python-scipy package, and that's only
   # available for python 2.7 (and 3.something, but pyrerp doesn't
