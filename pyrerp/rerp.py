@@ -21,11 +21,10 @@ from pyrerp.util import indent
 # Public interface
 ################################################################
 
-# XX FIXME: add (and implement) bad_event_query argument using Event.matches
 class rERPRequest(object):
     def __init__(self, event_query, start_time, stop_time,
                  formula="~ 1", name=None, eval_env=0,
-                 all_or_nothing=False):
+                 bad_event_query=None, all_or_nothing=False):
         if name is None:
             name = "%s: %s" % (event_query, formula)
         if stop_time < start_time:
@@ -37,17 +36,21 @@ class rERPRequest(object):
         self.formula = formula
         self.name = name
         self.eval_env = EvalEnvironment.capture(eval_env, reference=1)
+        self.bad_event_query = bad_event_query
         self.all_or_nothing = all_or_nothing
 
     __repr__ = repr_pretty_delegate
     def _repr_pretty_(self, p, cycle):
         assert not cycle
+        kwargs = [("formula", self.formula), ("name", self.name)]
+        if self.bad_event_query:
+            kwargs.append(("bad_event_query", self.bad_event_query))
+        if self.all_or_nothing:
+            kwargs.append(("all_or_nothing", self.all_or_nothing))
         return repr_pretty_impl(p, self,
                                 [self.event_query,
                                  self.start_time, self.stop_time],
-                                {"formula": self.formula,
-                                 "name": self.name,
-                                 })
+                                kwargs)
 
 def test_rERPRequest():
     x = object()
@@ -61,18 +64,6 @@ def test_rERPRequest():
     assert one_deeper(x2, 0).eval_env.namespace["x"] is x2
     from nose.tools import assert_raises
     assert_raises(ValueError, rERPRequest, "asdf", 100, 0)
-
-class rERPInfo(object):
-    def __init__(self, **attrs):
-        self.__dict__.update(attrs)
-        self._attr_names = sorted(attrs)
-
-    __repr__ = repr_pretty_delegate
-    def _repr_pretty_(self, p, cycle):
-        assert not cycle
-        return repr_pretty_impl(p, self, [],
-                                [(attr, getattr(self, attr))
-                                 for attr in self._attr_names])
 
 # TODO:
 # let's make the return value a list of rerp objects
@@ -411,8 +402,12 @@ def _epoch_info_and_spans(dataset, rerp_request):
     design, design_row_idxes = _rerp_design(rerp_request.formula,
                                             events,
                                             rerp_request.eval_env)
-    rerp = rERP(dataset.data_format, rerp_request, design.design_info,
+    rerp = rERP(rerp_request, dataset.data_format, design.design_info,
                 start_tick, stop_tick)
+    if rerp_request.bad_event_query is None:
+        bad_event_query = None
+    else:
+        bad_event_query = dataset.events_query(rerp_request.bad_event_query)
     for i, event in enumerate(events):
         epoch_start = start_tick + event.start_tick
         epoch_stop = stop_tick + event.start_tick
@@ -431,6 +426,8 @@ def _epoch_info_and_spans(dataset, rerp_request):
             # it as an artifact though so we get proper accounting at
             # the end.)
             intrinsic_artifacts.append("_MISSING_PREDICTOR")
+        if bad_event_query is not None and event.matches(bad_event_query):
+            intrinsic_artifacts.append("_BAD_EVENT_QUERY")
         epoch = _Epoch(event.recspan_id, epoch_start,
                        epoch_stop - epoch_start,
                        design_row, rerp, intrinsic_artifacts)
@@ -502,6 +499,17 @@ def test__epoch_info_and_spans():
     assert rerp.start_tick == 1
     assert rerp.stop_tick == 4
 
+    # bad_event_query
+    req = rERPRequest("include", -10, 10, formula="a",
+                      bad_event_query="a == None or a == 6")
+    rerp, spans = _epoch_info_and_spans(ds, req)
+    assert [s.epoch.intrinsic_artifacts for s in spans] == [
+        [],
+        [],
+        ["_MISSING_PREDICTOR", "_BAD_EVENT_QUERY"],
+        ["_BAD_EVENT_QUERY"]
+        ]
+
 ################################################################
 
 # Work out the size of the full design matrices, and fill in the offset fields
@@ -522,10 +530,10 @@ def _layout_design_matrices(rerps):
 def test__layout_design_matrices():
     from patsy import DesignInfo
     fake_rerps = [
-        rERP(None, None,
+        rERP(rERPRequest("asdf", -100, 1000), None,
              DesignInfo.from_array(np.ones((1, 3))),
              -2, 8),
-        rERP(None, None,
+        rERP(rERPRequest("asdf", -100, 1000), None,
              DesignInfo.from_array(np.ones((1, 5))),
              10, 20),
         ]
@@ -713,7 +721,7 @@ def _propagate_all_or_nothing(spans, overlap_correction):
     epochs_needing_artifact = set()
     for subspan in _epoch_subspans(spans, overlap_correction):
         relevant_epochs = [epoch for epoch in subspan.epochs
-                           if epoch.rerp.request.all_or_nothing]
+                           if epoch.rerp.all_or_nothing]
         for epoch_a in relevant_epochs:
             for epoch_b in relevant_epochs:
                 if epoch_a is not epoch_b:
@@ -735,7 +743,7 @@ def test__propagate_all_or_nothing():
     def e(start, stop, all_or_nothing, expected_survival,
           starts_with_intrinsic=False):
         req = rERPRequest("asdf", -100, 1000, all_or_nothing=all_or_nothing)
-        rerp = rERP(None, req, None, -25, 250)
+        rerp = rERP(req, None, None, -25, 250)
         i_a = []
         if starts_with_intrinsic:
             i_a.append("born_bad")
@@ -983,7 +991,8 @@ class _Accountant(object):
 
 def test__Accountant():
     def make_rerps(N):
-        rerps = [rERP(None, None, None, 0, 0) for i in xrange(N)]
+        rerps = [rERP(rERPRequest("asdf", -100, 1000),
+                      None, None, 0, 0) for i in xrange(N)]
         for i, rerp in enumerate(rerps):
             rerp._set_context(i, N)
         return rerps
@@ -1398,11 +1407,18 @@ class rERP(object):
         assert not self._has(part)
         self._parts.add(part)
 
-    def __init__(self, data_format, request, design_info,
+    def __init__(self, request, data_format, design_info,
                  start_tick, stop_tick):
         self._parts = set()
+        self.name = str(request.name)
+        self.event_query = str(request.event_query)
+        self.start_time = float(request.start_time)
+        self.stop_time = float(request.stop_time)
+        self.formula = str(request.formula)
+        self.bad_event_query = request.bad_event_query
+        self.all_or_nothing = request.all_or_nothing
+
         self.data_format = data_format
-        self.request = request
         self.design_info = design_info
         self.start_tick = start_tick
         self.stop_tick = stop_tick
