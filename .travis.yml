@@ -11,7 +11,10 @@ before_install:
   - echo Preinstalled
   - pip freeze
   - sudo apt-get install -qq python-scipy python-pandas cython
-  - pip install --use-mirrors coverage patsy
+  - echo Available by apt-get
+  - pip freeze
+  # Need something like scipy 0.10, pandas 0.12, not sure about cython (want memoryview support anyway)
+  - pip install --use-mirrors --upgrade coverage scipy cython patsy pandas
   - echo Final installation
   - pip freeze
   - which nosetests
