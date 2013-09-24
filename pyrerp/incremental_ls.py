@@ -318,7 +318,7 @@ class _XtXAccumulator(object):
         # If you add a dense array to a sparse matrix, what you get out is a
         # dense np.matrix, and we just want to deal with np.ndarray's.
         print "offending code:", self.xtx, xtx
-        print type(self.txt)
+        print type(self.xtx)
         print type(xtx)
         self.xtx += xtx
         if isinstance(self.xtx, np.matrix):
