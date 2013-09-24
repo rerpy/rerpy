@@ -10,8 +10,8 @@ python:
 before_install:
   - echo Preinstalled
   - pip freeze
-  - sudo apt-get install -qq python-scipy python-pandas
-  - pip install --use-mirrors coverage patsy cython
+  - sudo apt-get install -qq python-scipy python-pandas cython
+  - pip install --use-mirrors coverage patsy
   - echo Final installation
   - pip freeze
   - which nosetests
