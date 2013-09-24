@@ -13,7 +13,6 @@ import pandas
 from patsy import DesignInfo
 
 import pyrerp.events
-from pyrerp.rerp import multi_rerp_impl
 
 # This is just a stub for now. (There's some code that may be resurrectable
 # from my old stuff.) Notes on formats:
@@ -273,6 +272,7 @@ class DataSet(object):
         if stop_tick is None:
             stop_tick = start_tick + 1
         p = self.placeholder_event()
+
         q = p.overlaps(recspan_id, start_tick, stop_tick)
         q &= self.events_query(subset)
         return q

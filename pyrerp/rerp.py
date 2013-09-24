@@ -3,7 +3,7 @@
 # See file COPYING for license information.
 
 import itertools
-from collections import namedtuple, OrderedDict
+from collections import namedtuple
 import inspect
 
 import numpy as np
@@ -23,7 +23,7 @@ from pyrerp.util import indent
 
 class rERPRequest(object):
     def __init__(self, event_query, start_time, stop_time,
-                 formula="~ 1", name=None, eval_env=0,
+                 formula="1", name=None, eval_env=0,
                  bad_event_query=None, all_or_nothing=False):
         if name is None:
             name = "%s: %s" % (event_query, formula)
@@ -65,12 +65,8 @@ def test_rERPRequest():
     from nose.tools import assert_raises
     assert_raises(ValueError, rERPRequest, "asdf", 100, 0)
 
-# TODO:
-# let's make the return value a list of rerp objects
-# where each has a ref to an analysis-global-info object
-# which itself has some weak record of all the results (rerp requests, but
-# not a circular link)
-# then rerp(...) can just return multi_rerp(...)[0]
+def rerp(dataset, rerp_request, *args, **kwargs):
+    return multi_rerp(dataset, [rerp_request], *args, **kwargs)[0]
 
 # regression_strategy can be "continuous", "by-epoch", or "auto". If
 # "continuous", we always build one giant regression model, treating the data
@@ -91,40 +87,6 @@ def multi_rerp(dataset,
                artifact_type_field="_ARTIFACT_TYPE",
                overlap_correction=True,
                regression_strategy="auto"):
-    return multi_rerp_impl(dataset, rerp_requests, artifact_query,
-                           artifact_type_field, overlap_correction,
-                           regression_strategy)
-
-################################################################
-# Implementation
-################################################################
-
-# Can't use a namedtuple for this because we want __eq__ and __hash__ to use
-# identity semantics, not value semantics.
-class _Epoch(object):
-    def __init__(self, recspan_id, start_tick, ticks,
-                 design_row, rerp, intrinsic_artifacts):
-        self.recspan_id = recspan_id
-        self.start_tick = start_tick
-        self.ticks = ticks
-        self.design_row = design_row
-        self.rerp = rerp
-        # 'intrinsic artifacts' are artifact types that inhere in this epoch's
-        # copy of the data. In "classic", no-overlap-correction rerps, this
-        # means that they knock out all and only the data for this epoch, but
-        # not overlapping epochs. In overlap-correcting rerps, this means that
-        # they knock out all the epoch in this data, *and* the portions of any
-        # other epochs that overlap this epoch, i.e., they become regular
-        # artifacts.
-        self.intrinsic_artifacts = intrinsic_artifacts
-
-_DataSpan = namedtuple("_DataSpan", ["start", "stop", "epoch", "artifact"])
-_DataSubSpan = namedtuple("_DataSubSpan",
-                          ["start", "stop", "epochs", "artifacts"])
-
-def multi_rerp_impl(dataset, rerp_requests,
-                    artifact_query, artifact_type_field,
-                    overlap_correction, regression_strategy):
     if not rerp_requests:
         return []
     _check_unique_names(rerp_requests)
@@ -147,8 +109,8 @@ def multi_rerp_impl(dataset, rerp_requests,
     accountant = _Accountant(rerps)
     analysis_subspans = []
     for subspan in _epoch_subspans(spans, overlap_correction):
-        accountant.count(subspan.start[1] - subspan.stop[1],
-                         subspan.epoch, subspan.artifacts)
+        accountant.count(subspan.stop[1] - subspan.start[1],
+                         subspan.epochs, subspan.artifacts)
         if not subspan.artifacts:
             analysis_subspans.append(subspan)
     accountant.save()
@@ -163,9 +125,11 @@ def multi_rerp_impl(dataset, rerp_requests,
     (by_epoch_design_width,
      continuous_design_width) = _layout_design_matrices(rerps)
     if regression_strategy == "by-epoch":
-        all_betas = _fit_by_epoch(dataset, analysis_subspans, design_width)
+        all_betas = _fit_by_epoch(dataset, analysis_subspans,
+                                  by_epoch_design_width)
     elif regression_strategy == "continuous":
-        all_betas = _fit_continuous(dataset, analysis_subspans, design_width)
+        all_betas = _fit_continuous(dataset, analysis_subspans,
+                                    continuous_design_width)
     # And finally, we unpack the combined betas into those belonging to each
     # rERP.
     for rerp in rerps:
@@ -174,6 +138,35 @@ def multi_rerp_impl(dataset, rerp_requests,
     for rerp in rerps:
         assert rerp._is_complete()
     return rerps
+
+################################################################
+# Implementation
+################################################################
+
+# Types
+
+# Can't use a namedtuple for this because we want __eq__ and __hash__ to use
+# identity semantics, not value semantics.
+class _Epoch(object):
+    def __init__(self, recspan_id, start_tick, stop_tick,
+                 design_row, rerp, intrinsic_artifacts):
+        self.recspan_id = recspan_id
+        self.start_tick = start_tick
+        self.stop_tick = stop_tick
+        self.design_row = design_row
+        self.rerp = rerp
+        # 'intrinsic artifacts' are artifact types that inhere in this epoch's
+        # copy of the data. In "classic", no-overlap-correction rerps, this
+        # means that they knock out all and only the data for this epoch, but
+        # not overlapping epochs. In overlap-correcting rerps, this means that
+        # they knock out all the epoch in this data, *and* the portions of any
+        # other epochs that overlap this epoch, i.e., they become regular
+        # artifacts.
+        self.intrinsic_artifacts = intrinsic_artifacts
+
+_DataSpan = namedtuple("_DataSpan", ["start", "stop", "epoch", "artifact"])
+_DataSubSpan = namedtuple("_DataSubSpan",
+                          ["start", "stop", "epochs", "artifacts"])
 
 ################################################################
 
@@ -428,8 +421,7 @@ def _epoch_info_and_spans(dataset, rerp_request):
             intrinsic_artifacts.append("_MISSING_PREDICTOR")
         if bad_event_query is not None and event.matches(bad_event_query):
             intrinsic_artifacts.append("_BAD_EVENT_QUERY")
-        epoch = _Epoch(event.recspan_id, epoch_start,
-                       epoch_stop - epoch_start,
+        epoch = _Epoch(event.recspan_id, epoch_start, epoch_stop,
                        design_row, rerp, intrinsic_artifacts)
         spans.append(_DataSpan((event.recspan_id, epoch_start),
                                (event.recspan_id, epoch_stop),
@@ -462,7 +454,9 @@ def test__epoch_info_and_spans():
     assert [s.epoch.start_tick for s in spans] == [
         0 - 2, 10 - 2, 40 - 2, 50 - 2,
         ]
-    assert [s.epoch.ticks for s in spans] == [5] * 4
+    assert [s.epoch.stop_tick for s in spans] == [
+        0 + 3, 10 + 3, 40 + 3, 50 + 3,
+        ]
     for span in spans:
         assert span.epoch.rerp is rerp
     from numpy.testing import assert_array_equal
@@ -835,9 +829,9 @@ def _break_down_rejections(superclass, subclasses):
     result = ("%s:\n" % (superclass,)
            + "  Requested: %s" % (total,))
     if total > 0:
-        result += "".join(["    %s: %s (%.1f%%)\n"
-                           % (name, value, value * 100. / total)
-                           for (name, value) in subclasses])
+        result += "\n" + "".join(["    %s: %s (%.1f%%)\n"
+                                  % (name, value, value * 100. / total)
+                                  for (name, value) in subclasses])
     return result
 
 class EpochRejectionStats(object):
@@ -932,7 +926,7 @@ class _Accountant(object):
             self._global_bucket: len(epochs),
             }
         for epoch in epochs:
-            bucket = self._rerp_buckets[epoch.rerp.this_rerp_idx]
+            bucket = self._rerp_buckets[epoch.rerp.this_rerp_index]
             bucket_events.setdefault(bucket, 0)
             bucket_events[bucket] += 1
 
@@ -1269,26 +1263,38 @@ def _by_epoch_jobs(dataset, analysis_subspans):
     # analysis_spans is fully included in the regression.
     epochs = set()
     for subspan in analysis_subspans:
-        assert len(subspan.epochs == 1)
+        assert len(subspan.epochs) == 1
         epochs.update(subspan.epochs)
     epochs = sorted(epochs, key=lambda e: (e.recspan_id, e.start_tick))
     for epoch in epochs:
         recspan = dataset[epoch.recspan_id]
-        data = recspan.iloc[epoch.start_tick:epoch.stop_tick, :]
+        data = np.asarray(recspan.iloc[epoch.start_tick:epoch.stop_tick, :])
         yield (data, epoch.rerp._by_epoch_design_offset, epoch.design_row)
 
 class _ByEpochWorker(object):
     def __init__(self, design_width):
         self._design_width = design_width
 
-    def __call__(self, job):
+    def _make_x_y(self, job):
         data, design_offset, design_row = job
         # XX FIXME: making this a sparse array might be more efficient
-        x_strip = np.zeros((1, design_width))
+        x_strip = np.zeros((1, self._design_width))
         x_idx = slice(design_offset, design_offset + len(design_row))
-        x_strip[x_idx] = design_row
+        x_strip[0, x_idx] = design_row
         y_strip = data.reshape((1, -1))
+        return x_strip, y_strip
+
+    def __call__(self, job):
+        x_strip, y_strip = self._make_x_y(job)
         return XtXIncrementalLS.append_top_half(x_strip, y_strip)
+
+def test__ByEpochWorker():
+    worker = _ByEpochWorker(4)
+    x_strip, y_strip = worker._make_x_y((np.asarray([[1, 2], [3, 4]]),
+                                         2,
+                                         np.asarray([1, 2])))
+    assert np.array_equal(x_strip, [[0, 0, 1, 2]])
+    assert np.array_equal(y_strip, [[1, 2, 3, 4]])
 
 def _incremental_fit(worker, jobs_iter):
     model = XtXIncrementalLS()
@@ -1311,7 +1317,7 @@ def _fit_by_epoch(dataset, analysis_subspans, design_width):
     #   predictor 2, latency n
     #   ...
     # Just like the continuous regression strategy spits out by default.
-    all_betas.resize((-1, len(dataset.data_format.channel_names)))
+    all_betas = all_betas.reshape((-1, len(dataset.data_format.channel_names)))
     return all_betas
 
 _ContinuousEpochInfo = namedtuple("_ContinuousJob",
@@ -1321,13 +1327,13 @@ _ContinuousEpochInfo = namedtuple("_ContinuousJob",
 def _continuous_jobs(dataset, analysis_subspans):
     for subspan in analysis_subspans:
         recspan = dataset[subspan.start[0]]
-        data = recspan.iloc[subspan.start[1]:subspan.stop[1], :]
+        data = np.asarray(recspan.iloc[subspan.start[1]:subspan.stop[1], :])
         yield (data,
                subspan.start[1],
                [_ContinuousJob(epoch.rerp._continuous_design_offset,
                                epoch.design_row,
                                epoch.start_tick,
-                               epoch.ticks)
+                               epoch.stop_tick - epoch.start_tick)
                 for epoch in epochs])
 
 class _ContinuousWorker(object):
@@ -1384,8 +1390,7 @@ def _extract_rerp_betas(rerp, all_betas):
     num_predictors = len(rerp.design_info.column_names)
     num_columns = rerp.ticks * num_predictors
     betas = all_betas[i:i + num_columns, :]
-    betas.resize((num_predictors, rerp.ticks, -1))
-    return betas
+    return betas.reshape((num_predictors, rerp.ticks, -1))
 
 ################################################################
 
@@ -1424,9 +1429,9 @@ class rERP(object):
         self.stop_tick = stop_tick
         self.ticks = stop_tick - start_tick
 
-    def _set_context(self, this_rerp_idx, total_rerps):
-        assert 0 <= this_rerp_idx < total_rerps
-        self.this_rerp_idx = this_rerp_idx
+    def _set_context(self, this_rerp_index, total_rerps):
+        assert 0 <= this_rerp_index < total_rerps
+        self.this_rerp_index = this_rerp_index
         self.total_rerps = total_rerps
         self._add_part("context")
 
@@ -1451,10 +1456,10 @@ class rERP(object):
         assert (num_predictors, self.ticks, num_channels) == betas.shape
         tick_array = np.arange(self.start_tick, self.stop_tick)
         time_array = self.data_format.ticks_to_ms(tick_array)
-        self.data = pandas.Panel(betas,
-                                 items=self.design_info.column_names,
-                                 major_axis=time_array,
-                                 minor_axis=self.data_format.channel_names)
+        self.betas = pandas.Panel(betas,
+                                  items=self.design_info.column_names,
+                                  major_axis=time_array,
+                                  minor_axis=self.data_format.channel_names)
         self._add_part("betas")
 
     ################################################################
