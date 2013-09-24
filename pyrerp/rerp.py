@@ -138,38 +138,21 @@ def multi_rerp_impl(dataset, rerp_requests,
         return []
     _check_unique_names(rerp_requests)
 
-    # First, we find where all the artifacts and desired epochs are, and
-    # represent each of them by a _DataSpan object in this list:
+    ## Find all the requested epochs and artifacts
     spans = []
-    # Get artifacts.
-    spans.extend(_artifact_spans(dataset, artifact_query, artifact_type_field))
-    # And get the events, and build the associated epoch objects.
+    # And allocate the rERP objects that we will eventually return.
     rerps = []
     for i, rerp_request in enumerate(rerp_requests):
         rerp, epoch_spans = _epoch_info_and_spans(dataset, rerp_request)
         rerp._set_context(i, len(rerp_requests))
         rerps.append(rerp)
         spans.extend(epoch_spans)
-
-    # Now we have a list of all interesting events, and where they occur, but
-    # it's organized by event: for each event, we know where it happend. Now
-    # we need to flip that around, and organize it by position: for each
-    # interesting position in the data, what events are relevant?
-    # _epoch_subspans takes our spans and produces a sequence of subspans such
-    # that (a) over all points within a single subspan, the same epochs and
-    # artifacts are "live", and (b) gives us each of these subspans along with
-    # the epochs and artifacts that apply to each. (If you know some
-    # algorithms theory, this is equivalent to a "segment tree", but we don't
-    # actually build the tree, we just iterate over the leaves -- the
-    # canonical subsets.)
-
-    # Small optimization: even if all_or_nothing is disabled,
-    # _propagate_all_or_nothing still has a somewhat large overhead (iterating
-    # over all subspans) before it can discover that it has nothing to do. So
-    # we only bother calling it if there might be some work for it to do.
+    spans.extend(_artifact_spans(dataset, artifact_query, artifact_type_field))
+    # Small optimization: only check for all_or_nothing artifacts
     if any(rerp_request.all_or_nothing for rerp_request in rerp_requests):
         _propagate_all_or_nothing(spans, overlap_correction)
 
+    ## Find the good data, gather artifact/overlap/good data statistics
     accountant = _Accountant(rerps)
     analysis_subspans = []
     for subspan in _epoch_subspans(spans, overlap_correction):
@@ -179,46 +162,27 @@ def multi_rerp_impl(dataset, rerp_requests,
             analysis_subspans.append(subspan)
     accountant.save()
 
+    ## Do the regression
     regression_strategy = _choose_strategy(regression_strategy,
                                            rerps[0].global_stats)
     for rerp in rerps:
-        rerp._set_strategy(regression_strategy)
-
+        rerp._set_fit_info(regression_strategy, overlap_correction)
     # Work out the size of the full design matrices, and fill in the offset
     # fields in rerps. NB: modifies rerps.
     (by_epoch_design_width,
      continuous_design_width) = _layout_design_matrices(rerps)
-
     if regression_strategy == "by-epoch":
-        worker = _ByEpochWorker(design_width)
-        jobs_iter = _by_epoch_jobs(dataset, analysis_subspans)
+        all_betas = _fit_by_epoch(dataset, analysis_subspans, design_width)
     elif regression_strategy == "continuous":
-        worker = _ContinuousWorker(expanded_design_width)
-        jobs_iter = _continuous_jobs(dataset, analysis_subspans)
-    else:
-        assert False
-    model = XtXIncrementalLS()
-    for job_result in parimap_unordered(worker, jobs_iter):
-        model.append_bottom_half(job_result)
-    result = model.fit()
-    betas = result.coef()
-    # For continuous fits, this has no effect. For by-epoch fits, it
-    # rearranges the beta matrix so that each column contains results for one
-    # channel, and the rows go:
-    #   predictor 1, latency 1
-    #   ...
-    #   predictor 1, latency n
-    #   predictor 2, latency 1
-    #   ...
-    #   predictor 2, latency n
-    #   ...
-    betas = betas.reshape((-1, len(dataset.data_format.channel_names)))
+        all_betas = _fit_continuous(dataset, analysis_subspans, design_width)
+    # And finally, we unpack the combined betas into those belonging to each
+    # rERP.
+    for rerp in rerps:
+        rerp._set_betas(_extract_rerp_betas(rerp, all_betas))
 
-    return rERPAnalysis(dataset.data_format,
-                        rerps, overlap_correction, regression_strategy,
-                        total_wanted_ticks, total_good_ticks,
-                        total_overlap_ticks, total_overlap_multiplicity,
-                        artifact_counts, betas)
+    for rerp in rerps:
+        assert rerp._is_complete()
+    return rerps
 
 ################################################################
 
@@ -567,10 +531,10 @@ def test__layout_design_matrices():
         ]
     (by_epoch_design_width,
      continuous_design_width) = _layout_design_matrices(fake_rerps)
-    assert fake_rerps[0].by_epoch_design_offset == 0
-    assert fake_rerps[0].continuous_design_offset == 0
-    assert fake_rerps[1].by_epoch_design_offset == 3
-    assert fake_rerps[1].continuous_design_offset == 3 * 10
+    assert fake_rerps[0]._by_epoch_design_offset == 0
+    assert fake_rerps[0]._continuous_design_offset == 0
+    assert fake_rerps[1]._by_epoch_design_offset == 3
+    assert fake_rerps[1]._continuous_design_offset == 3 * 10
     assert by_epoch_design_width == 3 + 5
     assert continuous_design_width == 3 * 10 + 5 * 10
 
@@ -1302,38 +1266,70 @@ def _by_epoch_jobs(dataset, analysis_subspans):
     for epoch in epochs:
         recspan = dataset[epoch.recspan_id]
         data = recspan.iloc[epoch.start_tick:epoch.stop_tick, :]
-        yield (data, epoch)
+        yield (data, epoch.rerp._by_epoch_design_offset, epoch.design_row)
 
 class _ByEpochWorker(object):
     def __init__(self, design_width):
         self._design_width = design_width
 
     def __call__(self, job):
-        data, epoch = job
-        assert data.shape[0] == epoch.stop_tick - epoch.start_tick
+        data, design_offset, design_row = job
         # XX FIXME: making this a sparse array might be more efficient
         x_strip = np.zeros((1, design_width))
-        x_idx = slice(epoch.design_offset,
-                      epoch.design_offset + len(epoch.design_row))
-        x_strip[x_idx] = epoch.design_row
+        x_idx = slice(design_offset, design_offset + len(design_row))
+        x_strip[x_idx] = design_row
         y_strip = data.reshape((1, -1))
         return XtXIncrementalLS.append_top_half(x_strip, y_strip)
+
+def _incremental_fit(worker, jobs_iter):
+    model = XtXIncrementalLS()
+    for job_result in parimap_unordered(worker, jobs_iter):
+        model.append_bottom_half(job_result)
+    result = model.fit()
+    return result.coef()
+
+def _fit_by_epoch(dataset, analysis_subspans, design_width):
+    worker = _ByEpochWorker(design_width)
+    jobs_iter = _by_epoch_jobs(dataset, analysis_subspans)
+    all_betas = _incremental_fit(worker, jobs_iter)
+    # Rearrange the beta matrix so that each column contains results for one
+    # channel, and the rows go:
+    #   predictor 1, latency 1
+    #   ...
+    #   predictor 1, latency n
+    #   predictor 2, latency 1
+    #   ...
+    #   predictor 2, latency n
+    #   ...
+    # Just like the continuous regression strategy spits out by default.
+    all_betas.resize((-1, len(dataset.data_format.channel_names)))
+    return all_betas
+
+_ContinuousEpochInfo = namedtuple("_ContinuousJob",
+                                  ["design_offset", "design_row",
+                                   "start_tick", "ticks"])
 
 def _continuous_jobs(dataset, analysis_subspans):
     for subspan in analysis_subspans:
         recspan = dataset[subspan.start[0]]
         data = recspan.iloc[subspan.start[1]:subspan.stop[1], :]
-        yield data, subspan.start[1], subspan.epochs
+        yield (data,
+               subspan.start[1],
+               [_ContinuousJob(epoch.rerp._continuous_design_offset,
+                               epoch.design_row,
+                               epoch.start_tick,
+                               epoch.ticks)
+                for epoch in epochs])
 
 class _ContinuousWorker(object):
     def __init__(self, expanded_design_width):
         self._expanded_design_width = expanded_design_width
 
     def __call__(self, job):
-        data, data_start_tick, epochs = job
+        data, data_start_tick, epoch_infos = job
         nnz = 0
-        for epoch in epochs:
-            nnz += epoch.design_row.shape[0] * data.shape[0]
+        for epoch_info in epoch_infos:
+            nnz += epoch_info.design_row.shape[0] * data.shape[0]
         design_data = np.empty(nnz, dtype=float)
         design_i = np.empty(nnz, dtype=int)
         design_j = np.empty(nnz, dtype=int)
@@ -1350,14 +1346,14 @@ class _ContinuousWorker(object):
         #   practice I guess it only happens if you have two events of the
         #   same type that occur at exactly the same time).
         for epoch in epochs:
-            for i, x_value in enumerate(epoch.design_row):
+            for i, x_value in enumerate(epoch_info.design_row):
                 write_slice = slice(write_ptr, write_ptr + data.shape[0])
                 write_ptr += data.shape[0]
                 design_data[write_slice] = x_value
                 design_i[write_slice] = np.arange(data.shape[0])
-                col_start = epoch.expanded_design_offset
-                col_start += i * epoch.ticks
-                col_start += data_start_tick - epoch.start_tick
+                col_start = epoch_info.design_offset
+                col_start += i * epoch_info.ticks
+                col_start += data_start_tick - epoch_info.start_tick
                 design_j[write_slice] = np.arange(col_start,
                                                   col_start + data.shape[0])
         x_strip_coo = sp.coo_matrix((design_data, (design_i, design_j)),
@@ -1367,42 +1363,32 @@ class _ContinuousWorker(object):
         y_strip = data
         return XtXIncrementalLS.append_top_half(x_strip, y_strip)
 
+def _fit_continuous(dataset, analysis_subspans, expanded_design_width):
+    worker = _ContinuousWorker(expanded_design_width)
+    jobs_iter = _continuous_jobs(dataset, analysis_subspans)
+    return _incremental_fit(worker, jobs_iter)
+
 ################################################################
 
-class rERPAnalysis(object):
-    def __init__(self, data_format,
-                 rerps, overlap_correction, regression_strategy,
-                 total_wanted_ticks, total_good_ticks,
-                 total_overlap_ticks, total_overlap_multiplicity,
-                 artifact_counts, betas):
-        self.overlap_correction = overlap_correction
-        self.regression_strategy = regression_strategy
-        self.artifact_counts = artifact_counts
-        self.total_wanted_ticks = total_wanted_ticks
-        self.total_good_ticks = total_good_ticks
-        self.total_bad_ticks = total_wanted_ticks - total_good_ticks
-        self.total_overlap_ticks = total_overlap_ticks
-        self.mean_overlap = total_overlap_multiplicity * 1.0 / total_good_ticks
+def _extract_rerp_betas(rerp, all_betas):
+    i = rerp._continuous_design_offset
+    num_predictors = len(rerp.design_info.column_names)
+    num_columns = rerp.ticks * num_predictors
+    betas = all_betas[i:i + num_columns, :]
+    betas.resize((num_predictors, rerp.ticks, -1))
+    return betas
 
-        self.rerps = OrderedDict()
-        for rerp_info in rerps:
-            i = rerp_info["expanded_design_offset"]
-            epoch_len = rerp_info["stop_tick"] - rerp_info["start_tick"]
-            num_predictors = len(rerp_info["design_info"].column_names)
-            this_betas = betas[i:i + epoch_len * num_predictors, :]
-            this_betas.resize((num_predictors, epoch_len, this_betas.shape[1]))
-            self.rerps[rerp_info["spec"].name] = rERP(rerp_info,
-                                                      data_format,
-                                                      this_betas)
+################################################################
 
 class rERP(object):
     # This object is built up over time, which is a terrible design on my
-    # part, because it creates complex interrelationships between the
-    # different parts of the code. But unfortunately I'm not clever enough to
-    # come up with a better solution. To somewhat mitigate the problem, let's
-    # at least explicitly keep track of how built up it is at each point, so
-    # we can have assertions about that.
-    _ALL_PARTS = frozenset(["context", "layout", "accounting", "strategy",
+    # part, because it creates the possibility of complex interrelationships
+    # between the different parts of the code. But unfortunately I'm not
+    # clever enough to come up with a better solution. The different pieces
+    # don't interact too much, fortunately. To somewhat mitigate the problem,
+    # let's at least explicitly keep track of how built up it is at each
+    # point, so we can have assertions about that.
+    _ALL_PARTS = frozenset(["context", "layout", "accounting", "fit-info",
                             "betas"])
     def _has(self, *parts):
         return self._parts.issuperset(parts)
@@ -1429,8 +1415,8 @@ class rERP(object):
         self._add_part("context")
 
     def _set_layout(self, by_epoch_design_offset, continuous_design_offset):
-        self.by_epoch_design_offset = by_epoch_design_offset
-        self.continuous_design_offset = continuous_design_offset
+        self._by_epoch_design_offset = by_epoch_design_offset
+        self._continuous_design_offset = continuous_design_offset
         self._add_part("layout")
 
     def _set_accounting(self, global_stats, this_rerp_stats):
@@ -1438,9 +1424,10 @@ class rERP(object):
         self.this_rerp_stats = this_rerp_stats
         self._add_part("accounting")
 
-    def set_strategy(self, strategy):
-        self.regression_strategy = strategy
-        self._add_part("strategy")
+    def _set_fit_info(self, regression_strategy, overlap_correction):
+        self.regression_strategy = regression_strategy
+        self.overlap_correction = overlap_correction
+        self._add_part("fit-info")
 
     def _set_betas(self, betas):
         num_predictors = len(self.design_info.column_names)
@@ -1470,9 +1457,9 @@ class rERP(object):
         else:
             builder = self.design_info.builder
             betas_idx = slice(None)
-        design = build_design_matrices([builder], predictors,
-                                       return_type="dataframe",
-                                       NA_action=NA_action)
+        (design,) = build_design_matrices([builder], predictors,
+                                          return_type="dataframe",
+                                          NA_action=NA_action)
         predicted = np.dot(np.asarray(design).T,
                            np.asarray(self.data)[betas_idx, :, :])
         as_pandas = pandas.Panel(predicted,
@@ -1492,3 +1479,25 @@ class rERP(object):
             raise ValueError("multiple values given for predictors; to make "
                              "several predictions at once, use predict_many")
         return prediction.iloc[0, :, :]
+
+    # Not sure what more API to provide, some ideas:
+
+    # def events_predictor(self, events):
+    #     return _FormulaEnv(events)
+
+    # def design_matrix(self, events, which_terms=None, NA_action="raise"):
+    #     if which_terms is not None:
+    #         builder = self.design_info.builder.subset(which_terms)
+    #     else:
+    #         builder = self.design_info.builder
+    #     data = _FormulaEnv(events)
+    #     (design,) = build_design_matrices([builder], data,
+    #                                       return_type="dataframe",
+    #                                       NA_action=NA_action)
+    #     return design
+
+    # def predict_events(self, events, which_terms=None, NA_action="raise"):
+    #     predictors = _FormulaEnv(events)
+    #     return self.predict_many(predictors,
+    #                              which_terms=which_terms,
+    #                              NA_action=NA_action)
