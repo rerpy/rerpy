@@ -318,6 +318,8 @@ class _XtXAccumulator(object):
         # If you add a dense array to a sparse matrix, what you get out is a
         # dense np.matrix, and we just want to deal with np.ndarray's.
         print "offending code:", self.xtx, xtx
+        print type(self.txt)
+        print type(xtx)
         self.xtx += xtx
         if isinstance(self.xtx, np.matrix):
             self.xtx = np.asarray(self.xtx)
@@ -579,6 +581,7 @@ def _incremental_ls_tst(class_):
         fit = ls.fit()
         check(fit)
     for test_sparse in ([], ["X"], ["Y"], ["X", "Y"]):
+        print "test_sparse", test
         if test_sparse and not hasattr(class_, "_test_sparse"):
             continue
         if "X" in test_sparse:
