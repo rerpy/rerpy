@@ -13,7 +13,7 @@ before_install:
   - sudo apt-get install -qq python-scipy python-pandas cython
   - echo Available by apt-get
   - pip freeze
-  # Need something like scipy 0.10, pandas 0.12, not sure about cython (want memoryview support anyway)
+  # Need something like scipy 0.10, pandas 0.12, not sure about cython (want memoryview support anyway, 0.15 does NOT work, 0.19 does)
   - pip install --use-mirrors --upgrade coverage scipy cython patsy pandas
   - echo Final installation
   - pip freeze
