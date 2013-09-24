@@ -581,7 +581,7 @@ def _incremental_ls_tst(class_):
         fit = ls.fit()
         check(fit)
     for test_sparse in ([], ["X"], ["Y"], ["X", "Y"]):
-        print "test_sparse", test
+        print "test_sparse", test_sparse
         if test_sparse and not hasattr(class_, "_test_sparse"):
             continue
         if "X" in test_sparse:
