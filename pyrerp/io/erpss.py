@@ -352,7 +352,8 @@ def test_read_log():
         from cStringIO import StringIO
         got = read_log(StringIO(data))
         # .sort() is a trick to make sure columns line up
-        assert np.all(expected.sort(axis=1) == got.sort(axis=1))
+        from pandas.util.testing import assert_frame_equal
+        assert_frame_equal(expected.sort(axis=1), got.sort(axis=1))
 
     # The first 80 bytes of arquan25.log (from Delong, Urbach & Kutas 2005)
     data = "01000000ec01010001000000e103010001000000f50601004b00000044070100010000007b0701004b000000ca07010001000000010801004b0000004f08010001000000860801004b000000d5080100".decode("hex")

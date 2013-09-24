@@ -122,8 +122,9 @@ def test_DataSet():
     # Check __iter__
     recspans = list(dataset)
     assert len(recspans) == 4
+    from pandas.util.testing import assert_frame_equal
     for i in xrange(4):
-        assert np.all(recspans[i] == dataset[i])
+        assert_frame_equal(recspans[i], dataset[i])
 
 def test_DataSet_add_recspan():
     # Check the add_recspan convenience method
