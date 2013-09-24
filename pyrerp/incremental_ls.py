@@ -317,9 +317,12 @@ class _XtXAccumulator(object):
         self.rows += rows
         # If you add a dense array to a sparse matrix, what you get out is a
         # dense np.matrix, and we just want to deal with np.ndarray's.
-        print "offending code:", self.xtx, xtx
+        print "offending objects:", repr(self.xtx), repr(xtx)
         print type(self.xtx)
         print type(xtx)
+        import pickle
+        print pickle.dumps(self.xtx).encode("hex")
+        print pickle.dumps(xtx).encode("hex")
         self.xtx += xtx
         if isinstance(self.xtx, np.matrix):
             self.xtx = np.asarray(self.xtx)
@@ -329,7 +332,15 @@ class _XtXAccumulator(object):
         self.y_ssp += y_ssp
         if isinstance(self.y_ssp, np.matrix):
             self.y_ssp = np.asarray(self.y_ssp)
-            
+
+def test_foo():
+    a = np.zeros((2, 2))
+    b = sparse.csc_matrix([[10.0, 45.0], [45.0, 285.0]])
+    print repr(a)
+    print repr(b)
+    a + b
+    a += b
+
 class XtXGroupWeightedIncrementalLS(object):
     """Perform weighted least-squares regression with very large model
     matrices.
