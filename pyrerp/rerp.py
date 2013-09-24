@@ -179,7 +179,11 @@ def multi_rerp_impl(dataset, rerp_requests,
             analysis_subspans.append(subspan)
     accountant.save()
 
-    regression_strategy = _choose_strategy(regression_strategy, rerps)
+    regression_strategy = _choose_strategy(regression_strategy,
+                                           rerps[0].global_stats)
+    for rerp in rerps:
+        rerp._set_strategy(regression_strategy)
+
     # Work out the size of the full design matrices, and fill in the offset
     # fields in rerps. NB: modifies rerps.
     (by_epoch_design_width,
@@ -1032,9 +1036,9 @@ def test__Accountant():
             accountant.count(ticks, epochs, artifacts)
         accountant.save()
         for rerp in rerps:
-            assert rerp.global_artifact_info is rerps[0].global_artifact_info
-        return (rerps[0].global_artifact_info,
-                [rerp.this_artifact_info for rerp in rerps])
+            assert rerp.global_stats is rerps[0].global_stats
+        return (rerps[0].global_stats,
+                [rerp.this_rerp_stats for rerp in rerps])
 
     g, (r0, r1, r2) = make_infos(
         [(1, [], []),
@@ -1216,18 +1220,17 @@ def test__Accountant():
 
 ################################################################
 
-def _choose_strategy(requested_strategy, rerps):
-    assert rerps
+def _choose_strategy(requested_strategy, global_stats):
+    gs = global_stats
     # If there is any overlap, then by_epoch is impossible. (Recall that at
     # this phase in the code, if overlap_correction=False then all overlapping
     # epochs have been split out into independent non-overlapping epochs that
     # happen to refer to the same data, so any overlap really is the sort of
     # overlap that prevents by-epoch regression from working.)
-    gai = rerps[0].global_artifact_info
-    have_overlap = (gai.event_ticks.accepted > gai.ticks.accepted)
+    have_overlap = (gs.event_ticks.accepted > gs.ticks.accepted)
     # If there are any partially accepted, partially not-accepted epochs, then
     # by_epoch is impossible.
-    have_partial_epochs = (gai.epochs.partially_accepted > 0)
+    have_partial_epochs = (gs.epochs.partially_accepted > 0)
     by_epoch_possible = not (have_overlap or have_partial_epochs)
     if requested_strategy == "continuous":
         return requested_strategy
@@ -1256,6 +1259,34 @@ def _choose_strategy(requested_strategy, rerps):
         raise ValueError("Unknown regression strategy %r requested; must be "
                          "\"by-epoch\", \"continuous\", or \"auto\""
                          % (requested_strategy,))
+
+def test__choose_strategy():
+    from nose.tools import assert_raises
+    overlapped = RejectionOverlapStats()
+    overlapped.ticks.accepted = 10
+    overlapped.event_ticks.accepted = 11
+    partial_rej = RejectionOverlapStats()
+    partial_rej.epochs.partially_accepted = 1
+    both = RejectionOverlapStats()
+    both.ticks.accepted = 10
+    both.event_ticks.accepted = 11
+    both.epochs.partially_accepted = 1
+    clean = RejectionOverlapStats()
+    clean.ticks.accepted = 10
+    clean.event_ticks.accepted = 10
+    clean.epochs.fully_rejected = 5
+
+    for stats in [overlapped, partial_rej, both, clean]:
+        assert _choose_strategy("continuous", stats) == "continuous"
+        assert_raises(ValueError, _choose_strategy, "asdf", stats)
+    assert  _choose_strategy("auto", overlapped) == "continuous"
+    assert  _choose_strategy("auto", partial_rej) == "continuous"
+    assert  _choose_strategy("auto", both) == "continuous"
+    assert  _choose_strategy("auto", clean) == "by-epoch"
+    assert_raises(ValueError, _choose_strategy, "by-epoch", overlapped)
+    assert_raises(ValueError, _choose_strategy, "by-epoch", partial_rej)
+    assert_raises(ValueError, _choose_strategy, "by-epoch", both)
+    assert  _choose_strategy("by-epoch", clean) == "by-epoch"
 
 ################################################################
 
@@ -1371,7 +1402,8 @@ class rERP(object):
     # come up with a better solution. To somewhat mitigate the problem, let's
     # at least explicitly keep track of how built up it is at each point, so
     # we can have assertions about that.
-    _ALL_PARTS = frozenset(["context", "layout", "accounting", "betas"])
+    _ALL_PARTS = frozenset(["context", "layout", "accounting", "strategy",
+                            "betas"])
     def _has(self, *parts):
         return self._parts.issuperset(parts)
     def _is_complete(self):
@@ -1401,10 +1433,14 @@ class rERP(object):
         self.continuous_design_offset = continuous_design_offset
         self._add_part("layout")
 
-    def _set_accounting(self, global_artifact_info, this_artifact_info):
-        self.global_artifact_info = global_artifact_info
-        self.this_artifact_info = this_artifact_info
+    def _set_accounting(self, global_stats, this_rerp_stats):
+        self.global_stats = global_stats
+        self.this_rerp_stats = this_rerp_stats
         self._add_part("accounting")
+
+    def set_strategy(self, strategy):
+        self.regression_strategy = strategy
+        self._add_part("strategy")
 
     def _set_betas(self, betas):
         num_predictors = len(self.design_info.column_names)
