@@ -429,4 +429,5 @@ class MPimap(object):
         self._transition(self._CLOSED)
 
     def __del__(self):
-        self.close()
+        if hasattr(self, "_state"):
+            self.close()
