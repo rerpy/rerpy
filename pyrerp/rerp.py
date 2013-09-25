@@ -64,6 +64,10 @@ def test_rERPRequest():
     assert one_deeper(x2, 0).eval_env.namespace["x"] is x2
     from nose.tools import assert_raises
     assert_raises(ValueError, rERPRequest, "asdf", 100, 0)
+    # smoke test
+    repr(rERPRequest("useful query", -100, 1000, formula="x"))
+    repr(rERPRequest("useful query", -100, 1000, formula="x",
+                     all_or_nothing=True, bad_event_query="asdf"))
 
 def rerp(dataset, rerp_request, *args, **kwargs):
     return multi_rerp(dataset, [rerp_request], *args, **kwargs)[0]
@@ -130,6 +134,8 @@ def multi_rerp(dataset,
     elif regression_strategy == "continuous":
         all_betas = _fit_continuous(dataset, analysis_subspans,
                                     continuous_design_width)
+    else: # pragma: no cover
+        assert False
     # And finally, we unpack the combined betas into those belonging to each
     # rERP.
     for rerp in rerps:
@@ -241,7 +247,7 @@ def test__artifact_spans():
 
     from nose.tools import assert_raises
     assert_raises(TypeError,
-                  list, _artifact_spans, ds, "has _ARTIFACT_TYPE", "number")
+                  list, _artifact_spans(ds, "has _ARTIFACT_TYPE", "number"))
 
 ################################################################
 
