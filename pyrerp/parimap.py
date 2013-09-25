@@ -111,14 +111,25 @@ class _CrossProcessExceptionMixin(object):
         return self._parimap_mapper.post_mortem()
 
     def __str__(self):
-        return ("\n-- Traceback from worker process --\n%s"
-                "%s: %s\n\n"
-                "If running from interactive shell, to open a debugger use:\n"
-                "   import sys; sys.last_value.pm()"
-                % ("".join(traceback.format_list(self._parimap_traceback_list)),
-                   self._parimap_orig_class.__name__,
-                   self._parimap_orig_class.__str__(self),
-                   ))
+        # nose likes to perform some shenanigans, where when it catches one
+        # exception it creates a new one by calling
+        #   exc.__type__(modified_exc_string)
+        # this creates an object that will normally print the same as the
+        # original exception, but is missing our special stuff.
+        if not hasattr(self, "_parimap_traceback_list"):
+            return super(_CrossProcessExceptionMixin, self).__str__()
+        try:
+            return ("\n-- Traceback from worker process --\n%s"
+                    "%s: %s\n\n"
+                    "If running from interactive shell, to open a debugger use:\n"
+                    "   import sys; sys.last_value.pm()"
+                    % ("".join(traceback.format_list(self._parimap_traceback_list)),
+                       self._parimap_orig_class.__name__,
+                       self._parimap_orig_class.__str__(self),
+                       ))
+        except Exception, e:
+            return "<unprintable %s b/c of %s>" % (
+                self.__class__.__name__, e)
 
 def _try_wrap_exception(exc, traceback_list, mapper):
     if not isinstance(exc, object):
