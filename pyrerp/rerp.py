@@ -1320,7 +1320,7 @@ def _fit_by_epoch(dataset, analysis_subspans, design_width):
     all_betas = all_betas.reshape((-1, len(dataset.data_format.channel_names)))
     return all_betas
 
-_ContinuousEpochInfo = namedtuple("_ContinuousJob",
+_ContinuousEpochInfo = namedtuple("_ContinuousEpochInfo",
                                   ["design_offset", "design_row",
                                    "start_tick", "ticks"])
 
@@ -1330,11 +1330,11 @@ def _continuous_jobs(dataset, analysis_subspans):
         data = np.asarray(recspan.iloc[subspan.start[1]:subspan.stop[1], :])
         yield (data,
                subspan.start[1],
-               [_ContinuousJob(epoch.rerp._continuous_design_offset,
-                               epoch.design_row,
-                               epoch.start_tick,
-                               epoch.stop_tick - epoch.start_tick)
-                for epoch in epochs])
+               [_ContinuousEpochInfo(epoch.rerp._continuous_design_offset,
+                                     epoch.design_row,
+                                     epoch.start_tick,
+                                     epoch.stop_tick - epoch.start_tick)
+                for epoch in subspan.epochs])
 
 class _ContinuousWorker(object):
     def __init__(self, expanded_design_width):
@@ -1360,7 +1360,7 @@ class _ContinuousWorker(object):
         #   thing to do in our case (though it should be very rare -- in
         #   practice I guess it only happens if you have two events of the
         #   same type that occur at exactly the same time).
-        for epoch in epochs:
+        for epoch_info in epoch_infos:
             for i, x_value in enumerate(epoch_info.design_row):
                 write_slice = slice(write_ptr, write_ptr + data.shape[0])
                 write_ptr += data.shape[0]
