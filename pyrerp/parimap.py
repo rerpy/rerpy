@@ -168,10 +168,11 @@ if CONFIG_ENVVAR in os.environ:
                          % (CONFIG_ENVVAR, tag))
 
 def configure(mode=None, processes=None):
+    global _config
     if mode is not None:
-        self._config["mode"] = mode
+        _config["mode"] = mode
     if processes is not None:
-        self._config["processes"] = processes
+        _config["processes"] = processes
 
 class _OrderPreserver(object):
     def __init__(self, fn):
@@ -209,6 +210,8 @@ def parimap_unordered(fn, *iterables, **kwargs):
         return itertools.imap(fn, *iterators, **kwargs)
     elif _config["mode"] == "multiprocess":
         return MPimap(fn, iterators, kwargs, special_args)
+    else:
+        assert False, "bad parimap mode"
 
 def _mpimap_worker(worker_id, fn, kwargs,
                    work_queue, result_queue,
