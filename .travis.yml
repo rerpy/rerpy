@@ -22,7 +22,9 @@ script:
   - mkdir empty
   - cd empty
   - INSTALLDIR=$(python -c "import os; import pyrerp; print(os.path.dirname(pyrerp.__file__))")
-  - export PYTHONWARNINGS=default PYRERP_FORCE_NO_WARNINGS=1
+  # PYRERP_WARNINGS_MODE=error would make more sense, but with numpy
+  # 1.7.1 that triggers a bug when doing ndarray += csc_matrix.
+  - export PYTHONWARNINGS=default PYRERP_WARNINGS_MODE=once
   # The --exe is because python sometimes marks all installed modules
   # as executable, so without --exe nosetests will just ignore
   # everything. Baffling, but so it goes.

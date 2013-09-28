@@ -6,8 +6,9 @@ __version__ = "0.0.0+dev"
 
 # Do this first, to make it easy to check for warnings while testing:
 import os
-if os.environ.get("PYRERP_FORCE_NO_WARNINGS"):
+if "PYRERP_WARNINGS_MODE" in os.environ:
     import warnings
-    warnings.filterwarnings("error", module="^pyrerp")
+    warnings.filterwarnings(os.environ["PYRERP_WARNINGS_MODE"],
+                            module="^pyrerp")
     del warnings
 del os
