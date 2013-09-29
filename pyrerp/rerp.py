@@ -1428,6 +1428,8 @@ class rERP(object):
         self.stop_time = float(request.stop_time)
         self.formula = str(request.formula)
         self.bad_event_query = request.bad_event_query
+        if self.bad_event_query is not None:
+            self.bad_event_query = str(self.bad_event_query)
         self.all_or_nothing = request.all_or_nothing
 
         self.data_format = data_format
