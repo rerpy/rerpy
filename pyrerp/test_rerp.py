@@ -33,8 +33,8 @@ def test_rerp_simple():
                           regression_strategy=regression_strategy,
                           overlap_correction=overlap_correction) == []
 
-        standard_req = rERPRequest("type == 'standard'", -2, 4)
-        target_req = rERPRequest("type == 'target'", -2, 4)
+        standard_req = rERPRequest("type == 'standard'", -2, 4, "~ 1")
+        target_req = rERPRequest("type == 'target'", -2, 4, "~ 1")
         erps = multi_rerp(ds, [standard_req, target_req],
                           regression_strategy=regression_strategy,
                           overlap_correction=overlap_correction)
@@ -44,7 +44,7 @@ def test_rerp_simple():
         for i, erp in enumerate([standard_erp, target_erp]):
             assert erp.start_time == -2
             assert erp.stop_time == 4
-            assert erp.formula == "1"
+            assert erp.formula == "~ 1"
             assert erp.bad_event_query is None
             assert erp.all_or_nothing == False
             assert erp.data_format is ds.data_format
@@ -124,6 +124,7 @@ def test_rerp_simple():
                            target_avg - standard_avg)
 
         ################
+
         both_req2 = rERPRequest("has type", -2, 4, formula="~ 0 + type")
         erps = multi_rerp(ds, [both_req2],
                           regression_strategy=regression_strategy,
@@ -134,6 +135,7 @@ def test_rerp_simple():
         assert np.allclose(both_erp2.betas["type[standard]"], standard_avg)
         assert np.allclose(both_erp2.betas["type[target]"], target_avg)
 
+        ################
         # regular artifact (check accounting)
         if regression_strategy == "by-epoch":
             assert_raises(ValueError, multi_rerp, ds, [both_req2],
@@ -162,6 +164,7 @@ def test_rerp_simple():
             assert np.allclose(both_erp3.betas["type[target]"],
                                target_art_avg)
 
+        ################
         # all or nothing
         both_req4 = rERPRequest("has type", -2, 4, formula="~ 0 + type",
                                 all_or_nothing=True)
@@ -176,6 +179,7 @@ def test_rerp_simple():
         assert np.allclose(both_erp4.betas["type[target]"],
                            (target_epoch0 + target_epoch1) / 2.0)
 
+        ################
         # bad_event_query
         both_req5 = rERPRequest("has type", -2, 4, formula="~ 0 + type",
                                 bad_event_query="_START_TICK == 20")
@@ -197,6 +201,82 @@ def test_rerp_simple():
             assert np.allclose(both_erp5.betas["type[target]"],
                                target_art_avg)
 
-        # overlap
+def test_rerp_overlap():
+    # A very simple case where overlap correction can be worked out by hand:
+    #  event type A: |-- 1 --|   |-- 2 --|
+    #  event type B:                  |-- 3 --|
+    # The rerp for event type A will be:
+    #   the average of 1 & 2 in the part where the epoch 2 has no overlap
+    #   just the values from 1 in the part where epoch 2 has overlap
+    # The rerp for event type B will be:
+    #   the difference between the values in 3 and 1 in the part where 2 and 3
+    #     overlap
+    #   just the values from 3 in the part where 3 does not overlap
+    HALF_EPOCH = 1
+    EPOCH = 2 * HALF_EPOCH
+    ds = mock_dataset(num_channels=2, ticks_per_recspan=10 * EPOCH, hz=1000)
+    ds.add_event(0, 0, 1, {"type": "A"})
+    ds.add_event(0, 4 * HALF_EPOCH, 4 * HALF_EPOCH + 1, {"type": "A"})
+    ds.add_event(0, 5 * HALF_EPOCH, 5 * HALF_EPOCH + 1, {"type": "B"})
 
-        # predict
+    epoch1 = np.asarray(ds[0].iloc[0:EPOCH, :])
+    epoch2 = np.asarray(ds[0].iloc[4 * HALF_EPOCH:6 * HALF_EPOCH, :])
+    epoch3 = np.asarray(ds[0].iloc[5 * HALF_EPOCH:7 * HALF_EPOCH, :])
+
+    expected_A = np.empty((EPOCH, 2))
+    expected_A[:HALF_EPOCH, :] = ((epoch1 + epoch2) / 2)[:HALF_EPOCH, :]
+    expected_A[HALF_EPOCH:, :] = epoch1[HALF_EPOCH:, :]
+    expected_B = np.empty((EPOCH, 2))
+    # Notice that the indexes here are different for the different arrays:
+    expected_B[:HALF_EPOCH, :] = epoch3[:HALF_EPOCH, :] - epoch1[HALF_EPOCH:, :]
+    expected_B[HALF_EPOCH:, :] = epoch3[HALF_EPOCH:, :]
+
+    req = rERPRequest("True", 0, EPOCH - 1, formula="0 + type")
+
+    for (regression_strategy, overlap_correction, parimap_mode) in product(
+        ["auto", "by-epoch", "continuous"],
+        [True, False],
+        ["serial", "multiprocess"]):
+
+        pyrerp.parimap.configure(mode=parimap_mode)
+        if overlap_correction and regression_strategy == "by-epoch":
+            assert_raises(ValueError,
+                          multi_rerp, ds, [req],
+                          regression_strategy=regression_strategy,
+                          overlap_correction=overlap_correction)
+        else:
+            rerp, = multi_rerp(ds, [req],
+                               regression_strategy=regression_strategy,
+                               overlap_correction=overlap_correction)
+            if overlap_correction:
+                assert np.allclose(rerp.betas["type[A]"], expected_A)
+                assert np.allclose(rerp.betas["type[B]"], expected_B)
+                assert rerp.regression_strategy == "continuous"
+                s = rerp.global_stats
+                assert s.ticks.requested == 5 * HALF_EPOCH
+                assert s.ticks.accepted == 5 * HALF_EPOCH
+                assert s.event_ticks.requested == 3 * EPOCH
+                assert s.event_ticks.accepted == 3 * EPOCH
+                # all of epoch 1, plus half of epoch 2 and half of epoch 3:
+                assert s.no_overlap_ticks.requested == 4 * HALF_EPOCH
+                assert s.no_overlap_ticks.accepted == 4 * HALF_EPOCH
+            else:
+                assert np.allclose(rerp.betas["type[A]"],
+                                   (epoch1 + epoch2) / 2)
+                assert np.allclose(rerp.betas["type[B]"], epoch3)
+                if regression_strategy == "auto":
+                    assert rerp.regression_strategy == "by-epoch"
+                else:
+                    assert rerp.regression_strategy == regression_strategy
+                s = rerp.global_stats
+                assert s.ticks.requested == 3 * EPOCH
+                assert s.ticks.accepted == 3 * EPOCH
+                assert s.event_ticks.requested == 3 * EPOCH
+                assert s.event_ticks.accepted == 3 * EPOCH
+                assert s.no_overlap_ticks.requested == 3 * EPOCH
+                assert s.no_overlap_ticks.accepted == 3 * EPOCH
+
+def test_predict():
+    pass
+
+# no-epochs-available or no-data-available error reporting? what happens?

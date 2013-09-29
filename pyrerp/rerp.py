@@ -22,8 +22,8 @@ from pyrerp.util import indent
 ################################################################
 
 class rERPRequest(object):
-    def __init__(self, event_query, start_time, stop_time,
-                 formula="1", name=None, eval_env=0,
+    def __init__(self, event_query, start_time, stop_time, formula,
+                 name=None, eval_env=0,
                  bad_event_query=None, all_or_nothing=False):
         if name is None:
             name = "%s: %s" % (event_query, formula)
@@ -42,31 +42,32 @@ class rERPRequest(object):
     __repr__ = repr_pretty_delegate
     def _repr_pretty_(self, p, cycle):
         assert not cycle
-        kwargs = [("formula", self.formula), ("name", self.name)]
+        kwargs = [("name", self.name)]
         if self.bad_event_query:
             kwargs.append(("bad_event_query", self.bad_event_query))
         if self.all_or_nothing:
             kwargs.append(("all_or_nothing", self.all_or_nothing))
         return repr_pretty_impl(p, self,
                                 [self.event_query,
-                                 self.start_time, self.stop_time],
+                                 self.start_time, self.stop_time,
+                                 self.formula],
                                 kwargs)
 
 def test_rERPRequest():
     x = object()
-    req = rERPRequest("useful query", -100, 1000, formula="x")
+    req = rERPRequest("useful query", -100, 1000, "x")
     assert req.name == "useful query: x"
     assert req.eval_env.namespace["x"] is x
     def one_deeper(x, level):
-        return rERPRequest("foo", -100, 1000, eval_env=level)
+        return rERPRequest("foo", -100, 1000, "1", eval_env=level)
     x2 = object()
     assert one_deeper(x2, 1).eval_env.namespace["x"] is x
     assert one_deeper(x2, 0).eval_env.namespace["x"] is x2
     from nose.tools import assert_raises
-    assert_raises(ValueError, rERPRequest, "asdf", 100, 0)
+    assert_raises(ValueError, rERPRequest, "asdf", 100, 0, "1")
     # smoke test
-    repr(rERPRequest("useful query", -100, 1000, formula="x"))
-    repr(rERPRequest("useful query", -100, 1000, formula="x",
+    repr(rERPRequest("useful query", -100, 1000, "x"))
+    repr(rERPRequest("useful query", -100, 1000, "x",
                      all_or_nothing=True, bad_event_query="asdf"))
 
 # Can't decide what to do with this...
@@ -186,9 +187,9 @@ def _check_unique_names(rerp_requests):
         rerp_names.add(rerp_request.name)
 
 def test__check_unique_names():
-    req1 = rERPRequest("asdf", -100, 1000, name="req1")
-    req1_again = rERPRequest("asdf", -100, 1000, name="req1")
-    req2 = rERPRequest("asdf", -100, 1000, name="req2")
+    req1 = rERPRequest("asdf", -100, 1000, "1", name="req1")
+    req1_again = rERPRequest("asdf", -100, 1000, "1", name="req1")
+    req2 = rERPRequest("asdf", -100, 1000, "1", name="req2")
     from nose.tools import assert_raises
     _check_unique_names([req1, req2])
     _check_unique_names([req1_again, req2])
@@ -446,7 +447,7 @@ def test__epoch_info_and_spans():
     ds.add_event(1, 40, 41, {"include": True, "a": None}) # missing predictor
     ds.add_event(1, 50, 51, {"include": True, "a": 6})
 
-    req = rERPRequest("include", -10, 10, formula="a")
+    req = rERPRequest("include", -10, 10, "a")
     rerp, spans = _epoch_info_and_spans(ds, req)
     # [-10 ms, 10 ms] -> [-8 ms, 8 ms] -> [-2 tick, 2 tick] -> [-2 tick, 3 tick)
     assert rerp.start_tick == -2
@@ -484,14 +485,14 @@ def test__epoch_info_and_spans():
                              [(18, 22), (5, 6)],
                              [(20, 20), (5, 6)],
                              ]:
-        req = rERPRequest("include", times[0], times[1], formula="a")
+        req = rERPRequest("include", times[0], times[1], "a")
         rerp, _ = _epoch_info_and_spans(ds, req)
         assert rerp.start_tick == exp_ticks[0]
         assert rerp.stop_tick == exp_ticks[1]
 
     # No samples -> error
     from nose.tools import assert_raises
-    req_tiny = rERPRequest("include", 1, 3, formula="a")
+    req_tiny = rERPRequest("include", 1, 3, "a")
     assert_raises(ValueError, _epoch_info_and_spans, ds, req_tiny)
     # But the same req it's fine with a higher-res data set
     ds_high_hz = mock_dataset(hz=1000)
@@ -501,7 +502,7 @@ def test__epoch_info_and_spans():
     assert rerp.stop_tick == 4
 
     # bad_event_query
-    req = rERPRequest("include", -10, 10, formula="a",
+    req = rERPRequest("include", -10, 10, "a",
                       bad_event_query="a == None or a == 6")
     rerp, spans = _epoch_info_and_spans(ds, req)
     assert [s.epoch.intrinsic_artifacts for s in spans] == [
@@ -531,10 +532,10 @@ def _layout_design_matrices(rerps):
 def test__layout_design_matrices():
     from patsy import DesignInfo
     fake_rerps = [
-        rERP(rERPRequest("asdf", -100, 1000), None,
+        rERP(rERPRequest("asdf", -100, 1000, "1"), None,
              DesignInfo.from_array(np.ones((1, 3))),
              -2, 8),
-        rERP(rERPRequest("asdf", -100, 1000), None,
+        rERP(rERPRequest("asdf", -100, 1000, "1"), None,
              DesignInfo.from_array(np.ones((1, 5))),
              10, 20),
         ]
@@ -743,7 +744,8 @@ def test__propagate_all_or_nothing():
     # convenience function for making mock epoch spans
     def e(start, stop, all_or_nothing, expected_survival,
           starts_with_intrinsic=False):
-        req = rERPRequest("asdf", -100, 1000, all_or_nothing=all_or_nothing)
+        req = rERPRequest("asdf", -100, 1000, "1",
+                          all_or_nothing=all_or_nothing)
         rerp = rERP(req, None, None, -25, 250)
         i_a = []
         if starts_with_intrinsic:
@@ -992,7 +994,7 @@ class _Accountant(object):
 
 def test__Accountant():
     def make_rerps(N):
-        rerps = [rERP(rERPRequest("asdf", -100, 1000),
+        rerps = [rERP(rERPRequest("asdf", -100, 1000, "1"),
                       None, None, 0, 0) for i in xrange(N)]
         for i, rerp in enumerate(rerps):
             rerp._set_context(i, N)
@@ -1383,6 +1385,10 @@ class _ContinuousWorker(object):
                                            self._expanded_design_width))
         x_strip = x_strip_coo.tocsc()
         y_strip = data
+        # print "x strip at %s:" % (data_start_tick,)
+        # print x_strip.todense()
+        # print "y strip at %s:" % (data_start_tick,)
+        # print y_strip
         return XtXIncrementalLS.append_top_half(x_strip, y_strip)
 
 def _fit_continuous(dataset, analysis_subspans, expanded_design_width):
