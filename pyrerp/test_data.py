@@ -136,7 +136,7 @@ def test_DataSet_events():
 
     for args, kwargs, expected in [((1, 13), {}, [e1]),
                                    ((2, 13), {}, [e2]),
-                                   ((1, 13), {"subset": "a == 2"}, []),
+                                   ((1, 13), {"restrict": "a == 2"}, []),
                                    ((1, 8, 12), {}, [e1]),
                                    ]:
         assert dataset.events_at(*args, **kwargs) == expected
@@ -248,7 +248,7 @@ def test_DataSet_merge_df():
                           "code2": [10, 10, 11],
                           "foo": ["a", "b", "c"]}),
         on={"code": "code2", "code2": "code"},
-        subset="code == 10")
+        restrict="code == 10")
     assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
     assert dict(ev2) == {"code": 10, "code2": 21, "foo": "b"}
     assert dict(ev3) == {"code": 11, "code2": 20}

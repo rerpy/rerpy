@@ -9,11 +9,11 @@ import pandas
 
 from nose.tools import assert_raises
 
-from pyrerp.rerp import rERPRequest, multi_rerp
+from pyrerp.rerp import rERPRequest
 from pyrerp.test_data import mock_dataset
 import pyrerp.parimap
 
-def test_rerp_simple():
+def test_multi_rerp():
     ds = mock_dataset(num_channels=2, hz=1000)
     ds.add_event(0, 10, 11, {"type": "standard"})
     ds.add_event(0, 20, 21, {"type": "standard"})
@@ -29,15 +29,15 @@ def test_rerp_simple():
 
         pyrerp.parimap.configure(mode=parimap_mode)
 
-        assert multi_rerp(ds, [],
-                          regression_strategy=regression_strategy,
-                          overlap_correction=overlap_correction) == []
+        assert ds.multi_rerp([],
+                             regression_strategy=regression_strategy,
+                             overlap_correction=overlap_correction) == []
 
         standard_req = rERPRequest("type == 'standard'", -2, 4, "~ 1")
         target_req = rERPRequest("type == 'target'", -2, 4, "~ 1")
-        erps = multi_rerp(ds, [standard_req, target_req],
-                          regression_strategy=regression_strategy,
-                          overlap_correction=overlap_correction)
+        erps = ds.multi_rerp([standard_req, target_req],
+                             regression_strategy=regression_strategy,
+                             overlap_correction=overlap_correction)
         standard_erp, target_erp = erps
         assert standard_erp.event_query == "type == 'standard'"
         assert target_erp.event_query == "type == 'target'"
@@ -81,9 +81,9 @@ def test_rerp_simple():
         ################
 
         both_req = rERPRequest("has type", -2, 4, formula="~ type")
-        erps = multi_rerp(ds, [both_req],
-                          regression_strategy=regression_strategy,
-                          overlap_correction=overlap_correction)
+        erps = ds.multi_rerp([both_req],
+                             regression_strategy=regression_strategy,
+                             overlap_correction=overlap_correction)
         both_erp, = erps
         assert both_erp.event_query == "has type"
         assert both_erp.start_time == -2
@@ -126,9 +126,9 @@ def test_rerp_simple():
         ################
 
         both_req2 = rERPRequest("has type", -2, 4, formula="~ 0 + type")
-        erps = multi_rerp(ds, [both_req2],
-                          regression_strategy=regression_strategy,
-                          overlap_correction=overlap_correction)
+        erps = ds.multi_rerp([both_req2],
+                             regression_strategy=regression_strategy,
+                             overlap_correction=overlap_correction)
         both_erp2, = erps
         assert both_erp2.design_info.column_names == ["type[standard]",
                                                       "type[target]"]
@@ -138,15 +138,15 @@ def test_rerp_simple():
         ################
         # regular artifact (check accounting)
         if regression_strategy == "by-epoch":
-            assert_raises(ValueError, multi_rerp, ds, [both_req2],
+            assert_raises(ValueError, ds.multi_rerp, [both_req2],
                           artifact_query="has maybe_artifact",
                           regression_strategy=regression_strategy,
                           overlap_correction=overlap_correction)
         else:
-            both_erp3, = multi_rerp(ds, [both_req2],
-                                    artifact_query="has maybe_artifact",
-                                    regression_strategy=regression_strategy,
-                                    overlap_correction=overlap_correction)
+            both_erp3, = ds.multi_rerp([both_req2],
+                                       artifact_query="has maybe_artifact",
+                                       regression_strategy=regression_strategy,
+                                       overlap_correction=overlap_correction)
             assert both_erp3.regression_strategy == "continuous"
             assert both_erp3.global_stats.epochs.requested == 5
             assert both_erp3.global_stats.epochs.fully_accepted == 4
@@ -168,10 +168,10 @@ def test_rerp_simple():
         # all or nothing
         both_req4 = rERPRequest("has type", -2, 4, formula="~ 0 + type",
                                 all_or_nothing=True)
-        both_erp4, = multi_rerp(ds, [both_req4],
-                                artifact_query="has maybe_artifact",
-                                regression_strategy=regression_strategy,
-                                overlap_correction=overlap_correction)
+        both_erp4, = ds.multi_rerp([both_req4],
+                                   artifact_query="has maybe_artifact",
+                                   regression_strategy=regression_strategy,
+                                   overlap_correction=overlap_correction)
         if regression_strategy == "auto":
             assert both_erp4.regression_strategy == "by-epoch"
         assert np.allclose(both_erp4.betas["type[standard]"],
@@ -184,15 +184,15 @@ def test_rerp_simple():
         both_req5 = rERPRequest("has type", -2, 4, formula="~ 0 + type",
                                 bad_event_query="_START_TICK == 20")
         if regression_strategy == "by-epoch":
-            assert_raises(ValueError, multi_rerp, ds, [both_req5],
+            assert_raises(ValueError, ds.multi_rerp, [both_req5],
                           artifact_query="has maybe_artifact",
                           regression_strategy=regression_strategy,
                           overlap_correction=overlap_correction)
         else:
-            both_erp5, = multi_rerp(ds, [both_req5],
-                                    artifact_query="has maybe_artifact",
-                                    regression_strategy=regression_strategy,
-                                    overlap_correction=overlap_correction)
+            both_erp5, = ds.multi_rerp([both_req5],
+                                       artifact_query="has maybe_artifact",
+                                       regression_strategy=regression_strategy,
+                                       overlap_correction=overlap_correction)
             assert both_erp5.regression_strategy == "continuous"
             # standard_epoch1 is knocked out by bad_event_query
             assert np.allclose(both_erp5.betas["type[standard]"],
@@ -231,8 +231,6 @@ def test_rerp_overlap():
     expected_B[:HALF_EPOCH, :] = epoch3[:HALF_EPOCH, :] - epoch1[HALF_EPOCH:, :]
     expected_B[HALF_EPOCH:, :] = epoch3[HALF_EPOCH:, :]
 
-    req = rERPRequest("True", 0, EPOCH - 1, formula="0 + type")
-
     for (regression_strategy, overlap_correction, parimap_mode) in product(
         ["auto", "by-epoch", "continuous"],
         [True, False],
@@ -241,13 +239,13 @@ def test_rerp_overlap():
         pyrerp.parimap.configure(mode=parimap_mode)
         if overlap_correction and regression_strategy == "by-epoch":
             assert_raises(ValueError,
-                          multi_rerp, ds, [req],
+                          ds.rerp, "True", 0, EPOCH - 1, "0 + type",
                           regression_strategy=regression_strategy,
                           overlap_correction=overlap_correction)
         else:
-            rerp, = multi_rerp(ds, [req],
-                               regression_strategy=regression_strategy,
-                               overlap_correction=overlap_correction)
+            rerp = ds.rerp("True", 0, EPOCH - 1, "0 + type",
+                           regression_strategy=regression_strategy,
+                           overlap_correction=overlap_correction)
             if overlap_correction:
                 assert np.allclose(rerp.betas["type[A]"], expected_A)
                 assert np.allclose(rerp.betas["type[B]"], expected_B)
@@ -277,6 +275,85 @@ def test_rerp_overlap():
                 assert s.no_overlap_ticks.accepted == 3 * EPOCH
 
 def test_predict():
-    pass
+    ds = mock_dataset(num_channels=2, hz=1000)
+    ds.add_event(0, 10, 11, {"type": "standard", "x": 1})
+    ds.add_event(0, 20, 21, {"type": "standard", "x": 2})
+    ds.add_event(0, 30, 31, {"type": "target", "x": 3})
+    ds.add_event(0, 40, 41, {"type": "target", "x": 4})
+
+    rerp = ds.rerp("has type", 0, 10, "type + x")
+
+    for predictors in [{"type": ["standard"], "x": [5]},
+                       {"type": "standard", "x": 5},
+                       pandas.DataFrame({"type": ["standard"], "x": [5]}),
+                       ]:
+        prediction = rerp.predict(predictors)
+        assert isinstance(prediction, pandas.DataFrame)
+        assert np.all(prediction.index == rerp.betas.major_axis)
+        assert np.all(prediction.columns == rerp.betas.minor_axis)
+        assert np.allclose(prediction,
+                           rerp.betas["Intercept"] + 5 * rerp.betas["x"])
+
+        prediction = rerp.predict(predictors, which_terms="0 + x")
+        assert isinstance(prediction, pandas.DataFrame)
+        assert np.all(prediction.index == rerp.betas.major_axis)
+        assert np.all(prediction.columns == rerp.betas.minor_axis)
+        assert np.allclose(prediction, 5 * rerp.betas["x"])
+
+        prediction = rerp.predict(predictors, which_terms="0 + type + x")
+        assert isinstance(prediction, pandas.DataFrame)
+        assert np.allclose(prediction, 5 * rerp.betas["x"])
+
+    prediction = rerp.predict_many({"type": ["standard", "target"],
+                                    "x": [4, 5]})
+    assert isinstance(prediction, pandas.Panel)
+    assert np.all(prediction.items == [0, 1])
+    assert np.all(prediction.major_axis == rerp.betas.major_axis)
+    assert np.all(prediction.minor_axis == rerp.betas.minor_axis)
+    assert np.allclose(prediction[0],
+                       rerp.betas["Intercept"] + 4 * rerp.betas["x"])
+    assert np.allclose(prediction[1],
+                       rerp.betas["Intercept"]
+                         + rerp.betas["type[T.target]"]
+                         + 5 * rerp.betas["x"])
+    # non-trivial index on input
+    predictors = pandas.DataFrame({"type": ["standard", "target"],
+                                   "x": [4, 5]},
+                                  index=[10, 20])
+    prediction2 = rerp.predict_many(predictors)
+    assert np.all(prediction2.items == [10, 20])
+    assert np.all(np.asarray(prediction2) == np.asarray(prediction))
+
+    # broadcasting
+    prediction = rerp.predict_many({"type": "standard", "x": [4, 5]})
+    assert isinstance(prediction, pandas.Panel)
+    assert np.all(prediction.items == [0, 1])
+    assert np.all(prediction.major_axis == rerp.betas.major_axis)
+    assert np.all(prediction.minor_axis == rerp.betas.minor_axis)
+    assert np.allclose(prediction[0],
+                       rerp.betas["Intercept"] + 4 * rerp.betas["x"])
+    assert np.allclose(prediction[1],
+                       rerp.betas["Intercept"] + 5 * rerp.betas["x"])
+
+    # all scalars okay (well, this behaviour is kind of unfortunate in fact,
+    # maybe we should return a dataframe in this case instead of a panel, see:
+    #   https://github.com/pydata/patsy/issues/24
+    # but in the mean time, oh well, let's test it):
+    prediction = rerp.predict_many({"type": "standard", "x": 4})
+    assert isinstance(prediction, pandas.Panel)
+    assert np.all(prediction.items == [0])
+    assert np.all(prediction.major_axis == rerp.betas.major_axis)
+    assert np.all(prediction.minor_axis == rerp.betas.minor_axis)
+    assert np.allclose(prediction[0],
+                       rerp.betas["Intercept"] + 4 * rerp.betas["x"])
+
+    # subsetting
+    prediction = rerp.predict_many({"type": "standard", "x": [4, 5]},
+                                   which_terms=["x"])
+    assert np.all(prediction.items == [0, 1])
+    assert np.all(prediction.major_axis == rerp.betas.major_axis)
+    assert np.all(prediction.minor_axis == rerp.betas.minor_axis)
+    assert np.allclose(prediction[0], 4 * rerp.betas["x"])
+    assert np.allclose(prediction[1], 5 * rerp.betas["x"])
 
 # no-epochs-available or no-data-available error reporting? what happens?

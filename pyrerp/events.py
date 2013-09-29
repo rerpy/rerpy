@@ -399,34 +399,34 @@ class Events(object):
     def placeholder_event(self):
         return PlaceholderEvent(self)
 
-    def events_query(self, subset=None):
-        """subset can be {"a": 1, "b": 2} or a Query or a string or a bool
+    def events_query(self, restrict=None):
+        """restrict can be {"a": 1, "b": 2} or a Query or a string or a bool
         or None to mean "all"
         """
-        if isinstance(subset, Query):
-            if subset._events is not self:
+        if isinstance(restrict, Query):
+            if restrict._events is not self:
                 raise ValueError("query object does not refer to this Events "
                                  "object")
-            return subset
-        elif isinstance(subset, dict):
+            return restrict
+        elif isinstance(restrict, dict):
             p = self.placeholder_event()
             query = LiteralQuery(self, True)
             equalities = []
-            for query_name in _magic_query_strings.intersection(subset):
+            for query_name in _magic_query_strings.intersection(restrict):
                 q = _magic_query_string_to_query(self, query_name)
-                query &= (q == subset.pop(query_name))
-            for k, v in subset.iteritems():
+                query &= (q == restrict.pop(query_name))
+            for k, v in restrict.iteritems():
                 query &= (p[k] == v)
             return query
-        elif isinstance(subset, basestring):
-            return _query_from_string(self, subset)
-        elif isinstance(subset, bool):
-            return LiteralQuery(self, subset)
-        elif subset is None:
+        elif isinstance(restrict, basestring):
+            return _query_from_string(self, restrict)
+        elif isinstance(restrict, bool):
+            return LiteralQuery(self, restrict)
+        elif restrict is None:
             return LiteralQuery(self, True)
         else:
             raise ValueError("I don't know how to interpret %r as an event "
-                             "query" % (subset,))
+                             "query" % (restrict,))
 
     def _query(self, sql_where, query_tables, query_vals):
         tables = set(["sys_events"])
@@ -621,13 +621,13 @@ class Event(_Obj):
         query &= (IndexFieldQuery(self._events, "id") == self._obj_id)
         return bool(len(query))
 
-    def relative(self, count, subset=None):
+    def relative(self, count, restrict=None):
         """Counts 'count' events forward or back from the current event (or
-        optionally, only events that match 'subset'), and returns that. Use
+        optionally, only events that match 'restrict'), and returns that. Use
         negative for backwards."""
         if count == 0:
             raise IndexError, "count must be non-zero"
-        query = self._events.events_query(subset)
+        query = self._events.events_query(restrict)
         p = self._events.placeholder_event()
         query &= (p.recspan_id == self.recspan_id)
         if count > 0:

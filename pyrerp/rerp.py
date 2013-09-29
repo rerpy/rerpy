@@ -22,6 +22,8 @@ from pyrerp.util import indent
 ################################################################
 
 class rERPRequest(object):
+    # WARNING: if you modify this function's arguments in any way, you must
+    # also update DataSet.rerp() to match!
     def __init__(self, event_query, start_time, stop_time, formula,
                  name=None, eval_env=0,
                  bad_event_query=None, all_or_nothing=False):
@@ -70,29 +72,10 @@ def test_rERPRequest():
     repr(rERPRequest("useful query", -100, 1000, "x",
                      all_or_nothing=True, bad_event_query="asdf"))
 
-# Can't decide what to do with this...
-# def rerp(dataset, rerp_request, *args, **kwargs):
-#     return multi_rerp(dataset, [rerp_request], *args, **kwargs)[0]
-
-# regression_strategy can be "continuous", "by-epoch", or "auto". If
-# "continuous", we always build one giant regression model, treating the data
-# as continuous. If "auto", we use the (much faster) approach of generating a
-# single regression model and then applying it to each latency separately --
-# but *only* if this will produce the same result as doing the full
-# regression. If "epoch", then we either use the fast method, or else error
-# out. Changing this argument never affects the actual output of this
-# function. If it does, that's a bug! In general, we can do the fast thing if:
-# -- any artifacts affect either all or none of each
-#    epoch, and
-# -- either, overlap_correction=False,
-# -- or, overlap_correction=True and there are in fact no
-#    overlaps.
-def multi_rerp(dataset,
-               rerp_requests,
-               artifact_query="has _ARTIFACT_TYPE",
-               artifact_type_field="_ARTIFACT_TYPE",
-               overlap_correction=True,
-               regression_strategy="auto"):
+def multi_rerp_impl(dataset, rerp_requests,
+                    artifact_query, artifact_type_field,
+                    overlap_correction,
+                    regression_strategy):
     if not rerp_requests:
         return []
     _check_unique_names(rerp_requests)
@@ -1411,10 +1394,10 @@ class rERP(object):
     # This object is built up over time, which is a terrible design on my
     # part, because it creates the possibility of complex interrelationships
     # between the different parts of the code. But unfortunately I'm not
-    # clever enough to come up with a better solution. The different pieces
-    # don't interact too much, fortunately. To somewhat mitigate the problem,
-    # let's at least explicitly keep track of how built up it is at each
-    # point, so we can have assertions about that.
+    # clever enough to come up with a better solution. At least the different
+    # pieces don't interact too much. To somewhat mitigate the problem, let's
+    # at least explicitly keep track of how built up it is at each point, so
+    # we can have assertions about that.
     _ALL_PARTS = frozenset(["context", "layout", "accounting", "fit-info",
                             "betas"])
     def _has(self, *parts):
@@ -1482,6 +1465,23 @@ class rERP(object):
     ################################################################
 
     def predict_many(self, predictors, which_terms=None, NA_action="raise"):
+        if not isinstance(predictors, pandas.DataFrame):
+            # This pandas-based preprocessing accomplishes two purposes:
+            # 1) If predictors has a mix of scalars and arrays, like
+            #      {"x": [1, 2, 3], "type": "target"}
+            #    then pandas will broadcast them against each other, which is
+            #    nice.
+            # 2) If predictors is a dict-of-scalars, like
+            #      {"x": 1, "type": "target"}
+            #    then DataFrame raises a ValueError unless index=[0] is
+            #    specified. We want to support dict-of-scalars, so we attempt
+            #    that.
+            # See also:
+            #   https://github.com/pydata/patsy/issues/24
+            try:
+                predictors = pandas.DataFrame(predictors)
+            except ValueError:
+                predictors = pandas.DataFrame(predictors, index=[0])
         if which_terms is not None:
             builder = self.design_info.builder.subset(which_terms)
             columns = []
@@ -1496,19 +1496,29 @@ class rERP(object):
         (design,) = build_design_matrices([builder], predictors,
                                           return_type="dataframe",
                                           NA_action=NA_action)
-        predicted = np.dot(np.asarray(design).T,
-                           np.asarray(self.data)[betas_idx, :, :])
+        betas = np.asarray(self.betas)[betas_idx, :, :]
+        # design has shape (i, n)
+        # betas has shape (n, j, k)
+        # we want to matrix-multiply these to get a single array with shape
+        # (i, j, k)
+        # to do that we have to collapse betas down to (n, j*k), multiply to
+        # get (i, j*k), and then expand back to (i, j, k)
+        i, n = design.shape
+        assert n == betas.shape[0]
+        n, j, k = betas.shape
+        predicted = np.dot(np.asarray(design), betas.reshape(n, j * k))
+        predicted = predicted.reshape((i, j, k))
         as_pandas = pandas.Panel(predicted,
                                  items=design.index,
-                                 major_axis=self.data.major_axis,
-                                 minor_axis=self.data.minor_axis)
+                                 major_axis=self.betas.major_axis,
+                                 minor_axis=self.betas.minor_axis)
         as_pandas.data_format = self.data_format
         return as_pandas
 
     # This gives a 2-d DataFrame instead of a 3-d Panel, and is otherwise
     # identical to predict_many
     def predict(self, predictors, which_terms=None, NA_action="raise"):
-        prediction = self.predict_many(self.predictors,
+        prediction = self.predict_many(predictors,
                                        which_terms=which_terms,
                                        NA_action=NA_action)
         if prediction.shape[0] != 1:

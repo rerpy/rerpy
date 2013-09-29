@@ -10,9 +10,10 @@ import csv
 
 import numpy as np
 import pandas
-from patsy import DesignInfo
+from patsy import DesignInfo, EvalEnvironment
 
 import pyrerp.events
+from pyrerp.rerp import rERPRequest, multi_rerp_impl
 
 # TODO: add sensor metadata, esp. locations, referencing. make units be
 # by-sensor. (There's some code for locations that may be resurrectable from
@@ -213,26 +214,81 @@ class DataSet(object):
     def placeholder_event(self):
         return self._events.placeholder_event()
 
-    def events_query(self, subset=None):
-        return self._events.events_query(subset)
+    def events_query(self, restrict=None):
+        return self._events.events_query(restrict)
 
-    def events(self, subset=None):
-        return list(self.events_query(subset))
+    def events(self, restrict=None):
+        return list(self.events_query(restrict))
 
     def events_at_query(self, recspan_id, start_tick, stop_tick=None,
-                        subset=None):
+                        restrict=None):
         if stop_tick is None:
             stop_tick = start_tick + 1
         p = self.placeholder_event()
 
         q = p.overlaps(recspan_id, start_tick, stop_tick)
-        q &= self.events_query(subset)
+        q &= self.events_query(restrict)
         return q
 
     def events_at(self, recspan_id, start_tick, stop_tick=None,
-                  subset=None):
+                  restrict=None):
         return list(self.events_at_query(recspan_id, start_tick,
-                                         stop_tick, subset))
+                                         stop_tick, restrict))
+
+    ################################################################
+    # rERP!
+    ################################################################
+
+    def rerp(self,
+             # rERPRequest arguments
+             event_query, start_time, stop_time, formula,
+             name=None, eval_env=0, bad_event_query=None,
+             all_or_nothing=False,
+             # multi_rerp arguments
+             artifact_query="has _ARTIFACT_TYPE",
+             artifact_type_field="_ARTIFACT_TYPE",
+             overlap_correction=True,
+             regression_strategy="auto"):
+        eval_env = EvalEnvironment.capture(eval_env, reference=1)
+        request = rERPRequest(event_query, start_time, stop_time, formula,
+                              name=name, eval_env=eval_env,
+                              bad_event_query=bad_event_query,
+                              all_or_nothing=all_or_nothing)
+        rerps = self.multi_rerp([request],
+                                artifact_query=artifact_query,
+                                artifact_type_field=artifact_type_field,
+                                overlap_correction=overlap_correction,
+                                regression_strategy=regression_strategy)
+        assert len(rerps) == 1
+        return rerps[0]
+
+    # regression_strategy can be "continuous", "by-epoch", or "auto". If
+    # "continuous", we always build one giant regression model, treating the
+    # data as continuous. If "auto", we use the (much faster) approach of
+    # generating a single regression model and then applying it to each
+    # latency separately -- but *only* if this will produce the same result as
+    # doing the full regression. If "epoch", then we either use the fast
+    # method, or else error out. Changing this argument never affects the
+    # actual output of this function. If it does, that's a bug! In general, we
+    # can do the fast thing if:
+    # -- any artifacts affect either all or none of each
+    #    epoch, and
+    # -- either, overlap_correction=False,
+    # -- or, overlap_correction=True and there are in fact no
+    #    overlaps.
+    #
+    # WARNING: if you modify this function's arguments in any way, you must
+    # also update rerp() to match!
+    def multi_rerp(self, rerp_requests,
+                   artifact_query="has _ARTIFACT_TYPE",
+                   artifact_type_field="_ARTIFACT_TYPE",
+                   overlap_correction=True,
+                   regression_strategy="auto"):
+        return multi_rerp_impl(self, rerp_requests,
+                               artifact_query=artifact_query,
+                               artifact_type_field=artifact_type_field,
+                               overlap_correction=overlap_correction,
+                               regression_strategy=regression_strategy)
 
     ################################################################
     # Convenience methods
@@ -253,7 +309,7 @@ class DataSet(object):
                            their_event.stop_tick,
                            dict(their_event))
 
-    def merge_df(self, df, on, subset=None):
+    def merge_df(self, df, on, restrict=None):
         # 'on' is like {df_colname: event_key}
         # or just [colname]
         # or just colname
@@ -262,7 +318,7 @@ class DataSet(object):
         if not isinstance(on, dict):
             on = dict([(key, key) for key in on])
         p = self.placeholder_event()
-        query = self.events_query(subset)
+        query = self.events_query(restrict)
         NOTHING = object()
         for _, row in df.iterrows():
             this_query = query
