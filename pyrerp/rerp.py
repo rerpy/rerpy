@@ -69,8 +69,9 @@ def test_rERPRequest():
     repr(rERPRequest("useful query", -100, 1000, formula="x",
                      all_or_nothing=True, bad_event_query="asdf"))
 
-def rerp(dataset, rerp_request, *args, **kwargs):
-    return multi_rerp(dataset, [rerp_request], *args, **kwargs)[0]
+# Can't decide what to do with this...
+# def rerp(dataset, rerp_request, *args, **kwargs):
+#     return multi_rerp(dataset, [rerp_request], *args, **kwargs)[0]
 
 # regression_strategy can be "continuous", "by-epoch", or "auto". If
 # "continuous", we always build one giant regression model, treating the data
@@ -857,7 +858,7 @@ class EpochRejectionStats(object):
             "Epochs", [("Fully accepted", self.fully_accepted),
                        ("Partially accepted", self.partially_accepted),
                        ("Fully rejected", self.fully_rejected)])
-    def _repr_pretty_(self, p, cycle):
+    def _repr_pretty_(self, p, cycle): # pragma: no cover
         assert not cycle
         p.text(indent(repr(self), p.indentation, indent_first=False))
 
@@ -886,7 +887,7 @@ class PointRejectionStats(object):
             result += "\n"
             result += indent("\n".join(causes), 6)
         return result
-    def _repr_pretty_(self, p, cycle):
+    def _repr_pretty_(self, p, cycle): # pragma: no cover
         assert not cycle
         p.text(indent(repr(self), p.indentation, indent_first=False))
 
@@ -908,7 +909,7 @@ class RejectionOverlapStats(object):
                 " (>1 indicates overlap between the epochs included in this category)"
                 % (self.event_ticks.accepted * 1.0 / self.ticks.accepted))
         return "\n".join(chunks)
-    def _repr_pretty_(self, p, cycle):
+    def _repr_pretty_(self, p, cycle): # pragma: no cover
         assert not cycle
         p.text(indent(repr(self), p.indentation, indent_first=False))
 
