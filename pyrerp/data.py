@@ -14,8 +14,9 @@ from patsy import DesignInfo
 
 import pyrerp.events
 
-# This is just a stub for now. (There's some code that may be resurrectable
-# from my old stuff.) Notes on formats:
+# TODO: add sensor metadata, esp. locations, referencing. make units be
+# by-sensor. (There's some code for locations that may be resurrectable from
+# my old stuff.) Notes on formats:
 # http://robertoostenveld.nl/?p=5
 # https://sccn.ucsd.edu/svn/software/eeglab/functions/sigprocfunc/readlocs.m
 # http://sccn.ucsd.edu/eeglab/channellocation.html
@@ -23,13 +24,10 @@ import pyrerp.events
 # spherical griddata (use s=0): http://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.RectSphereBivariateSpline.html
 # some MEG sensors:
 #   https://wiki.umd.edu/meglab/images/6/61/KIT_sensor_pos.txt
-class SensorInfo(object):
-    def __init__(self):
-        pass
-
-    def update(self, sensor_info):
-        pass
-
+# at that point we'll probably also want to extend this to have a notion of
+# "compatible" distinct from "==", b/c if two DataFormats are identical except
+# that one has no sensor location information in it, then we can totally
+# combine that data (and should be able to union the sensor metadata).
 class DataFormat(object):
     def __init__(self, exact_sample_rate_hz, units, channel_names):
         self.exact_sample_rate_hz = exact_sample_rate_hz
@@ -127,6 +125,9 @@ def test_DataFormat():
 
     assert df == df
     assert not (df != df)
+    assert df != DataFormat(1000, "uV", ["MiCe", "A2", "rle"])
+    assert df != DataFormat(1024, "raw", ["MiCe", "A2", "rle"])
+    assert df != DataFormat(1024, "uV", ["MiCe", "rle", "A2"])
 
     tr = df.compute_symbolic_transform("-A2/2", exclude=["rle"])
     assert np.allclose(tr, [[1, -0.5, 0],
@@ -140,7 +141,6 @@ def test_DataFormat():
 class DataSet(object):
     def __init__(self, data_format):
         self.data_format = data_format
-        self.sensor_info = SensorInfo()
         self._events = pyrerp.events.Events()
         self._recspans = []
         self.recspan_infos = []
@@ -242,7 +242,6 @@ class DataSet(object):
         # Metadata
         if self.data_format != dataset.data_format:
             raise ValueError("data format mismatch")
-        self.sensor_info.update(dataset.sensor_info)
         # Recspans
         our_recspan_id_base = len(self._recspans)
         for recspan, recspan_info in zip(dataset, dataset.recspan_infos):
