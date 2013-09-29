@@ -137,64 +137,13 @@ def test_DataFormat():
     assert_raises(ValueError, df.compute_symbolic_transform, "A2/2, A2/3")
     assert_raises(ValueError, df.compute_symbolic_transform, "A2/2 + 1")
 
-
-class MemoryDataSource(object):
-    def __init__(self, recspan_data):
-        self._recspan_data = np.asarray(recspan_data, dtype=np.float64)
-        self._recspan_data.flags.writeable = False
-
-    def __getitem__(self, local_recspan_id):
-        assert local_recspan_id == 0
-        return self._recspan_data
-
-    def transform(self, matrix):
-        self._recspan_data = np.dot(self._recspan_data, matrix.T)
-        self._recspan_data.flags.writeable = False
-
-    def copy(self):
-        # We already don't compute dot() in place, so no need to actually make
-        # any copy of the data. But we do need to make a new object, so that
-        # next time .transform is called it will affect only one object and
-        # not the other.
-        return self.__class__(self._recspan_data)
-
-    # even if we add a save_helper system, it won't be implemented here, since
-    # for this we always want to fall back on directly saving the data in the
-    # original file.
-
-def test_MemoryDataSource():
-    mem1 = MemoryDataSource([[1, 2], [3, 4]])
-    assert np.all(mem1[0] == [[1, 2], [3, 4]])
-    assert mem1[0].dtype == np.dtype(np.float64)
-    mem2 = mem1.copy()
-    mem1.transform(2 * np.eye(2))
-    assert mem1[0].dtype == np.dtype(np.float64)
-    assert np.all(mem1[0] == [[2, 4], [6, 8]])
-    assert np.all(mem2[0] == [[1, 2], [3, 4]])
-
 class DataSet(object):
     def __init__(self, data_format):
         self.data_format = data_format
         self.sensor_info = SensorInfo()
         self._events = pyrerp.events.Events()
         self._recspans = []
-        self._recspan_sources = []
         self.recspan_infos = []
-
-    def add_recspan_source(self, data_source, tick_lengths, metadatas):
-        if len(tick_lengths) != len(metadatas):
-            raise ValueError("tick_lengths and metadatas must have the "
-                             "same number of entries")
-        self._recspan_sources.append(data_source)
-        base_recspan_id = len(self._recspans)
-        for local_recspan_id, (ticks, metadata) in (
-            enumerate(zip(tick_lengths, metadatas))):
-            self._recspans.append((data_source, local_recspan_id))
-            recspan_id = base_recspan_id + local_recspan_id
-            recspan_info = self._events.add_recspan_info(recspan_id,
-                                                         ticks,
-                                                         metadata)
-            self.recspan_infos.append(recspan_info)
 
     def transform(self, matrix, exclude=[]):
         if isinstance(matrix, basestring):
@@ -205,18 +154,29 @@ class DataSet(object):
                 raise ValueError("exclude= can only be specified if matrix= "
                                  "is a symbolic expression")
         matrix = np.asarray(matrix)
-        for recspan_source in self._recspan_sources:
-            recspan_source.transform(matrix)
+        for i, recspan in enumerate(self._recspans):
+            new_data = np.dot(recspan, matrix.T)
+            self._recspans[i] = pandas.DataFrame(new_data,
+                                                 columns=recspan.columns,
+                                                 index=recspan.index)
 
     def add_recspan(self, data, metadata):
-        data = np.asarray(data)
+        data = np.asarray(data, dtype=np.float64)
         if data.shape[1] != self.data_format.num_channels:
             raise ValueError("wrong number of channels, array should have "
                              "shape (ticks, %s)"
                              % (self.data_format.num_channels,))
-        data_source = MemoryDataSource(data)
         ticks = data.shape[0]
-        self.add_recspan_source(data_source, [ticks], [metadata])
+        recspan_id = len(self._recspans)
+        recspan_info = self._events.add_recspan_info(recspan_id,
+                                                     ticks,
+                                                     metadata)
+        self.recspan_infos.append(recspan_info)
+        index = np.arange(ticks) * float(self.data_format.approx_sample_period_ms)
+        df = pandas.DataFrame(data,
+                              columns=self.data_format.channel_names,
+                              index=index)
+        self._recspans.append(df)
 
     # We act like a sequence of recspan data objects
     def __len__(self):
@@ -229,15 +189,7 @@ class DataSet(object):
             raise TypeError("DataSet indexing allows only a single integer "
                             "(no slicing or other fanciness!)")
         # May raise IndexError, which is what we want:
-        data_source, local_recspan_id = self._recspans[key]
-        data = data_source[local_recspan_id]
-        ticks, num_channels = data.shape
-        assert num_channels == self.data_format.num_channels
-        index = np.arange(ticks) * float(self.data_format.approx_sample_period_ms)
-        return pandas.DataFrame(data,
-                                columns=self.data_format.channel_names,
-                                index=index)
-
+        return self._recspans[key]
 
     def __iter__(self):
         for i in xrange(len(self)):
@@ -293,18 +245,8 @@ class DataSet(object):
         self.sensor_info.update(dataset.sensor_info)
         # Recspans
         our_recspan_id_base = len(self._recspans)
-        recspan_source_info = {}
-        for i, (data_source, local_recspan_id) in enumerate(dataset._recspans):
-            recspan_source_info.setdefault(id(data_source), ([], []))
-            tick_lengths, metadatas = recspan_source_info[id(data_source)]
-            assert len(tick_lengths) == len(metadatas) == local_recspan_id
-            recspan_info = dataset.recspan_infos[i]
-            tick_lengths.append(recspan_info.ticks)
-            metadatas.append(dict(recspan_info))
-        for data_source in dataset._recspan_sources:
-            tick_lengths, metadatas = recspan_source_info[id(data_source)]
-            self.add_recspan_source(data_source.copy(),
-                                    tick_lengths, metadatas)
+        for recspan, recspan_info in zip(dataset, dataset.recspan_infos):
+            self.add_recspan(recspan, dict(recspan_info))
         # Events
         for their_event in dataset.events_query():
             self.add_event(their_event.recspan_id + our_recspan_id_base,

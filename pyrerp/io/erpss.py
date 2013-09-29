@@ -440,13 +440,10 @@ def load_erpss(raw, log, calibration_events="condition == 0"):
 
     span_slices = [slice(span_edges[i], span_edges[i + 1])
                    for i in xrange(len(span_edges) - 1)]
-    data_source = ErpssDataSource(data, span_slices)
-    span_ticks = [(s.stop - s.start) for s in span_slices]
 
     dataset = DataSet(data_format)
-    dataset.add_recspan_source(data_source,
-                                span_ticks,
-                                [metadata] * len(span_ticks))
+    for span_slice in span_slices:
+        dataset.add_recspan(data[span_slice, :], metadata)
 
     span_starts = [s.start for s in span_slices]
     for tick, row in raw_log_events.iterrows():
@@ -470,17 +467,6 @@ def load_erpss(raw, log, calibration_events="condition == 0"):
         cal_event["calibration_pulse"] = True
 
     return dataset
-
-class ErpssDataSource(object):
-    def __init__(self, concat_data, span_slices):
-        self._concat_data = concat_data
-        self._span_slices = span_slices
-
-    def __getitem__(self, local_recspan_id):
-        return self._concat_data[self._span_slices[local_recspan_id], :]
-
-    def transform(self, matrix):
-        self._concat_data = np.dot(self._concat_data, matrix.T)
 
 def test_load_erpss():
     from pyrerp.test import test_data_path

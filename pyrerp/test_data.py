@@ -19,24 +19,6 @@ def mock_dataset(num_channels=4, num_recspans=4, ticks_per_recspan=100,
         dataset.add_recspan(data, {})
     return dataset
 
-class MockDataSource(object):
-    def __init__(self, tick_lengths):
-        self._tick_lengths = tick_lengths
-        self._transform = np.eye(2)
-
-    def __getitem__(self, local_recspan_id):
-        ticks = self._tick_lengths[local_recspan_id]
-        return np.dot(np.ones((ticks, 2)) * local_recspan_id,
-                      self._transform.T)
-
-    def transform(self, matrix):
-        self._transform = np.dot(matrix, self._transform)
-
-    def copy(self):
-        new = MockDataSource(self._tick_lengths)
-        new.transform(self._transform)
-        return new
-
 def test_DataSet():
     data_format = DataFormat(250, "uV", ["MOCK1", "MOCK2"])
     dataset = DataSet(data_format)
@@ -46,15 +28,11 @@ def test_DataSet():
     assert_raises(TypeError, dataset.__getitem__, slice(0, 0))
     assert list(dataset) == []
 
-    # Mismatch between tick_lengths and metadatas
-    assert_raises(ValueError, dataset.add_recspan_source,
-                  MockDataSource([10, 20]), [10, 20], [{}])
-    dataset.add_recspan_source(MockDataSource([10, 20]),
-                                [10, 20],
-                                [{"a": 0}, {"a": 1}])
-    dataset.add_recspan_source(MockDataSource([30, 40]),
-                                [30, 40],
-                                [{"a": 2}, {"a": 3}])
+    dataset.add_recspan(np.ones((10, 2)) * 0, {"a": 0})
+    dataset.add_recspan(np.ones((20, 2)) * 1, {"a": 1})
+    dataset.add_recspan(np.ones((30, 2)) * 0, {"a": 2})
+    dataset.add_recspan(np.ones((40, 2)) * 1, {"a": 3})
+
     assert len(dataset) == 4
     assert_raises(IndexError, dataset.__getitem__, 4)
 
@@ -127,7 +105,6 @@ def test_DataSet():
         assert_frame_equal(recspans[i], dataset[i])
 
 def test_DataSet_add_recspan():
-    # Check the add_recspan convenience method
     dataset = mock_dataset(num_channels=2, num_recspans=4)
     dataset.add_recspan([[1, 2], [3, 4], [5, 6]], {"a": 31337})
     assert len(dataset) == 5
