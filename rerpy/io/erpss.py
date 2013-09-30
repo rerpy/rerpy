@@ -1,6 +1,6 @@
 # This file is part of rERPy
 # Copyright (C) 2012-2013 Nathaniel Smith <njs@pobox.com>
-# See file COPYING for license information.
+# See file LICENSE.txt for license information.
 
 import os.path
 import struct
@@ -102,10 +102,10 @@ def _read_header(stream):
     else: # pragma: no cover
         assert False, "Unrecognized file type"
     hz = 1 / (header["10usec_per_tick"] / 100000.0)
-    if abs(hz - int(hz)) > 1e-6:
+    if abs(hz - int(round(hz))) > 1e-6:
         raise ValueError("file claims weird non-integer sample rate %shz"
                          % hz)
-    hz = int(hz)
+    hz = int(round(hz))
 
     channel_names = _channel_names_from_header(header)
 
