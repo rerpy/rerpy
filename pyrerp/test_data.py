@@ -252,3 +252,21 @@ def test_DataSet_merge_df():
     assert dict(ev1) == {"code": 10, "code2": 20, "foo": "a"}
     assert dict(ev2) == {"code": 10, "code2": 21, "foo": "b"}
     assert dict(ev3) == {"code": 11, "code2": 20}
+
+def test_DataSet_merge_csv():
+    from cStringIO import StringIO
+    for sep in [",", "\t"]:
+        ds = mock_dataset()
+        ev1 = ds.add_event(0, 10, 11, {"code": 10, "ignore": False})
+        ev2 = ds.add_event(0, 20, 21, {"code": 20, "ignore": False})
+        ev3 = ds.add_event(0, 30, 31, {"code": 10, "ignore": False})
+        ev4 = ds.add_event(0, 40, 41, {"code": 10, "ignore": True})
+
+        csv = "code-SEP-extra\n10-SEP-foo\n20-SEP-bar\n"
+        csv = csv.replace("-SEP-", sep)
+        ds.merge_csv(StringIO(csv), "code", restrict="not ignore", sep=sep)
+
+        assert dict(ev1) == {"code": 10, "ignore": False, "extra": "foo"}
+        assert dict(ev2) == {"code": 20, "ignore": False, "extra": "bar"}
+        assert dict(ev3) == {"code": 10, "ignore": False, "extra": "foo"}
+        assert dict(ev4) == {"code": 10, "ignore": True}

@@ -336,3 +336,7 @@ class DataSet(object):
                                     "event already has a value for key %r, "
                                     "%r, which does not match new value %r"
                                     % (df_key, current_value, row[df_key]))
+
+    def merge_csv(self, path, on, restrict=None, **kwargs):
+        df = pandas.read_csv(path, **kwargs)
+        self.merge_df(df, on, restrict=restrict)
