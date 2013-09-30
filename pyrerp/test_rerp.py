@@ -304,6 +304,9 @@ def test_predict():
         assert isinstance(prediction, pandas.DataFrame)
         assert np.allclose(prediction, 5 * rerp.betas["x"])
 
+    assert_raises(ValueError, rerp.predict, {"type": ["standard", "standard"],
+                                             "x": [1, 2]})
+
     prediction = rerp.predict_many({"type": ["standard", "target"],
                                     "x": [4, 5]})
     assert isinstance(prediction, pandas.Panel)
