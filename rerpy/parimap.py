@@ -1,6 +1,6 @@
 # This file is part of rERPy
 # Copyright (C) 2013 Nathaniel Smith <njs@pobox.com>
-# See file COPYING for license information.
+# See file LICENSE.txt for license information.
 
 # support multiple iterables like imap (with same semantics: stop when first
 # one is exhausted)
