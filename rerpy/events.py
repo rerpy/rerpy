@@ -1,4 +1,4 @@
-# This file is part of pyrerp
+# This file is part of rERPy
 # Copyright (C) 2012-2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
@@ -35,7 +35,7 @@ from patsy import PatsyError, Origin
 from patsy.infix_parser import Token, Operator, infix_parse
 from patsy.util import repr_pretty_delegate
 
-from pyrerp.util import memoized_method
+from rerpy.util import memoized_method
 
 __all__ = ["Events", "EventsError"]
 

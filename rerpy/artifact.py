@@ -1,4 +1,4 @@
-# This file is part of pyrerp
+# This file is part of rERPy
 # Copyright (C) 2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
@@ -24,7 +24,7 @@
 # the difference between these.
 
 import numpy as np
-from pyrerp._artifact import flat_spans
+from rerpy._artifact import flat_spans
 
 def test_flat_spans():
     assert np.all(flat_spans(10.0, np.asarray([

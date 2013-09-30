@@ -1,4 +1,4 @@
-# This file is part of pyrerp
+# This file is part of rERPy
 # Copyright (C) 2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
@@ -6,7 +6,7 @@ import numpy as np
 import pandas
 from nose.tools import assert_raises
 
-from pyrerp.data import DataSet, DataFormat
+from rerpy.data import DataSet, DataFormat
 
 def mock_dataset(num_channels=4, num_recspans=4, ticks_per_recspan=100,
                  hz=250):

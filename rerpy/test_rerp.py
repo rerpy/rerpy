@@ -1,4 +1,4 @@
-# This file is part of pyrerp
+# This file is part of rERPy
 # Copyright (C) 2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
@@ -9,9 +9,9 @@ import pandas
 
 from nose.tools import assert_raises
 
-from pyrerp.rerp import rERPRequest
-from pyrerp.test_data import mock_dataset
-import pyrerp.parimap
+from rerpy.rerp import rERPRequest
+from rerpy.test_data import mock_dataset
+import rerpy.parimap
 
 def test_multi_rerp():
     ds = mock_dataset(num_channels=2, hz=1000)
@@ -27,7 +27,7 @@ def test_multi_rerp():
         [True, False],
         ["multiprocess", "serial"]):
 
-        pyrerp.parimap.configure(mode=parimap_mode)
+        rerpy.parimap.configure(mode=parimap_mode)
 
         assert ds.multi_rerp([],
                              regression_strategy=regression_strategy,
@@ -236,7 +236,7 @@ def test_rerp_overlap():
         [True, False],
         ["serial", "multiprocess"]):
 
-        pyrerp.parimap.configure(mode=parimap_mode)
+        rerpy.parimap.configure(mode=parimap_mode)
         if overlap_correction and regression_strategy == "by-epoch":
             assert_raises(ValueError,
                           ds.rerp, "True", 0, EPOCH - 1, "0 + type",

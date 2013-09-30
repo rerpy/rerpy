@@ -1,4 +1,4 @@
-# This file is part of pyrerp
+# This file is part of rERPy
 # Copyright (C) 2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
@@ -63,7 +63,7 @@ import itertools
 import traceback
 import sys
 
-CONFIG_ENVVAR = "PYRERP_PARALLEL"
+CONFIG_ENVVAR = "RERPY_PARALLEL"
 
 class ParimapError(Exception):
     pass

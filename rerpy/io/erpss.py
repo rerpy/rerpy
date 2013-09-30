@@ -1,4 +1,4 @@
-# This file is part of pyrerp
+# This file is part of rERPy
 # Copyright (C) 2012-2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
@@ -12,9 +12,9 @@ import bisect
 import numpy as np
 import pandas
 
-from pyrerp.data import DataFormat, DataSet
-from pyrerp.util import maybe_open
-from pyrerp.io._erpss import _decompress_crw_chunk
+from rerpy.data import DataFormat, DataSet
+from rerpy.util import maybe_open
+from rerpy.io._erpss import _decompress_crw_chunk
 
 PAUSE_CODE = 49152
 DELETE_CODE = 57344
@@ -281,7 +281,7 @@ def assert_files_match(p1, p2):
 
 def test_read_raw_on_test_data():
     import glob
-    from pyrerp.test import test_data_path
+    from rerpy.test import test_data_path
     tested = 0
     for rawp in glob.glob(test_data_path("erpss/*.raw")):
         crwp = rawp[:-3] + "crw"
@@ -293,7 +293,7 @@ def test_read_raw_on_test_data():
     assert tested == 5
 
 def test_64bit_channel_names():
-    from pyrerp.test import test_data_path
+    from rerpy.test import test_data_path
     stream = open(test_data_path("erpss/two-chunks-64chan.raw"))
     (hz, channel_names, codes, data, info) = read_raw(stream, int)
     # "Correct" channel names as listed by headinfo(1):
@@ -469,7 +469,7 @@ def load_erpss(raw, log, calibration_events="condition == 0"):
     return dataset
 
 def test_load_erpss():
-    from pyrerp.test import test_data_path
+    from rerpy.test import test_data_path
     # This crw/log file is constructed to have a few features:
     # - it only has 3 records, so it's tiny
     # - the first two records are in one recspan, the last is in a second, so
@@ -559,6 +559,6 @@ def test_load_erpss():
                       test_data_path("erpss/tiny-complete.%s.log" % (bad,)))
 
     # test .transform and .copy
-    from pyrerp.test_data import check_transforms
+    from rerpy.test_data import check_transforms
     check_transforms(load_erpss(test_data_path("erpss/tiny-complete.crw"),
                                 test_data_path("erpss/tiny-complete.log")))

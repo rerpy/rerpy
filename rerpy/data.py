@@ -1,4 +1,4 @@
-# This file is part of pyrerp
+# This file is part of rERPy
 # Copyright (C) 2012-2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
@@ -12,8 +12,8 @@ import numpy as np
 import pandas
 from patsy import DesignInfo, EvalEnvironment
 
-import pyrerp.events
-from pyrerp.rerp import rERPRequest, multi_rerp_impl
+import rerpy.events
+from rerpy.rerp import rERPRequest, multi_rerp_impl
 
 # TODO: add sensor metadata, esp. locations, referencing. make units be
 # by-sensor. (There's some code for locations that may be resurrectable from
@@ -142,7 +142,7 @@ def test_DataFormat():
 class DataSet(object):
     def __init__(self, data_format):
         self.data_format = data_format
-        self._events = pyrerp.events.Events()
+        self._events = rerpy.events.Events()
         self._recspans = []
         self.recspan_infos = []
 

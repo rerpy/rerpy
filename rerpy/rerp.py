@@ -1,4 +1,4 @@
-# This file is part of pyrerp
+# This file is part of rerpy
 # Copyright (C) 2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
@@ -13,9 +13,9 @@ from patsy import (EvalEnvironment, dmatrices, ModelDesc, Term,
                    build_design_matrices)
 from patsy.util import repr_pretty_delegate, repr_pretty_impl
 
-from pyrerp.incremental_ls import XtXIncrementalLS
-from pyrerp.parimap import parimap_unordered
-from pyrerp.util import indent
+from rerpy.incremental_ls import XtXIncrementalLS
+from rerpy.parimap import parimap_unordered
+from rerpy.util import indent
 
 ################################################################
 # Public interface
@@ -203,7 +203,7 @@ def _artifact_spans(dataset, artifact_query, artifact_type_field):
                         artifact_type)
 
 def test__artifact_spans():
-    from pyrerp.test_data import mock_dataset
+    from rerpy.test_data import mock_dataset
     ds = mock_dataset(num_recspans=2, ticks_per_recspan=30)
     ds.add_event(0, 5, 10, {"_ARTIFACT_TYPE": "just-bad",
                             "number": 1, "string": "a"})
@@ -289,7 +289,7 @@ class _FormulaRecspanInfo(object):
         return pandas.Series([ri[attr] for ri in self._recspan_infos])
 
 def test__FormulaEnv():
-    from pyrerp.test_data import mock_dataset
+    from rerpy.test_data import mock_dataset
     ds = mock_dataset(num_recspans=3)
     ds.recspan_infos[0]["subject"] = "s1"
     ds.recspan_infos[1]["subject"] = "s1"
@@ -337,7 +337,7 @@ def _rerp_design(formula, events, eval_env):
     return design, design_row_idxes
 
 def test__rerp_design():
-    from pyrerp.test_data import mock_dataset
+    from rerpy.test_data import mock_dataset
     ds = mock_dataset(num_recspans=3)
     ds.recspan_infos[0]["subject"] = "s1"
     ds.recspan_infos[1]["subject"] = "s1"
@@ -421,7 +421,7 @@ def _epoch_info_and_spans(dataset, rerp_request):
     return rerp, spans
 
 def test__epoch_info_and_spans():
-    from pyrerp.test_data import mock_dataset
+    from rerpy.test_data import mock_dataset
     ds = mock_dataset(num_recspans=2, hz=250)
     ds.add_event(0, 0, 1, {"include": True, "a": 1})
     ds.add_event(0, 10, 11, {"include": True, "a": 2})

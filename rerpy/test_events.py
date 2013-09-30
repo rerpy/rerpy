@@ -1,11 +1,11 @@
-# This file is part of pyrerp
+# This file is part of rERPy
 # Copyright (C) 2012-2013 Nathaniel Smith <njs@pobox.com>
 # See file COPYING for license information.
 
 import cPickle
 import numpy as np
 import pandas
-from pyrerp.events import Events, EventsError
+from rerpy.events import Events, EventsError
 from nose.tools import assert_raises
 
 def test_Events_basic():
