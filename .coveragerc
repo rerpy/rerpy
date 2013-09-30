@@ -1,6 +1,6 @@
 [run]
 branch=True
-source=pyrerp
+source=rerpy
 
 [report]
 exclude_lines =
