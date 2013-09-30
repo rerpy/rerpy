@@ -1,11 +1,3 @@
-todo:
-- get DataSet into shape (DONE)
-- and kutaslab loader (DONE)
-- then adjust rerp to match
-  - mock DataSet for tests
-  - new return type
-  - use rERPInfo
-
 never mind, write random access code for kutaslab reader
 scan (but don't decompress) the file first, which will be very fast,
 and then can find any block in constant time. or scan on demand even.
@@ -52,7 +44,17 @@ given). (need to put ms into events, but that's no problem. could add
 start_time field next to start_tick etc. for querying.)
 then these of course could be embedded, inverted, etc.
 for the string syntax... probably need to add function call syntax for
-this to be reasonable. at least , doesn't mean anything else for us.
+this to be reasonable. at least comma doesn't mean anything else for
+us.
+-- this can be done with SQL, though a touch of trickiness will be
+needed to uniquely rename the tables in the self-join.
+   http://stackoverflow.com/questions/19094257/in-sql-how-to-query-for-rows-based-on-the-values-in-other-rows-at-a-certain-rel
+  SELECT * FROM foo AS foo1 WHERE <foo1 restrictions>
+   AND EXISTS
+     (SELECT 1 FROM
+        (SELECT * FROM foo WHERE <any skip restrictions> AND <near foo1>
+         ORDER BY time LIMIT 1 OFFSET <n>) AS foo2
+        WHERE <foo2 restrictions>)
 
 
 if we ever want to support recordings that are aligned but without a
