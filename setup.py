@@ -10,11 +10,10 @@ try:
 except ImportError:
     sys.exit("numpy must be installed before this package can be built")
 
-DESC = """XX"""
+DESC = """A Python package for doing ERP and rERP analysis of brainwaves."""
 
 # This should be valid ReST.
-LONG_DESC = (DESC + "\n"
-             "XX")
+LONG_DESC = open("README.rst").read()
 
 setup(
     name="rerpy",
@@ -23,7 +22,7 @@ setup(
     long_description=LONG_DESC,
     author="Nathaniel J. Smith",
     author_email="njs@pobox.com",
-    license="XX None yet",
+    license="GPLv2+",
     packages=["rerpy"],
     url="https://github.com/rerpy",
     requires=["numpy", "scipy", "pandas", "patsy"],
