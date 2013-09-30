@@ -1,6 +1,6 @@
 # This file is part of rERPy
 # Copyright (C) 2012-2013 Nathaniel Smith <njs@pobox.com>
-# See file COPYING for license information.
+# See file LICENSE.txt for license information.
 
 __version__ = "0.0.0+dev"
 
@@ -12,3 +12,6 @@ if "RERPY_WARNINGS_MODE" in os.environ:
                             module="^rerpy")
     del warnings
 del os
+
+from rerpy.data import DataSet, DataFormat
+from rerpy.io.erpss import load_erpss
