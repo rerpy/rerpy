@@ -1,9 +1,12 @@
-rERPy is a Python library for analyzing EEG data using traditional
-averaging-based ERP estimation, and fancy new regression-based ERP
-estimation (also known as "rERPs" for short). rERPs are like ERPs, but
-they can also handle continuous manipulations (including non-linear
-effects like ERP-images), partial confounding, and separate out
-overlapping effects. They can even do all of these at the same time.
+rERPy is a Python library for analyzing EEG data using both
+traditional averaging-based ERP estimation, and fancy new
+regression-based ERP estimation (known as "rERPs" to their
+friends). rERPs can do anything ERPs can do -- in fact, ERPs are
+special cases or rERPs -- but rERPs can also handle mixes of
+categorical and continuous manipulations (including non-linear effects
+like "ERP images"), disentangle confounded effects, and separate out
+overlapping waveforms timelocked to temporally adjacent events. They
+can even do all these things at the same time.
 
 .. image:: https://travis-ci.org/rerpy/rerpy.png?branch=master
    :target: https://travis-ci.org/rerpy/rerpy
