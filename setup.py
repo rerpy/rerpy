@@ -23,7 +23,7 @@ setup(
     author="Nathaniel J. Smith",
     author_email="njs@pobox.com",
     license="GPLv2+",
-    packages=["rerpy"],
+    packages=["rerpy", "rerpy.io"],
     url="https://github.com/rerpy",
     requires=["numpy", "scipy", "pandas", "patsy"],
     classifiers =
