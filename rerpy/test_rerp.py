@@ -359,9 +359,38 @@ def test_predict():
     assert np.allclose(prediction[0], 4 * rerp.betas["x"])
     assert np.allclose(prediction[1], 5 * rerp.betas["x"])
 
-# no-epochs-available or no-data-available error reporting? what happens?
+def test_diff_lengths():
+    # Originally this caused by-epoch regression to blow up
+    ds = mock_dataset(hz=1000)
+    ds.add_event(0, 10, 11, {"type": "a"})
+    ds.add_event(0, 20, 21, {"type": "a"})
+    ds.add_event(0, 30, 31, {"type": "b"})
+    ds.add_event(0, 40, 41, {"type": "b"})
 
-# also: by-epoch is impossible if have multiple rERPs with different epoch
-# lengths.
+    req_a = rERPRequest("type == 'a'", -1, 3, "1")
+    req_b = rERPRequest("type == 'b'", -2, 4, "1")
+
+    epoch_a1 = np.asarray(ds[0].iloc[10 - 1:10 + 4, :])
+    epoch_a2 = np.asarray(ds[0].iloc[20 - 1:20 + 4, :])
+    epoch_b1 = np.asarray(ds[0].iloc[30 - 2:30 + 5, :])
+    epoch_b2 = np.asarray(ds[0].iloc[40 - 2:40 + 5, :])
+
+    expected_a = (epoch_a1 + epoch_a2) / 2
+    expected_b = (epoch_b1 + epoch_b2) / 2
+
+    for regression_strategy in ["by-epoch", "continuous"]:
+        a_alone, = ds.multi_rerp([req_a],
+                                 regression_strategy=regression_strategy)
+        b_alone, = ds.multi_rerp([req_b],
+                                 regression_strategy=regression_strategy)
+        a, b = ds.multi_rerp([req_a, req_b],
+                             regression_strategy=regression_strategy)
+        assert np.allclose(expected_a, a_alone.betas)
+        assert np.allclose(expected_b, b_alone.betas)
+        assert np.allclose(expected_a, a.betas)
+        assert np.allclose(expected_b, b.betas)
+
 # or... no, just need to run these as totally separate regressions.
 # and then design_offset is irrelevant, doh.
+
+# no-epochs-available or no-data-available error reporting? what happens?

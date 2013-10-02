@@ -111,20 +111,16 @@ def multi_rerp_impl(dataset, rerp_requests,
         rerp._set_fit_info(regression_strategy, overlap_correction)
     # Work out the size of the full design matrices, and fill in the offset
     # fields in rerps. NB: modifies rerps.
-    (by_epoch_design_width,
-     continuous_design_width) = _layout_design_matrices(rerps)
+    continuous_design_width = _layout_design_matrix(rerps)
     if regression_strategy == "by-epoch":
-        all_betas = _fit_by_epoch(dataset, analysis_subspans,
-                                  by_epoch_design_width)
+        _fit_by_epoch(dataset, analysis_subspans)
     elif regression_strategy == "continuous":
         all_betas = _fit_continuous(dataset, analysis_subspans,
                                     continuous_design_width)
+        for rerp in rerps:
+            rerp._set_betas(_extract_rerp_betas(rerp, all_betas))
     else: # pragma: no cover
         assert False
-    # And finally, we unpack the combined betas into those belonging to each
-    # rERP.
-    for rerp in rerps:
-        rerp._set_betas(_extract_rerp_betas(rerp, all_betas))
 
     for rerp in rerps:
         assert rerp._is_complete()
@@ -499,18 +495,16 @@ def test__epoch_info_and_spans():
 
 # Work out the size of the full design matrices, and fill in the offset fields
 # in rerps
-def _layout_design_matrices(rerps):
-    by_epoch_design_width = 0
+def _layout_design_matrix(rerps):
     continuous_design_width = 0
     for rerp in rerps:
         # However many columns have been seen so far, that's the offset of
         # this rerp's design columns within the larger design matrix
-        rerp._set_layout(by_epoch_design_width, continuous_design_width)
+        rerp._set_layout(continuous_design_width)
         # Now figure out how many columns it takes up
         this_design_width = len(rerp.design_info.column_names)
-        by_epoch_design_width += this_design_width
         continuous_design_width += this_design_width * rerp.ticks
-    return by_epoch_design_width, continuous_design_width
+    return continuous_design_width
 
 def test__layout_design_matrices():
     from patsy import DesignInfo
@@ -522,13 +516,9 @@ def test__layout_design_matrices():
              DesignInfo.from_array(np.ones((1, 5))),
              10, 20),
         ]
-    (by_epoch_design_width,
-     continuous_design_width) = _layout_design_matrices(fake_rerps)
-    assert fake_rerps[0]._by_epoch_design_offset == 0
+    continuous_design_width = _layout_design_matrix(fake_rerps)
     assert fake_rerps[0]._continuous_design_offset == 0
-    assert fake_rerps[1]._by_epoch_design_offset == 3
     assert fake_rerps[1]._continuous_design_offset == 3 * 10
-    assert by_epoch_design_width == 3 + 5
     assert continuous_design_width == 3 * 10 + 5 * 10
 
 ################################################################
@@ -1255,7 +1245,7 @@ def test__choose_strategy():
 # calling np.linalg.lstsq took 200 ms, and doing the lstsq by hand is an order
 # of magnitude faster again (!). The code could always be resurrected from git
 # if needed for scalability though.
-def _fit_by_epoch(dataset, analysis_subspans, design_width):
+def _fit_by_epoch(dataset, analysis_subspans):
     # Throw out all that nice subspan information and just get a list of
     # epochs. We're guaranteed that every epoch which appears in
     # analysis_spans is fully included in the regression.
@@ -1265,54 +1255,50 @@ def _fit_by_epoch(dataset, analysis_subspans, design_width):
         epochs.update(subspan.epochs)
     # Process recspans in order, to improve data locality
     epochs = sorted(epochs, key=lambda e: (e.recspan_id, e.start_tick))
-    ticks = epochs[0].stop_tick - epochs[0].start_tick
     channels = dataset.data_format.num_channels
-    X = np.zeros((len(epochs), design_width))
-    if X.shape[0] < X.shape[1]:
-        raise ValueError("You have more predictors than data points. "
-                         "I'm afraid this isn't going to work out.")
-    Y = np.empty((len(epochs), ticks * channels))
-    for i, epoch in enumerate(epochs):
-        x_idx = slice(epoch.rerp._by_epoch_design_offset,
-                      epoch.rerp._by_epoch_design_offset + len(epoch.design_row))
-        X[i, x_idx] = epoch.design_row
+    Xs = {}
+    Ys = {}
+    for epoch in epochs:
+        rerp = epoch.rerp
+        this_X = epoch.design_row
         recspan = dataset[epoch.recspan_id]
-        y_strip = recspan.iloc[epoch.start_tick:epoch.stop_tick, :]
-        Y[i, :] = np.asarray(y_strip).reshape((ticks * channels,), order="C")
-    # implementing lstsq ourselves is dramatically faster than using lstsq
-    # (like, factor of 20?). I don't know why. Some discussion:
-    #   http://mail.scipy.org/pipermail/scipy-user/2013-October/035016.html
-    # How this works:
-    #   svd gives X = USV'
-    # where U and V are unitary, S is diagonal. Therefore
-    #  B = (X'X)^-1 X'Y
-    #    = (VS'U'USV')-1 VS'U'Y
-    #    = V S^-1 S'^-1 V^-1 V S'U'Y
-    #    = V S^-1 U' Y
-    # np.linalg.svd gives V' instead of V, and gives S as a vector rather than
-    # a matrix.
-    U, s, Vt = np.linalg.svd(X, full_matrices=False)
-    # R's lm() has a default tolerance of 1e-7, so I'll arbitrarily steal
-    # that:
-    if s[0] / s[-1] > 1e7:
-        raise ValueError("Your predictors appear to be perfectly collinear.")
-    # If this were a real generic least-norm solver I'd want to mess about
-    # with any singular values that were "too small", but the above code
-    # guarantees that this will never happen, so we can just use the naive
-    # formula directly:
-    all_betas = np.dot(Vt.T * 1/s, np.dot(U.T, Y))
-    # Rearrange the beta matrix so that each column contains results for one
-    # channel, and the rows go:
-    #   predictor 1, latency 1
-    #   ...
-    #   predictor 1, latency n
-    #   predictor 2, latency 1
-    #   ...
-    #   predictor 2, latency n
-    #   ...
-    # Just like the continuous regression strategy spits out by default.
-    all_betas = all_betas.reshape((-1, len(dataset.data_format.channel_names)))
-    return all_betas
+        y_data = recspan.iloc[epoch.start_tick:epoch.stop_tick, :]
+        ticks = epoch.stop_tick - epoch.start_tick
+        this_Y = np.asarray(y_data).reshape((1, ticks * channels))
+        Xs.setdefault(rerp, []).append(this_X)
+        Ys.setdefault(rerp, []).append(this_Y)
+    for rerp in Xs:
+        X = np.row_stack(Xs[rerp])
+        Y = np.row_stack(Ys[rerp])
+        if X.shape[0] < X.shape[1]:
+            raise ValueError("rerp %r has more predictors than data points. "
+                             "I'm afraid this isn't going to work out."
+                             % (rerp.name,))
+        # implementing lstsq ourselves is dramatically faster than using lstsq
+        # (like, factor of 20?). I don't know why. Some discussion:
+        #   http://mail.scipy.org/pipermail/scipy-user/2013-October/035016.html
+        # How this works:
+        #   svd gives X = USV'
+        # where U and V are unitary, S is diagonal. Therefore
+        #  B = (X'X)^-1 X'Y
+        #    = (VS'U'USV')-1 VS'U'Y
+        #    = V S^-1 S'^-1 V^-1 V S'U'Y
+        #    = V S^-1 U' Y
+        # np.linalg.svd gives V' instead of V, and gives S as a vector rather
+        # than a matrix.
+        U, s, Vt = np.linalg.svd(X, full_matrices=False)
+        # R's lm() has a default tolerance of 1e-7, so I'll arbitrarily steal
+        # that:
+        if s[0] / s[-1] > 1e7:
+            raise ValueError("Your predictors appear to be perfectly "
+                             "collinear.")
+        # If this were a real generic least-norm solver I'd want to mess about
+        # with any singular values that were "too small", but the above code
+        # guarantees that this will never happen, so we can just use the naive
+        # formula directly:
+        betas = np.dot(Vt.T * 1/s, np.dot(U.T, Y))
+        betas = betas.reshape((-1, rerp.ticks, channels), order="C")
+        rerp._set_betas(betas)
 
 _ContinuousEpochInfo = namedtuple("_ContinuousEpochInfo",
                                   ["design_offset", "design_row",
@@ -1439,8 +1425,7 @@ class rERP(object):
         self.total_rerps = total_rerps
         self._add_part("context")
 
-    def _set_layout(self, by_epoch_design_offset, continuous_design_offset):
-        self._by_epoch_design_offset = by_epoch_design_offset
+    def _set_layout(self, continuous_design_offset):
         self._continuous_design_offset = continuous_design_offset
         self._add_part("layout")
 
