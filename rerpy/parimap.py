@@ -155,7 +155,7 @@ _config = {
     }
 
 if CONFIG_ENVVAR in os.environ:
-    for tag in os.environ["CONFIG_ENVVAR"].split(","):
+    for tag in os.environ[CONFIG_ENVVAR].split(","):
         if tag in ("serial", "parallel"):
             _config["mode"] = tag
             continue
