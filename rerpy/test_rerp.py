@@ -360,3 +360,8 @@ def test_predict():
     assert np.allclose(prediction[1], 5 * rerp.betas["x"])
 
 # no-epochs-available or no-data-available error reporting? what happens?
+
+# also: by-epoch is impossible if have multiple rERPs with different epoch
+# lengths.
+# or... no, just need to run these as totally separate regressions.
+# and then design_offset is irrelevant, doh.

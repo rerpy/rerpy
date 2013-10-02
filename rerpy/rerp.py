@@ -1249,7 +1249,13 @@ def test__choose_strategy():
 
 ################################################################
 
-def _by_epoch_jobs(dataset, analysis_subspans):
+# We used to do an incremental fit in here, but it was ridiculously
+# slower. Like for a simple 80 epochs/32 channels/2 predictors problem, the
+# naive incremental fit took 120 s, batching everything up took 6 s, just
+# calling np.linalg.lstsq took 200 ms, and doing the lstsq by hand is an order
+# of magnitude faster again (!). The code could always be resurrected from git
+# if needed for scalability though.
+def _fit_by_epoch(dataset, analysis_subspans, design_width):
     # Throw out all that nice subspan information and just get a list of
     # epochs. We're guaranteed that every epoch which appears in
     # analysis_spans is fully included in the regression.
@@ -1257,48 +1263,44 @@ def _by_epoch_jobs(dataset, analysis_subspans):
     for subspan in analysis_subspans:
         assert len(subspan.epochs) == 1
         epochs.update(subspan.epochs)
+    # Process recspans in order, to improve data locality
     epochs = sorted(epochs, key=lambda e: (e.recspan_id, e.start_tick))
-    for epoch in epochs:
+    ticks = epochs[0].stop_tick - epochs[0].start_tick
+    channels = dataset.data_format.num_channels
+    X = np.zeros((len(epochs), design_width))
+    if X.shape[0] < X.shape[1]:
+        raise ValueError("You have more predictors than data points. "
+                         "I'm afraid this isn't going to work out.")
+    Y = np.empty((len(epochs), ticks * channels))
+    for i, epoch in enumerate(epochs):
+        x_idx = slice(epoch.rerp._by_epoch_design_offset,
+                      epoch.rerp._by_epoch_design_offset + len(epoch.design_row))
+        X[i, x_idx] = epoch.design_row
         recspan = dataset[epoch.recspan_id]
-        data = np.asarray(recspan.iloc[epoch.start_tick:epoch.stop_tick, :])
-        yield (data, epoch.rerp._by_epoch_design_offset, epoch.design_row)
-
-class _ByEpochWorker(object):
-    def __init__(self, design_width):
-        self._design_width = design_width
-
-    def _make_x_y(self, job):
-        data, design_offset, design_row = job
-        # XX FIXME: making this a sparse array might be more efficient
-        x_strip = np.zeros((1, self._design_width))
-        x_idx = slice(design_offset, design_offset + len(design_row))
-        x_strip[0, x_idx] = design_row
-        y_strip = data.reshape((1, -1))
-        return x_strip, y_strip
-
-    def __call__(self, job):
-        x_strip, y_strip = self._make_x_y(job)
-        return XtXIncrementalLS.append_top_half(x_strip, y_strip)
-
-def test__ByEpochWorker():
-    worker = _ByEpochWorker(4)
-    x_strip, y_strip = worker._make_x_y((np.asarray([[1, 2], [3, 4]]),
-                                         2,
-                                         np.asarray([1, 2])))
-    assert np.array_equal(x_strip, [[0, 0, 1, 2]])
-    assert np.array_equal(y_strip, [[1, 2, 3, 4]])
-
-def _incremental_fit(worker, jobs_iter):
-    model = XtXIncrementalLS()
-    for job_result in parimap_unordered(worker, jobs_iter):
-        model.append_bottom_half(job_result)
-    result = model.fit()
-    return result.coef()
-
-def _fit_by_epoch(dataset, analysis_subspans, design_width):
-    worker = _ByEpochWorker(design_width)
-    jobs_iter = _by_epoch_jobs(dataset, analysis_subspans)
-    all_betas = _incremental_fit(worker, jobs_iter)
+        y_strip = recspan.iloc[epoch.start_tick:epoch.stop_tick, :]
+        Y[i, :] = np.asarray(y_strip).reshape((ticks * channels,), order="C")
+    # implementing lstsq ourselves is dramatically faster than using lstsq
+    # (like, factor of 20?). I don't know why. Some discussion:
+    #   http://mail.scipy.org/pipermail/scipy-user/2013-October/035016.html
+    # How this works:
+    #   svd gives X = USV'
+    # where U and V are unitary, S is diagonal. Therefore
+    #  B = (X'X)^-1 X'Y
+    #    = (VS'U'USV')-1 VS'U'Y
+    #    = V S^-1 S'^-1 V^-1 V S'U'Y
+    #    = V S^-1 U' Y
+    # np.linalg.svd gives V' instead of V, and gives S as a vector rather than
+    # a matrix.
+    U, s, Vt = np.linalg.svd(X, full_matrices=False)
+    # R's lm() has a default tolerance of 1e-7, so I'll arbitrarily steal
+    # that:
+    if s[0] / s[-1] > 1e7:
+        raise ValueError("Your predictors appear to be perfectly collinear.")
+    # If this were a real generic least-norm solver I'd want to mess about
+    # with any singular values that were "too small", but the above code
+    # guarantees that this will never happen, so we can just use the naive
+    # formula directly:
+    all_betas = np.dot(Vt.T * 1/s, np.dot(U.T, Y))
     # Rearrange the beta matrix so that each column contains results for one
     # channel, and the rows go:
     #   predictor 1, latency 1
@@ -1377,7 +1379,11 @@ class _ContinuousWorker(object):
 def _fit_continuous(dataset, analysis_subspans, expanded_design_width):
     worker = _ContinuousWorker(expanded_design_width)
     jobs_iter = _continuous_jobs(dataset, analysis_subspans)
-    return _incremental_fit(worker, jobs_iter)
+    model = XtXIncrementalLS()
+    for job_result in parimap_unordered(worker, jobs_iter):
+        model.append_bottom_half(job_result)
+    result = model.fit()
+    return result.coef()
 
 ################################################################
 
