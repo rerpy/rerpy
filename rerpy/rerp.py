@@ -109,16 +109,11 @@ def multi_rerp_impl(dataset, rerp_requests,
                                            rerps[0].global_stats)
     for rerp in rerps:
         rerp._set_fit_info(regression_strategy, overlap_correction)
-    # Work out the size of the full design matrices, and fill in the offset
-    # fields in rerps. NB: modifies rerps.
-    continuous_design_width = _layout_design_matrix(rerps)
+    # _fit_* functions fill in .betas field on rerps.
     if regression_strategy == "by-epoch":
         _fit_by_epoch(dataset, analysis_subspans)
     elif regression_strategy == "continuous":
-        all_betas = _fit_continuous(dataset, analysis_subspans,
-                                    continuous_design_width)
-        for rerp in rerps:
-            rerp._set_betas(_extract_rerp_betas(rerp, all_betas))
+        all_betas = _fit_continuous(dataset, analysis_subspans, rerps)
     else: # pragma: no cover
         assert False
 
@@ -490,36 +485,6 @@ def test__epoch_info_and_spans():
         ["_MISSING_PREDICTOR", "_BAD_EVENT_QUERY"],
         ["_BAD_EVENT_QUERY"]
         ]
-
-################################################################
-
-# Work out the size of the full design matrices, and fill in the offset fields
-# in rerps
-def _layout_design_matrix(rerps):
-    continuous_design_width = 0
-    for rerp in rerps:
-        # However many columns have been seen so far, that's the offset of
-        # this rerp's design columns within the larger design matrix
-        rerp._set_layout(continuous_design_width)
-        # Now figure out how many columns it takes up
-        this_design_width = len(rerp.design_info.column_names)
-        continuous_design_width += this_design_width * rerp.ticks
-    return continuous_design_width
-
-def test__layout_design_matrices():
-    from patsy import DesignInfo
-    fake_rerps = [
-        rERP(rERPRequest("asdf", -100, 1000, "1"), None,
-             DesignInfo.from_array(np.ones((1, 3))),
-             -2, 8),
-        rERP(rERPRequest("asdf", -100, 1000, "1"), None,
-             DesignInfo.from_array(np.ones((1, 5))),
-             10, 20),
-        ]
-    continuous_design_width = _layout_design_matrix(fake_rerps)
-    assert fake_rerps[0]._continuous_design_offset == 0
-    assert fake_rerps[1]._continuous_design_offset == 3 * 10
-    assert continuous_design_width == 3 * 10 + 5 * 10
 
 ################################################################
 #
@@ -1304,21 +1269,21 @@ _ContinuousEpochInfo = namedtuple("_ContinuousEpochInfo",
                                   ["design_offset", "design_row",
                                    "start_tick", "ticks"])
 
-def _continuous_jobs(dataset, analysis_subspans):
+def _continuous_jobs(dataset, analysis_subspans, design_offsets):
     for subspan in analysis_subspans:
         recspan = dataset[subspan.start[0]]
         data = np.asarray(recspan.iloc[subspan.start[1]:subspan.stop[1], :])
         yield (data,
                subspan.start[1],
-               [_ContinuousEpochInfo(epoch.rerp._continuous_design_offset,
+               [_ContinuousEpochInfo(design_offsets[epoch.rerp],
                                      epoch.design_row,
                                      epoch.start_tick,
                                      epoch.stop_tick - epoch.start_tick)
                 for epoch in subspan.epochs])
 
 class _ContinuousWorker(object):
-    def __init__(self, expanded_design_width):
-        self._expanded_design_width = expanded_design_width
+    def __init__(self, full_design_width):
+        self._full_design_width = full_design_width
 
     def __call__(self, job):
         data, data_start_tick, epoch_infos = job
@@ -1353,7 +1318,7 @@ class _ContinuousWorker(object):
                                                   col_start + data.shape[0])
         x_strip_coo = sp.coo_matrix((design_data, (design_i, design_j)),
                                     shape=(data.shape[0],
-                                           self._expanded_design_width))
+                                           self._full_design_width))
         x_strip = x_strip_coo.tocsc()
         y_strip = data
         # print "x strip at %s:" % (data_start_tick,)
@@ -1362,23 +1327,32 @@ class _ContinuousWorker(object):
         # print y_strip
         return XtXIncrementalLS.append_top_half(x_strip, y_strip)
 
-def _fit_continuous(dataset, analysis_subspans, expanded_design_width):
-    worker = _ContinuousWorker(expanded_design_width)
-    jobs_iter = _continuous_jobs(dataset, analysis_subspans)
+def _fit_continuous(dataset, analysis_subspans, rerps):
+    # Work out the size of the full design matrices, and the offset of each
+    # rerp's individual design matrix within this overall design matrix.
+    full_design_width = 0
+    design_offsets = {}
+    for rerp in rerps:
+        # However many columns have been seen so far, that's the offset of
+        # this rerp's design columns within the larger design matrix
+        design_offsets[rerp] = full_design_width
+        # Now figure out how many columns it takes up
+        this_design_width = len(rerp.design_info.column_names)
+        full_design_width += this_design_width * rerp.ticks
+    worker = _ContinuousWorker(full_design_width)
+    jobs_iter = _continuous_jobs(dataset, analysis_subspans, design_offsets)
     model = XtXIncrementalLS()
     for job_result in parimap_unordered(worker, jobs_iter):
         model.append_bottom_half(job_result)
     result = model.fit()
-    return result.coef()
-
-################################################################
-
-def _extract_rerp_betas(rerp, all_betas):
-    i = rerp._continuous_design_offset
-    num_predictors = len(rerp.design_info.column_names)
-    num_columns = rerp.ticks * num_predictors
-    betas = all_betas[i:i + num_columns, :]
-    return betas.reshape((num_predictors, rerp.ticks, -1))
+    all_betas = result.coef()
+    # Extract each rerp's betas from the big beta matrix.
+    for rerp in rerps:
+        i = design_offsets[rerp]
+        num_predictors = len(rerp.design_info.column_names)
+        num_columns = rerp.ticks * num_predictors
+        betas = all_betas[i:i + num_columns, :]
+        rerp._set_betas(betas.reshape((num_predictors, rerp.ticks, -1)))
 
 ################################################################
 
@@ -1390,8 +1364,7 @@ class rERP(object):
     # pieces don't interact too much. To somewhat mitigate the problem, let's
     # at least explicitly keep track of how built up it is at each point, so
     # we can have assertions about that.
-    _ALL_PARTS = frozenset(["context", "layout", "accounting", "fit-info",
-                            "betas"])
+    _ALL_PARTS = frozenset(["context", "accounting", "fit-info", "betas"])
     def _has(self, *parts):
         return self._parts.issuperset(parts)
     def _is_complete(self):
@@ -1424,10 +1397,6 @@ class rERP(object):
         self.this_rerp_index = this_rerp_index
         self.total_rerps = total_rerps
         self._add_part("context")
-
-    def _set_layout(self, continuous_design_offset):
-        self._continuous_design_offset = continuous_design_offset
-        self._add_part("layout")
 
     def _set_accounting(self, global_stats, this_rerp_stats):
         self.global_stats = global_stats

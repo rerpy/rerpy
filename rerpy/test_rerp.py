@@ -390,7 +390,6 @@ def test_diff_lengths():
         assert np.allclose(expected_a, a.betas)
         assert np.allclose(expected_b, b.betas)
 
-# or... no, just need to run these as totally separate regressions.
-# and then design_offset is irrelevant, doh.
-
-# no-epochs-available or no-data-available error reporting? what happens?
+# XX TODO: no-epochs-available or no-data-available error reporting? what happens?
+# XX TODO: add continuous-batch versus continuous-streaming modes
+# XX TODO: make continuous-streaming do some amount of batching
