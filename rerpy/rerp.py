@@ -84,9 +84,8 @@ def multi_rerp_impl(dataset, rerp_requests,
     spans = []
     # And allocate the rERP objects that we will eventually return.
     rerps = []
-    for i, rerp_request in enumerate(rerp_requests):
-        rerp, epoch_spans = _epoch_info_and_spans(dataset, rerp_request)
-        rerp._set_context(i, len(rerp_requests))
+    for i in xrange(len(rerp_requests)):
+        rerp, epoch_spans = _epoch_info_and_spans(dataset, rerp_requests, i)
         rerps.append(rerp)
         spans.extend(epoch_spans)
     spans.extend(_artifact_spans(dataset, artifact_query, artifact_type_field))
@@ -353,7 +352,8 @@ def test__rerp_design():
     from nose.tools import assert_raises
     assert_raises(ValueError, _rerp_design, "a ~ b", ds.events(), eval_env)
 
-def _epoch_info_and_spans(dataset, rerp_request):
+def _epoch_info_and_spans(dataset, rerp_requests, i):
+    rerp_request = rerp_requests[i]
     spans = []
     data_format = dataset.data_format
     # We interpret the time interval as a closed interval [start, stop],
@@ -378,7 +378,7 @@ def _epoch_info_and_spans(dataset, rerp_request):
                                             events,
                                             rerp_request.eval_env)
     rerp = rERP(rerp_request, dataset.data_format, design.design_info,
-                start_tick, stop_tick)
+                start_tick, stop_tick, i, len(rerp_requests))
     if rerp_request.bad_event_query is None:
         bad_event_query = None
     else:
@@ -422,10 +422,12 @@ def test__epoch_info_and_spans():
     ds.add_event(1, 50, 51, {"include": True, "a": 6})
 
     req = rERPRequest("include", -10, 10, "a")
-    rerp, spans = _epoch_info_and_spans(ds, req)
+    rerp, spans = _epoch_info_and_spans(ds, [req], 0)
     # [-10 ms, 10 ms] -> [-8 ms, 8 ms] -> [-2 tick, 2 tick] -> [-2 tick, 3 tick)
     assert rerp.start_tick == -2
     assert rerp.stop_tick == 3
+    assert rerp.this_rerp_index == 0
+    assert rerp.total_rerps == 1
     assert [s.start for s in spans] == [
         (0, 0 - 2), (0, 10 - 2), (1, 40 - 2), (1, 50 - 2),
         ]
@@ -460,25 +462,25 @@ def test__epoch_info_and_spans():
                              [(20, 20), (5, 6)],
                              ]:
         req = rERPRequest("include", times[0], times[1], "a")
-        rerp, _ = _epoch_info_and_spans(ds, req)
+        rerp, _ = _epoch_info_and_spans(ds, [req], 0)
         assert rerp.start_tick == exp_ticks[0]
         assert rerp.stop_tick == exp_ticks[1]
 
     # No samples -> error
     from nose.tools import assert_raises
     req_tiny = rERPRequest("include", 1, 3, "a")
-    assert_raises(ValueError, _epoch_info_and_spans, ds, req_tiny)
+    assert_raises(ValueError, _epoch_info_and_spans, ds, [req_tiny], 0)
     # But the same req it's fine with a higher-res data set
     ds_high_hz = mock_dataset(hz=1000)
     ds_high_hz.add_event(0, 0, 1, {"include": True, "a": 1})
-    rerp, _ = _epoch_info_and_spans(ds_high_hz, req_tiny)
+    rerp, _ = _epoch_info_and_spans(ds_high_hz, [req_tiny], 0)
     assert rerp.start_tick == 1
     assert rerp.stop_tick == 4
 
     # bad_event_query
     req = rERPRequest("include", -10, 10, "a",
                       bad_event_query="a == None or a == 6")
-    rerp, spans = _epoch_info_and_spans(ds, req)
+    rerp, spans = _epoch_info_and_spans(ds, [req], 0)
     assert [s.epoch.intrinsic_artifacts for s in spans] == [
         [],
         [],
@@ -684,7 +686,7 @@ def test__propagate_all_or_nothing():
           starts_with_intrinsic=False):
         req = rERPRequest("asdf", -100, 1000, "1",
                           all_or_nothing=all_or_nothing)
-        rerp = rERP(req, None, None, -25, 250)
+        rerp = rERP(req, None, None, -25, 250, 0, 1)
         i_a = []
         if starts_with_intrinsic:
             i_a.append("born_bad")
@@ -933,9 +935,7 @@ class _Accountant(object):
 def test__Accountant():
     def make_rerps(N):
         rerps = [rERP(rERPRequest("asdf", -100, 1000, "1"),
-                      None, None, 0, 0) for i in xrange(N)]
-        for i, rerp in enumerate(rerps):
-            rerp._set_context(i, N)
+                      None, None, 0, 0, i, N) for i in xrange(N)]
         return rerps
     def e(rerps, i):
         return _Epoch(None, None, None, None, rerps[i], None)
@@ -1364,7 +1364,7 @@ class rERP(object):
     # pieces don't interact too much. To somewhat mitigate the problem, let's
     # at least explicitly keep track of how built up it is at each point, so
     # we can have assertions about that.
-    _ALL_PARTS = frozenset(["context", "accounting", "fit-info", "betas"])
+    _ALL_PARTS = frozenset(["accounting", "fit-info", "betas"])
     def _has(self, *parts):
         return self._parts.issuperset(parts)
     def _is_complete(self):
@@ -1374,7 +1374,7 @@ class rERP(object):
         self._parts.add(part)
 
     def __init__(self, request, data_format, design_info,
-                 start_tick, stop_tick):
+                 start_tick, stop_tick, this_rerp_index, total_rerps):
         self._parts = set()
         self.name = str(request.name)
         self.event_query = str(request.event_query)
@@ -1392,11 +1392,9 @@ class rERP(object):
         self.stop_tick = stop_tick
         self.ticks = stop_tick - start_tick
 
-    def _set_context(self, this_rerp_index, total_rerps):
         assert 0 <= this_rerp_index < total_rerps
         self.this_rerp_index = this_rerp_index
         self.total_rerps = total_rerps
-        self._add_part("context")
 
     def _set_accounting(self, global_stats, this_rerp_stats):
         self.global_stats = global_stats
