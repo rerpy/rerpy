@@ -110,7 +110,7 @@ def multi_rerp_impl(dataset, rerp_requests,
         rerp._set_fit_info(regression_strategy, overlap_correction)
     # _fit_* functions fill in .betas field on rerps.
     if regression_strategy == "by-epoch":
-        _fit_by_epoch(dataset, analysis_subspans)
+        _fit_by_epoch(dataset, analysis_subspans, rerps)
     elif regression_strategy == "continuous":
         all_betas = _fit_continuous(dataset, analysis_subspans, rerps)
     else: # pragma: no cover
@@ -374,6 +374,8 @@ def _epoch_info_and_spans(dataset, rerp_requests, i):
                          % (rerp_request.start_time,
                             rerp_request.stop_time))
     events = dataset.events(rerp_request.event_query)
+    if not events:
+        raise ValueError("No events found for rERP %r" % (rerp_request.name,))
     design, design_row_idxes = _rerp_design(rerp_request.formula,
                                             events,
                                             rerp_request.eval_env)
@@ -476,6 +478,10 @@ def test__epoch_info_and_spans():
     rerp, _ = _epoch_info_and_spans(ds_high_hz, [req_tiny], 0)
     assert rerp.start_tick == 1
     assert rerp.stop_tick == 4
+
+    # no epochs -> error
+    assert_raises(ValueError, _epoch_info_and_spans, ds,
+                  [rERPRequest("False", -10, 10, "1")], 0)
 
     # bad_event_query
     req = rERPRequest("include", -10, 10, "a",
@@ -778,9 +784,10 @@ def _break_down_rejections(superclass, subclasses):
     result = ("%s:\n" % (superclass,)
            + "  Requested: %s" % (total,))
     if total > 0:
-        result += "\n" + "".join(["    %s: %s (%.1f%%)\n"
-                                  % (name, value, value * 100. / total)
-                                  for (name, value) in subclasses])
+        result += "\n"
+        result += "\n".join(["    %s: %s (%.1f%%)"
+                             % (name, value, value * 100. / total)
+                             for (name, value) in subclasses])
     return result
 
 class EpochRejectionStats(object):
@@ -848,7 +855,7 @@ class RejectionOverlapStats(object):
         if self.ticks.accepted > 0:
             chunks.append(
                 "Average events per accepted tick: %.2f\n"
-                " (>1 indicates overlap between the epochs included in this category)"
+                " (>1 indicates overlap between the epochs included in these statistics)"
                 % (self.event_ticks.accepted * 1.0 / self.ticks.accepted))
         return "\n".join(chunks)
     def _repr_pretty_(self, p, cycle): # pragma: no cover
@@ -1207,10 +1214,10 @@ def test__choose_strategy():
 # We used to do an incremental fit in here, but it was ridiculously
 # slower. Like for a simple 80 epochs/32 channels/2 predictors problem, the
 # naive incremental fit took 120 s, batching everything up took 6 s, just
-# calling np.linalg.lstsq took 200 ms, and doing the lstsq by hand is an order
-# of magnitude faster again (!). The code could always be resurrected from git
-# if needed for scalability though.
-def _fit_by_epoch(dataset, analysis_subspans):
+# calling np.linalg.lstsq took 200 ms, and doing the lstsq by hand takes
+# something under 10 ms (!!). The code could always be resurrected from git if
+# needed for scalability though.
+def _fit_by_epoch(dataset, analysis_subspans, rerps):
     # Throw out all that nice subspan information and just get a list of
     # epochs. We're guaranteed that every epoch which appears in
     # analysis_spans is fully included in the regression.
@@ -1221,20 +1228,19 @@ def _fit_by_epoch(dataset, analysis_subspans):
     # Process recspans in order, to improve data locality
     epochs = sorted(epochs, key=lambda e: (e.recspan_id, e.start_tick))
     channels = dataset.data_format.num_channels
-    Xs = {}
-    Ys = {}
+    Xs_Ys_by_rerp = {rerp: ([], []) for rerp in rerps}
     for epoch in epochs:
-        rerp = epoch.rerp
         this_X = epoch.design_row
         recspan = dataset[epoch.recspan_id]
         y_data = recspan.iloc[epoch.start_tick:epoch.stop_tick, :]
         ticks = epoch.stop_tick - epoch.start_tick
         this_Y = np.asarray(y_data).reshape((1, ticks * channels))
-        Xs.setdefault(rerp, []).append(this_X)
-        Ys.setdefault(rerp, []).append(this_Y)
-    for rerp in Xs:
-        X = np.row_stack(Xs[rerp])
-        Y = np.row_stack(Ys[rerp])
+        Xs, Ys = Xs_Ys_by_rerp[epoch.rerp]
+        Xs.append(this_X)
+        Ys.append(this_Y)
+    for rerp, (Xs, Ys) in Xs_Ys_by_rerp.items():
+        X = np.row_stack(Xs)
+        Y = np.row_stack(Ys)
         if X.shape[0] < X.shape[1]:
             raise ValueError("rerp %r has more predictors than data points. "
                              "I'm afraid this isn't going to work out."
@@ -1243,27 +1249,35 @@ def _fit_by_epoch(dataset, analysis_subspans):
         # (like, factor of 20?). I don't know why. Some discussion:
         #   http://mail.scipy.org/pipermail/scipy-user/2013-October/035016.html
         # How this works:
-        #   svd gives X = USV'
-        # where U and V are unitary, S is diagonal. Therefore
+        #   svd produces the factorization: X = USV'
+        # where U and V are unitary, S is diagonal. Therefore, starting from
+        # the normal equations:
         #  B = (X'X)^-1 X'Y
-        #    = (VS'U'USV')-1 VS'U'Y
-        #    = V S^-1 S'^-1 V^-1 V S'U'Y
+        #    = (V S' U' U S V')^-1 V S' U' Y
+        #    = V S^-1 S'^-1 V^-1 V S' U' Y
         #    = V S^-1 U' Y
-        # np.linalg.svd gives V' instead of V, and gives S as a vector rather
-        # than a matrix.
+        # (And V S^-1 U' is pinv(X), modulo some fiddling with near-zero
+        # singular values; in fact this is exactly how np.linalg.pinv is
+        # implemented.)
+        #
+        # Remember, np.linalg.svd gives V' instead of V, and gives S as a
+        # vector rather than a matrix.
         U, s, Vt = np.linalg.svd(X, full_matrices=False)
         # R's lm() has a default tolerance of 1e-7, so I'll arbitrarily steal
-        # that:
+        # that. s[0] / s[-1] is the condition number.
         if s[0] / s[-1] > 1e7:
             raise ValueError("Your predictors appear to be perfectly "
-                             "collinear.")
-        # If this were a real generic least-norm solver I'd want to mess about
-        # with any singular values that were "too small", but the above code
-        # guarantees that this will never happen, so we can just use the naive
-        # formula directly:
+                             "collinear. I could make up an answer, but I'd "
+                             "rather not.")
+        # If this were a real generic least-norm solver we'd want to go in by
+        # hand and zero out any singular values that were "too small", but the
+        # above code guarantees that this will never happen, so we can just
+        # use the naive formula directly:
         betas = np.dot(Vt.T * 1/s, np.dot(U.T, Y))
         betas = betas.reshape((-1, rerp.ticks, channels), order="C")
         rerp._set_betas(betas)
+
+################################################################
 
 _ContinuousEpochInfo = namedtuple("_ContinuousEpochInfo",
                                   ["design_offset", "design_row",
