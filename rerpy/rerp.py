@@ -5,6 +5,7 @@
 import itertools
 from collections import namedtuple
 import inspect
+import sys
 
 import numpy as np
 import scipy.sparse as sp
@@ -13,9 +14,7 @@ from patsy import (EvalEnvironment, dmatrices, ModelDesc, Term,
                    build_design_matrices)
 from patsy.util import repr_pretty_delegate, repr_pretty_impl
 
-from rerpy.incremental_ls import XtXIncrementalLS
-from rerpy.parimap import parimap_unordered
-from rerpy.util import indent
+from rerpy.util import indent, ProgressBar
 
 ################################################################
 # Public interface
@@ -81,6 +80,7 @@ def multi_rerp_impl(dataset, rerp_requests,
     _check_unique_names(rerp_requests)
 
     ## Find all the requested epochs and artifacts
+    sys.stdout.write("Locating epochs and artifacts\n")
     spans = []
     # And allocate the rERP objects that we will eventually return.
     rerps = []
@@ -108,6 +108,9 @@ def multi_rerp_impl(dataset, rerp_requests,
                                            rerps[0].global_stats)
     for rerp in rerps:
         rerp._set_fit_info(regression_strategy, overlap_correction)
+    sys.stdout.write("Fitting model to %s ticks with strategy %r\n"
+                     % (rerps[0].global_stats.ticks.accepted,
+                        regression_strategy))
     # _fit_* functions fill in .betas field on rerps.
     if regression_strategy == "by-epoch":
         _fit_by_epoch(dataset, analysis_subspans, rerps)
@@ -118,6 +121,7 @@ def multi_rerp_impl(dataset, rerp_requests,
 
     for rerp in rerps:
         assert rerp._is_complete()
+    sys.stdout.write("Done.\n")
     return rerps
 
 ################################################################
@@ -886,7 +890,6 @@ class _Accountant(object):
             bucket_events.setdefault(bucket, 0)
             bucket_events[bucket] += 1
 
-
         if artifacts:
             self._epochs_with_artifacts.update(epochs)
             # Special case: _ALL_OR_NOTHING artifacts should logically be seen
@@ -1246,7 +1249,9 @@ def _fit_by_epoch(dataset, analysis_subspans, rerps):
                              "I'm afraid this isn't going to work out."
                              % (rerp.name,))
         # implementing lstsq ourselves is dramatically faster than using lstsq
-        # (like, factor of 20?). I don't know why. Some discussion:
+        # (like, factor of 20?). This is because lstsq spends the majority of
+        # its time calculating residuals, which we don't need. Some
+        # discussion:
         #   http://mail.scipy.org/pipermail/scipy-user/2013-October/035016.html
         # How this works:
         #   svd produces the factorization: X = USV'
@@ -1256,9 +1261,13 @@ def _fit_by_epoch(dataset, analysis_subspans, rerps):
         #    = (V S' U' U S V')^-1 V S' U' Y
         #    = V S^-1 S'^-1 V^-1 V S' U' Y
         #    = V S^-1 U' Y
-        # (And V S^-1 U' is pinv(X), modulo some fiddling with near-zero
-        # singular values; in fact this is exactly how np.linalg.pinv is
-        # implemented.)
+        # And V S^-1 U' is in fact pinv(X), modulo some fiddling with
+        # near-zero singular values; in fact this is exactly how
+        # np.linalg.pinv is implemented. So basically this is equivalent to
+        # doing
+        #   betas = np.dot(np.linalg.pinv(X), Y)
+        # except that we get a chance to peek at the singular values and check
+        # for collinearity.
         #
         # Remember, np.linalg.svd gives V' instead of V, and gives S as a
         # vector rather than a matrix.
@@ -1279,68 +1288,6 @@ def _fit_by_epoch(dataset, analysis_subspans, rerps):
 
 ################################################################
 
-_ContinuousEpochInfo = namedtuple("_ContinuousEpochInfo",
-                                  ["design_offset", "design_row",
-                                   "start_tick", "ticks"])
-
-def _continuous_jobs(dataset, analysis_subspans, design_offsets):
-    for subspan in analysis_subspans:
-        recspan = dataset[subspan.start[0]]
-        data = np.asarray(recspan.iloc[subspan.start[1]:subspan.stop[1], :])
-        yield (data,
-               subspan.start[1],
-               [_ContinuousEpochInfo(design_offsets[epoch.rerp],
-                                     epoch.design_row,
-                                     epoch.start_tick,
-                                     epoch.stop_tick - epoch.start_tick)
-                for epoch in subspan.epochs])
-
-class _ContinuousWorker(object):
-    def __init__(self, full_design_width):
-        self._full_design_width = full_design_width
-
-    def __call__(self, job):
-        data, data_start_tick, epoch_infos = job
-        nnz = 0
-        for epoch_info in epoch_infos:
-            nnz += epoch_info.design_row.shape[0] * data.shape[0]
-        design_data = np.empty(nnz, dtype=float)
-        design_i = np.empty(nnz, dtype=int)
-        design_j = np.empty(nnz, dtype=int)
-        write_ptr = 0
-        # This code would be more complicated if it couldn't rely on the
-        # following facts:
-        # - Every epoch in 'epochs' is guaranteed to span the entire chunk of
-        #   data, so we don't need to fiddle about finding start and end
-        #   positions, and every epoch generates the same number of non-zero
-        #   values.
-        # - In a coo_matrix, if you have two different entries at the same (i,
-        #   j) coordinate, then they get added together. This is the correct
-        #   thing to do in our case (though it should be very rare -- in
-        #   practice I guess it only happens if you have two events of the
-        #   same type that occur at exactly the same time).
-        for epoch_info in epoch_infos:
-            for i, x_value in enumerate(epoch_info.design_row):
-                write_slice = slice(write_ptr, write_ptr + data.shape[0])
-                write_ptr += data.shape[0]
-                design_data[write_slice] = x_value
-                design_i[write_slice] = np.arange(data.shape[0])
-                col_start = epoch_info.design_offset
-                col_start += i * epoch_info.ticks
-                col_start += data_start_tick - epoch_info.start_tick
-                design_j[write_slice] = np.arange(col_start,
-                                                  col_start + data.shape[0])
-        x_strip_coo = sp.coo_matrix((design_data, (design_i, design_j)),
-                                    shape=(data.shape[0],
-                                           self._full_design_width))
-        x_strip = x_strip_coo.tocsc()
-        y_strip = data
-        # print "x strip at %s:" % (data_start_tick,)
-        # print x_strip.todense()
-        # print "y strip at %s:" % (data_start_tick,)
-        # print y_strip
-        return XtXIncrementalLS.append_top_half(x_strip, y_strip)
-
 def _fit_continuous(dataset, analysis_subspans, rerps):
     # Work out the size of the full design matrices, and the offset of each
     # rerp's individual design matrix within this overall design matrix.
@@ -1353,13 +1300,65 @@ def _fit_continuous(dataset, analysis_subspans, rerps):
         # Now figure out how many columns it takes up
         this_design_width = len(rerp.design_info.column_names)
         full_design_width += this_design_width * rerp.ticks
-    worker = _ContinuousWorker(full_design_width)
-    jobs_iter = _continuous_jobs(dataset, analysis_subspans, design_offsets)
-    model = XtXIncrementalLS()
-    for job_result in parimap_unordered(worker, jobs_iter):
-        model.append_bottom_half(job_result)
-    result = model.fit()
-    all_betas = result.coef()
+    # This was originally parallelized, but the parallel version always went
+    # slower than the serial version, and both seem to be pretty fast,
+    # so... eh. Low-hanging fruit for speeding it up would be to use CHOLMOD.
+    XtX = np.zeros((full_design_width, full_design_width))
+    XtY = np.zeros((full_design_width, dataset.data_format.num_channels))
+    rows = 0
+    with ProgressBar(len(analysis_subspans)) as progress_bar:
+        for subspan in analysis_subspans:
+            recspan = dataset[subspan.start[0]]
+            data = np.asarray(recspan.iloc[subspan.start[1]:subspan.stop[1], :])
+            rows += data.shape[0]
+            nnz = 0
+            for epoch in subspan.epochs:
+                nnz += epoch.design_row.shape[0] * data.shape[0]
+            design_data = np.empty(nnz, dtype=float)
+            design_i = np.empty(nnz, dtype=int)
+            design_j = np.empty(nnz, dtype=int)
+            write_ptr = 0
+            # This code would be more complicated if it couldn't rely on the
+            # following facts:
+            # - Every epoch in 'epochs' is guaranteed to span the entire chunk
+            #   of data, so we don't need to fiddle about finding start and
+            #   end positions, and every epoch generates the same number of
+            #   non-zero values.
+            # - In a coo_matrix, if you have two different entries at the same
+            #   (i, j) coordinate, then they get added together. This is the
+            #   correct thing to do in our case (though it should be very rare
+            #   -- in practice I guess it only happens if you have two events
+            #   of the same type that occur at exactly the same time).
+            for epoch in subspan.epochs:
+                for i, x_value in enumerate(epoch.design_row):
+                    write_slice = slice(write_ptr, write_ptr + data.shape[0])
+                    write_ptr += data.shape[0]
+                    design_data[write_slice] = x_value
+                    design_i[write_slice] = np.arange(data.shape[0])
+                    col_start = design_offsets[epoch.rerp]
+                    col_start += i * (epoch.stop_tick - epoch.start_tick)
+                    col_start += subspan.start[1] - epoch.start_tick
+                    design_j[write_slice] = np.arange(col_start,
+                                                      col_start + data.shape[0])
+            x_strip = sp.coo_matrix((design_data, (design_i, design_j)),
+                                    shape=(data.shape[0], full_design_width))
+            x_strip = x_strip.tocsc()
+            # This actually transmutes XtX and XtY into np.matrix
+            # objects. Weird and annoying, but not harmful.
+            XtX += x_strip.T * x_strip
+            XtY += x_strip.T * data
+            progress_bar.increment()
+    # Turn them back into ndarrays, to avoid any surprises later.
+    XtX = np.asarray(XtX)
+    XtY = np.asarray(XtY)
+    if rows < full_design_width:
+        raise ValueError("This analysis has more predictors than data "
+                         "points. I'm afraid this isn't going to work out.")
+    if np.linalg.cond(XtX) > 1e7:
+        raise ValueError("Your predictors appear to be perfectly "
+                         "collinear. I could make up an answer, but I'd "
+                         "rather not.")
+    all_betas = np.linalg.solve(XtX, XtY)
     # Extract each rerp's betas from the big beta matrix.
     for rerp in rerps:
         i = design_offsets[rerp]

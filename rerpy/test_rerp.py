@@ -11,7 +11,6 @@ from nose.tools import assert_raises
 
 from rerpy.rerp import rERPRequest
 from rerpy.test_data import mock_dataset
-import rerpy.parimap
 
 def test_multi_rerp():
     ds = mock_dataset(num_channels=2, hz=1000)
@@ -22,13 +21,10 @@ def test_multi_rerp():
     ds.add_event(0, 50, 51, {"type": "target"})
     ds.add_event(0, 51, 53, {"maybe_artifact": True})
 
-    for (regression_strategy, overlap_correction, parimap_mode) in product(
+    for (regression_strategy, overlap_correction) in product(
         ["auto", "by-epoch", "continuous"],
         [True, False],
-        ["multiprocess", "serial"]):
-
-        rerpy.parimap.configure(mode=parimap_mode)
-
+        ):
         assert ds.multi_rerp([],
                              regression_strategy=regression_strategy,
                              overlap_correction=overlap_correction) == []
@@ -231,12 +227,10 @@ def test_rerp_overlap():
     expected_B[:HALF_EPOCH, :] = epoch3[:HALF_EPOCH, :] - epoch1[HALF_EPOCH:, :]
     expected_B[HALF_EPOCH:, :] = epoch3[HALF_EPOCH:, :]
 
-    for (regression_strategy, overlap_correction, parimap_mode) in product(
+    for (regression_strategy, overlap_correction) in product(
         ["auto", "by-epoch", "continuous"],
         [True, False],
-        ["serial", "multiprocess"]):
-
-        rerpy.parimap.configure(mode=parimap_mode)
+        ):
         if overlap_correction and regression_strategy == "by-epoch":
             assert_raises(ValueError,
                           ds.rerp, "True", 0, EPOCH - 1, "0 + type",
@@ -281,7 +275,7 @@ def test_predict():
     ds.add_event(0, 30, 31, {"type": "target", "x": 3})
     ds.add_event(0, 40, 41, {"type": "target", "x": 4})
 
-    rerp = ds.rerp("has type", 0, 10, "type + x")
+    rerp = ds.rerp("has type", 0, 9, "type + x")
 
     for predictors in [{"type": ["standard"], "x": [5]},
                        {"type": "standard", "x": 5},
@@ -390,6 +384,61 @@ def test_diff_lengths():
         assert np.allclose(expected_a, a.betas)
         assert np.allclose(expected_b, b.betas)
 
-# XX TODO: no-epochs-available or no-data-available error reporting? what happens?
-# XX TODO: add continuous-batch versus continuous-streaming modes
-# XX TODO: make continuous-streaming do some amount of batching
+def test_not_enough_data():
+    ds = mock_dataset(hz=1000)
+    # Values chosen to avoid perfect collinearity, that's tested separately
+    ds.add_event(0, 10, 11, {"type": "a", "x1": 2, "x2": 3})
+    ds.add_event(0, 20, 21, {"type": "a", "x1": 3, "x2": 9})
+    ds.add_event(0, 12, 13, {"maybe_artifact": True})
+    ds.add_event(0, 22, 23, {"maybe_artifact": True})
+
+    for regression_strategy in ["by-epoch", "continuous"]:
+        # No events match
+        assert_raises(ValueError, ds.rerp, "type == 'b'", 0, 5, "1",
+                      regression_strategy=regression_strategy)
+        # No artifact-free data
+        assert_raises(ValueError, ds.rerp, "type == 'a'", 0, 5, "1",
+                      bad_event_query="type == 'a'",
+                      regression_strategy=regression_strategy)
+        # Some artifact-free data, but fewer data points than predictors
+        assert_raises(ValueError, ds.rerp, "type == 'a'", 0, 5, "x1 + x2",
+                      regression_strategy=regression_strategy)
+        if regression_strategy == "continuous":
+            # No artifact-free data at some latencies
+            assert_raises(ValueError,
+                          ds.rerp, "type == 'a'", 0, 5, "1",
+                          artifact_query="maybe_artifact")
+
+def test_perfect_collinearity():
+    ds = mock_dataset(hz=1000)
+    ds.add_event(0, 10, 11, {"x1": 1, "x2": 1, "type": "a"})
+    ds.add_event(0, 20, 21, {"x1": 2, "x2": 2, "type": "b"})
+
+    for regression_strategy in ["by-epoch", "continuous"]:
+        # two predictors that are identical
+        assert_raises(ValueError,
+                      ds.rerp, "has x1", 0, 5, "x1 + x2",
+                      regression_strategy=regression_strategy)
+        # two predictors that are *almost* identical
+        assert_raises(ValueError,
+                      ds.multi_rerp,
+                      # Call rERPRequest here to get correct evaluation
+                      # environment for formula.
+                      [rERPRequest("has x1", 0, 5,
+                                   "x1 + I(x2 + np.finfo(float).eps)")],
+                      regression_strategy=regression_strategy)
+        # missing data in some cell
+        assert_raises(ValueError,
+                      ds.rerp, "has x1", 0, 5, "type",
+                      bad_event_query="type == 'a'")
+        assert_raises(ValueError,
+                      ds.rerp, "has x1", 0, 5, "type",
+                      bad_event_query="type == 'b'")
+        assert_raises(ValueError,
+                      ds.rerp, "has x1", 0, 5, "0 + type",
+                      bad_event_query="type == 'a'")
+        assert_raises(ValueError,
+                      ds.rerp, "has x1", 0, 5, "0 + type",
+                      bad_event_query="type == 'b'")
+
+# XX TODO: make continuous do some amount of batching
