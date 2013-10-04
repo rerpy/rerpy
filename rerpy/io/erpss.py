@@ -557,8 +557,3 @@ def test_load_erpss():
                       load_erpss,
                       test_data_path("erpss/tiny-complete.crw"),
                       test_data_path("erpss/tiny-complete.%s.log" % (bad,)))
-
-    # test .transform and .copy
-    from rerpy.test_data import check_transforms
-    check_transforms(load_erpss(test_data_path("erpss/tiny-complete.crw"),
-                                test_data_path("erpss/tiny-complete.log")))

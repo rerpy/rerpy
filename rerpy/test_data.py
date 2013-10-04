@@ -147,7 +147,8 @@ def test_DataSet_events():
     assert list(p["a"] == 2) == [e2]
     assert dataset.events(p["a"] == 2) == [e2]
 
-def check_transforms(dataset):
+def test_transforms():
+    dataset = mock_dataset()
     saved_datas = []
     for data in dataset:
         saved_datas.append(np.array(data))
@@ -175,9 +176,6 @@ def check_transforms(dataset):
     tr_both = np.dot(tr2, tr1)
     for saved_data, data in zip(saved_datas, dataset):
         assert np.allclose(np.dot(saved_data, tr_both.T), data)
-
-def test_transforms():
-    check_transforms(mock_dataset())
 
 def test_DataSet_merge_df():
     def make_events():
