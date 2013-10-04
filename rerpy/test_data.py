@@ -147,8 +147,6 @@ def test_DataSet_events():
     assert list(p["a"] == 2) == [e2]
     assert dataset.events(p["a"] == 2) == [e2]
 
-# Use this to make sure your DataSource's .transform() and .copy() methods
-# work.
 def check_transforms(dataset):
     saved_datas = []
     for data in dataset:
@@ -161,6 +159,8 @@ def check_transforms(dataset):
         assert np.allclose(np.dot(saved_data, tr1.T), data)
 
     dataset_copy = DataSet(dataset.data_format)
+    dataset_copy.add_dataset(dataset)
+    assert len(saved_datas) == len(dataset_copy)
     for saved_data, copy_data in zip(saved_datas, dataset_copy):
         assert np.allclose(np.dot(saved_data, tr1.T), copy_data)
 
@@ -176,7 +176,7 @@ def check_transforms(dataset):
     for saved_data, data in zip(saved_datas, dataset):
         assert np.allclose(np.dot(saved_data, tr_both.T), data)
 
-def test_MemoryDataSource_transforms():
+def test_transforms():
     check_transforms(mock_dataset())
 
 def test_DataSet_merge_df():
