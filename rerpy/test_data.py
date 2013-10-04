@@ -268,3 +268,20 @@ def test_DataSet_merge_csv():
         assert dict(ev2) == {"code": 20, "ignore": False, "extra": "bar"}
         assert dict(ev3) == {"code": 10, "ignore": False, "extra": "foo"}
         assert dict(ev4) == {"code": 10, "ignore": True}
+
+def test_epochs():
+    ds = mock_dataset(hz=1000)
+    ds.add_event(0, 10, 11, {"a": True})
+    ds.add_event(0, 20, 21, {"a": False})
+    ds.add_event(1, 30, 31, {"a": True})
+
+    epochs = ds.epochs("a", -1.5, 3.5)
+    assert np.all(epochs.items == [0, 1])
+    assert np.all(epochs.major_axis == [-1, 0, 1, 2, 3])
+    assert np.all(epochs.minor_axis == ds.data_format.channel_names)
+    assert np.all(epochs[0] == np.asarray(ds[0].iloc[9:14, :]))
+    assert np.all(epochs[1] == np.asarray(ds[1].iloc[29:34, :]))
+
+    epochs2 = ds.epochs_ticks("a", -1, 4)
+    from pandas.util.testing import assert_panel_equal
+    assert_panel_equal(epochs, epochs2)

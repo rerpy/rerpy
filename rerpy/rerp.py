@@ -362,12 +362,8 @@ def _epoch_info_and_spans(dataset, rerp_requests, i):
     data_format = dataset.data_format
     # We interpret the time interval as a closed interval [start, stop],
     # just like pandas.
-    start_tick = data_format.ms_to_ticks(rerp_request.start_time,
-                                         round="up")
-    stop_tick = data_format.ms_to_ticks(rerp_request.stop_time,
-                                        round="down")
-    # Convert closed tick interval to half-open tick interval [start, stop)
-    stop_tick += 1
+    start_tick, stop_tick = data_format.ms_span_to_ticks(
+        rerp_request.start_time, rerp_request.stop_time)
     # This is actually still needed even though rERPRequest also checks for
     # something similar, because e.g. if we have a sampling rate of 250 Hz and
     # they request an epoch of [1 ms, 3 ms], then stop_time is > start_time,

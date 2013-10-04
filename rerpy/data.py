@@ -69,6 +69,13 @@ class DataFormat(object):
     def ticks_to_ms(self, ticks):
         return np.asarray(ticks) * 1000.0 / self.exact_sample_rate_hz
 
+    def ms_span_to_ticks(self, start_time, stop_time):
+        # Converts a closed [start, stop] time interval to a half-open [start,
+        # stop) tick interval
+        start_tick = self.ms_to_ticks(start_time, round="up")
+        stop_tick = self.ms_to_ticks(stop_time, round="down")
+        return (start_tick, stop_tick + 1)
+
     def compute_symbolic_transform(self, expression, exclude=[]):
         # This converts symbolic expressions like "-A1/2" into
         # matrices which perform that transformation. (Actually it is a bit of
@@ -123,6 +130,10 @@ def test_DataFormat():
     assert df.ms_to_ticks(1000, round="up") == 1024
     assert df.ms_to_ticks(1000.1, round="up") == 1025
     assert df.ms_to_ticks(1000.9, round="up") == 1025
+
+    assert df.ms_span_to_ticks(-1000, 1000) == (-1024, 1025)
+    assert df.ms_span_to_ticks(-999.99, 999.99) == (-1023, 1024)
+    assert df.ms_span_to_ticks(-1000.01, 1000.01) == (-1024, 1025)
 
     assert df == df
     assert not (df != df)
@@ -293,6 +304,28 @@ class DataSet(object):
     ################################################################
     # Convenience methods
     ################################################################
+
+    def epochs(self, event_query, start_time, stop_time):
+        start_tick, stop_tick = self.data_format.ms_span_to_ticks(
+            start_time, stop_time)
+        return self.epochs_ticks(event_query, start_tick, stop_tick)
+
+    def epochs_ticks(self, event_query, start_tick, stop_tick):
+        events = self.events(event_query)
+        result = np.empty((len(events),
+                           stop_tick - start_tick,
+                           self.data_format.num_channels))
+        for i, event in enumerate(events):
+            recspan = self[event.recspan_id]
+            result[i, :, :] = recspan.iloc[event.start_tick + start_tick
+                                           :event.start_tick + stop_tick,
+                                           :]
+        tick_array = np.arange(start_tick, stop_tick)
+        time_array = self.data_format.ticks_to_ms(tick_array)
+        return pandas.Panel(result,
+                            items=np.arange(len(events)),
+                            major_axis=time_array,
+                            minor_axis=self.data_format.channel_names)
 
     def add_dataset(self, dataset):
         # Metadata
