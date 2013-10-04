@@ -14,4 +14,5 @@ if "RERPY_WARNINGS_MODE" in os.environ:
 del os
 
 from rerpy.data import DataSet, DataFormat
+from rerpy.rerp import rERPRequest
 from rerpy.io.erpss import load_erpss
