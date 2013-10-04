@@ -412,7 +412,9 @@ def test_not_enough_data():
 def test_perfect_collinearity():
     ds = mock_dataset(hz=1000)
     ds.add_event(0, 10, 11, {"x1": 1, "x2": 1, "type": "a"})
-    ds.add_event(0, 20, 21, {"x1": 2, "x2": 2, "type": "b"})
+    ds.add_event(0, 20, 21, {"x1": 2, "x2": 2, "type": "a"})
+    ds.add_event(0, 30, 31, {"x1": 3, "x2": 3, "type": "b"})
+    ds.add_event(0, 40, 41, {"x1": 4, "x2": 4, "type": "b"})
 
     for regression_strategy in ["by-epoch", "continuous"]:
         # two predictors that are identical
