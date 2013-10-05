@@ -584,8 +584,8 @@ def test_load_erpss():
     assert len(dataset2.events("calibration_pulse")) == 4
 
     # check calibration
-    # idea: if calibration works, then the "calibration erp" will have the
-    # expected size
+    # idea: if calibration works, then the "calibration erp" will have been
+    # set to be the same size as whatever we told it to be.
     dataset_cal = load_erpss(test_data_path("erpss/tiny-complete.crw"),
                              test_data_path("erpss/tiny-complete.log"),
                              calibration_events="condition == 65",
@@ -596,7 +596,7 @@ def test_load_erpss():
                              calibrate_pulse_size=12.34,
                              calibrate_polarity=-1)
     assert dataset_cal.data_format.units == "uV"
-    # 4 ticks = 16 ms, +/-2 for the window = 8 to 24 ms
+    # -4 ticks = -16 ms, +/-2 for the window = -24 to -8 ms
     low_cal = dataset_cal.rerp("calibration_pulse", -24, -8, "1",
                                all_or_nothing=True,
                                overlap_correction=False)

@@ -26,7 +26,13 @@ two levels of metadata on sensors/channels:
     transformations should alter this stuff -- need some way to say
     that channels are changing when calling .transform I guess?
 
-maybe we can store
+maybe we can store channel metadata information in the channel index
+directly. pandas doesn't make this *very* easy -- no way to define a
+ChannelsIndex -- but we could make each entry in the Index be a custom
+ChannelInfo object that did __hash__ and __eq__ and __str__ like a
+string, but which also had a bunch of metadata attached. That way
+stuff like channel position would be automatically preserved as data
+moved through the system, and available for topographic plots.
 
 it would be nice to support fancy "nearby" type queries, like cdbl and
 Binlister[1]
