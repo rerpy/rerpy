@@ -396,8 +396,8 @@ def test_read_log():
 def load_erpss(raw, log, calibration_events="condition == 0",
                calibrate=False,
                calibrate_half_width_ticks=5,
-               calibrate_low_cursor_ticks=None,
-               calibrate_high_cursor_ticks=None,
+               calibrate_low_cursor_time=None,
+               calibrate_high_cursor_time=None,
                calibrate_pulse_size=None,
                calibrate_polarity=1):
     dtype = np.float64
@@ -478,21 +478,23 @@ def load_erpss(raw, log, calibration_events="condition == 0",
         cal_event["calibration_pulse"] = True
 
     if calibrate:
-        for kwarg in ["calibrate_low_cursor_ticks",
-                      "calibrate_high_cursor_ticks",
+        for kwarg in ["calibrate_low_cursor_time",
+                      "calibrate_high_cursor_time",
                       "calibrate_pulse_size"]:
             if locals()[kwarg] is None:
                 raise ValueError("when calibrating, %s= argument must be "
                                  "specified" % (kwarg,))
         half_width = dataset.data_format.ticks_to_ms(calibrate_half_width_ticks)
         cal_vals = {}
-        for which, cursor_ticks in [("low", calibrate_low_cursor_ticks),
-                                    ("high", calibrate_high_cursor_ticks)]:
+        for which, cursor_time in [("low", calibrate_low_cursor_time),
+                                   ("high", calibrate_high_cursor_time)]:
             sys.stdout.write("Computing %s calibration value\n" % (which,))
-            center = dataset.data_format.ticks_to_ms(cursor_ticks)
+            # Round cursor to nearest tick
+            cursor_tick = dataset.data_format.ms_to_ticks(cursor_time)
+            cursor_time = dataset.data_format.ticks_to_ms(cursor_tick)
             erp = dataset.rerp("calibration_pulse",
-                               center - half_width,
-                               center + half_width,
+                               cursor_time - half_width,
+                               cursor_time + half_width,
                                "1",
                                all_or_nothing=True,
                                overlap_correction=False)
@@ -591,16 +593,16 @@ def test_load_erpss():
                              calibration_events="condition == 65",
                              calibrate=True,
                              calibrate_half_width_ticks=2,
-                             calibrate_low_cursor_ticks=-4,
-                             calibrate_high_cursor_ticks=5,
+                             calibrate_low_cursor_time=-16,
+                             calibrate_high_cursor_time=21,
                              calibrate_pulse_size=12.34,
                              calibrate_polarity=-1)
     assert dataset_cal.data_format.units == "uV"
-    # -4 ticks = -16 ms, +/-2 for the window = -24 to -8 ms
+    # -16 ms +/-2 ticks = -24 to -8 ms
     low_cal = dataset_cal.rerp("calibration_pulse", -24, -8, "1",
                                all_or_nothing=True,
                                overlap_correction=False)
-    # 5 ticks = 20 ms, +/-2 for the window = 12 to 28 ms
+    # 21 ms rounds to 20 ms, +/-2 ticks for the window = 12 to 28 ms
     high_cal = dataset_cal.rerp("calibration_pulse", 12, 28, "1",
                                 all_or_nothing=True,
                                 overlap_correction=False)
