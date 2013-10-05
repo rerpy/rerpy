@@ -126,7 +126,12 @@ def _sql_value_to_value_type(sql_value, value_type):
 # BLOBs. (sqlite3.Binary is an alias for 'buffer'.) This function also
 # handles converting numpy scalars into equivalents that are acceptable to
 # sqlite.
+ok_types = set([int, bool, float])
 def _encode_sql_value(val):
+    # This is a non-trivial speedup for bulk inserts (e.g. creating thousands
+    # of events while loading a file):
+    if type(val) in ok_types:
+        return val
     if np.issubsctype(type(val), np.str_):
         return sqlite3.Binary(val)
     elif np.issubsctype(type(val), np.bool_):
@@ -183,6 +188,9 @@ class ObjType(object):
         self.name = name
         self.sys_table = sys_table
         self.event_join_field = event_join_field
+        # Optimization: which keys we've created tables for already (because
+        # asking the database is surprisingly expensive)
+        self.have_tables_for = set()
 
     def table_name(self, key):
         return self.name + "_attr_" + _munge_name(key)
@@ -218,6 +226,11 @@ class Events(object):
         self._analyze_threshold = 1
 
         self._objtypes = {}
+
+        # Allocating ids ourselves is better than letting sqlite do it,
+        # because it allows us to do bulk inserts via executemany(), which is
+        # must faster than calling execute() repeatedly.
+        self._next_id = 0
 
         c = self._connection.cursor()
         c.execute("PRAGMA case_sensitive_like = true;")
@@ -260,7 +273,7 @@ class Events(object):
         # situations under which this occurs, so to be safe, we just always
         # read out all db data immediately instead of letting true iterators
         # escape.
-        return list(c), c.lastrowid
+        return list(c)
 
     # WARNING: this should not be called inside a transaction, it might commit
     # it.
@@ -272,6 +285,10 @@ class Events(object):
 
     # WARNING: this will commit any ongoing transaction!
     def _ensure_table_for_key(self, objtype, key):
+        # Non-trivial optimization when doing bulk inserts (e.g. adding
+        # thousands of events when loading a file)
+        if key in objtype.have_tables_for:
+            return
         table = objtype.table_name(key)
         self._connection.execute("CREATE TABLE IF NOT EXISTS %s ("
                                  "obj_id INTEGER PRIMARY KEY, "
@@ -280,6 +297,7 @@ class Events(object):
                                  % (table, objtype.sys_table))
         self._connection.execute("CREATE INDEX IF NOT EXISTS %s_idx "
                                  "ON %s (value);" % (table, table))
+        objtype.have_tables_for.add(key)
 
     # WARNING: this neither commits nor creates the table if it doesn't exist,
     # it's your job to call _ensure_table_for_key and start a transaction
@@ -302,13 +320,17 @@ class Events(object):
             raise ValueError, "start_tick must be >= 0"
         interval_magnitude = approx_interval_magnitude(stop_tick - start_tick)
         self._interval_magnitudes.add(interval_magnitude)
+        event_id = self._next_id
+        self._next_id += 1
         with self._connection:
             try:
-                _, event_id = self._execute(
-                  "INSERT INTO sys_events "
-                  "  (recspan_id, start_tick, stop_tick, interval_magnitude) "
-                  "values (?, ?, ?, ?)",
-                  [recspan_id, start_tick, stop_tick, interval_magnitude])
+                self._execute(
+                    "INSERT INTO sys_events "
+                    "  (id, recspan_id, start_tick, stop_tick, "
+                    "   interval_magnitude) "
+                    "values (?, ?, ?, ?, ?)",
+                    [event_id, recspan_id, start_tick, stop_tick,
+                     interval_magnitude])
             except sqlite3.IntegrityError:
                 raise EventsError("undefined recspan")
             for key, value in attributes.iteritems():
@@ -342,7 +364,7 @@ class Events(object):
 
     def _obj_index_field(self, objtype, id, field):
         code = "SELECT %s FROM %s WHERE id = ?;" % (field, objtype.sys_table)
-        results, _ = self._execute(code, (id,))
+        results = self._execute(code, (id,))
         assert len(results) == 1
         return _decode_sql_value(results[0][0])
 
@@ -359,7 +381,7 @@ class Events(object):
         table = objtype.table_name(key)
         code = "SELECT value FROM %s WHERE obj_id = ?;" % (table,)
         try:
-            results, _ = self._execute(code, (id,))
+            results = self._execute(code, (id,))
         except sqlite3.OperationalError:
             # The table doesn't exist:
             raise KeyError, key
@@ -381,7 +403,7 @@ class Events(object):
 
     def _obj_exists(self, objtype, id):
         code = "SELECT COUNT(*) FROM %s WHERE id = ?" % (objtype.sys_table,)
-        results, _ = self._execute(code, (id,))
+        results = self._execute(code, (id,))
         return bool(results[0][0])
 
     def _move_event(self, id, offset):
@@ -444,12 +466,12 @@ class Events(object):
         if joins:
             code += " AND (%s)" % (" AND ".join(joins),)
         code += "ORDER BY sys_events.recspan_id, sys_events.start_tick"
-        return self._execute(code, sql_where.args)[0]
+        return self._execute(code, sql_where.args)
 
     # This is called directly by the test code, but is not really public.
     def _all_recspan_infos(self):
         for row in self._execute("SELECT id FROM sys_recspan_infos ORDER BY id",
-                                 ())[0]:
+                                 ()):
             yield RecspanInfo(self, _decode_sql_value(row[0]))
 
     def __repr__(self):
