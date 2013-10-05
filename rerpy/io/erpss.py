@@ -427,7 +427,12 @@ def load_erpss(raw, log, calibration_events="condition == 0",
     except IndexError as e:
         raise ValueError("log file claims event at position where there is "
                          "no data: %s" % (e,))
-    if np.any(expanded_log_codes != raw_codes):
+    # Sometimes people "delete" events by setting the high (sign) bit of the
+    # code in the log file (e.g. with 'logpoke'). So we ignore this bit when
+    # comparing log codes to raw codes -- mismatches here do not indicate an
+    # error -- and then are careful to use the log codes, rather than the
+    # raw codes, below.
+    if np.any((expanded_log_codes & ~0x8000) != (raw_codes & ~0x8000)):
         raise ValueError("raw and log files have mismatched codes")
     del raw_codes
     del expanded_log_codes
@@ -622,3 +627,7 @@ def test_load_erpss():
                       load_erpss,
                       test_data_path("erpss/tiny-complete.crw"),
                       test_data_path("erpss/tiny-complete.%s.log" % (bad,)))
+    # But if the only mismatch is an event that is "deleted" (sign bit set) in
+    # the log file, but not in the raw file, then that is okay:
+    load_erpss(test_data_path("erpss/tiny-complete.crw"),
+               test_data_path("erpss/tiny-complete.code-deleted.log"))
