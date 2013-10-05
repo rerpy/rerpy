@@ -1,6 +1,6 @@
 rERPy is a Python library for analyzing EEG data using both
 traditional averaging-based ERP estimation, and fancy new
-regression-based ERP estimation (known as "rERPs" to their
+regression-based ERP estimation (known as "rERP" to its
 friends). rERPs can do anything ERPs can do -- in fact, ERPs are
 special cases or rERPs -- but rERPs can also handle mixes of
 categorical and continuous manipulations (including non-linear effects

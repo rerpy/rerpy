@@ -3,15 +3,15 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-pyrERP - a toolkit for regression based ERP analysis
-====================================================
+rERPy - a toolkit for regression based ERP analysis
+===================================================
 
 Contents:
 
 .. toctree::
    :maxdepth: 2
 
-
+   overview.rst
 
 Indices and tables
 ==================
@@ -19,4 +19,3 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
-
