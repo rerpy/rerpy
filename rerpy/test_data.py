@@ -270,9 +270,10 @@ def test_DataSet_merge_csv():
         assert dict(ev4) == {"code": 10, "ignore": True}
 
 def test_epochs():
-    ds = mock_dataset(hz=1000)
+    ds = mock_dataset(hz=1000, ticks_per_recspan=100)
     ds.add_event(0, 10, 11, {"a": True})
     ds.add_event(0, 20, 21, {"a": False})
+    ds.add_event(0, 98, 99, {"a": False})
     ds.add_event(1, 30, 31, {"a": True})
 
     epochs = ds.epochs("a", -1.5, 3.5)
@@ -285,3 +286,11 @@ def test_epochs():
     epochs2 = ds.epochs_ticks("a", -1, 4)
     from pandas.util.testing import assert_panel_equal
     assert_panel_equal(epochs, epochs2)
+
+    ds.epochs("has a", -1, 1)
+    assert_raises(ValueError, ds.epochs, "has a", -1, 2)
+    epochs3 = ds.epochs("has a", -1, 2, incomplete_action="drop")
+    # it's epoch #2 that is incomplete
+    assert np.all(epochs3.items == [0, 1, 3])
+    assert_raises(ValueError, ds.epochs, "has a", -1, 2,
+                  incomplete_action="asdf")

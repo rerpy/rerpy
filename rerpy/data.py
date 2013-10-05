@@ -305,25 +305,43 @@ class DataSet(object):
     # Convenience methods
     ################################################################
 
-    def epochs(self, event_query, start_time, stop_time):
+    def epochs(self, event_query, start_time, stop_time,
+               incomplete_action="raise"):
         start_tick, stop_tick = self.data_format.ms_span_to_ticks(
             start_time, stop_time)
-        return self.epochs_ticks(event_query, start_tick, stop_tick)
+        return self.epochs_ticks(event_query, start_tick, stop_tick,
+                                 incomplete_action=incomplete_action)
 
-    def epochs_ticks(self, event_query, start_tick, stop_tick):
+    def epochs_ticks(self, event_query, start_tick, stop_tick,
+                     incomplete_action="raise"):
         events = self.events(event_query)
-        result = np.empty((len(events),
-                           stop_tick - start_tick,
-                           self.data_format.num_channels))
+        good_events = []
+        good_epochs = []
         for i, event in enumerate(events):
             recspan = self[event.recspan_id]
-            result[i, :, :] = recspan.iloc[event.start_tick + start_tick
-                                           :event.start_tick + stop_tick,
-                                           :]
+            s = slice(event.start_tick + start_tick,
+                      event.start_tick + stop_tick)
+            try:
+                data = recspan.iloc[s, :]
+            except IndexError:
+                if incomplete_action == "raise":
+                    raise ValueError("only part of epoch #%s was actually "
+                                     "recorded; if you want to discard "
+                                     "such epochs instead, use "
+                                     "incomplete_action=\"drop\""
+                                     % (i,))
+                elif incomplete_action == "drop":
+                    pass
+                else:
+                    raise ValueError("invalid incomplete_action= argument")
+            else:
+                good_epochs.append(np.asarray(data)[np.newaxis, ...])
+                good_events.append(i)
+        result = np.concatenate(good_epochs, axis=0)
         tick_array = np.arange(start_tick, stop_tick)
         time_array = self.data_format.ticks_to_ms(tick_array)
         return pandas.Panel(result,
-                            items=np.arange(len(events)),
+                            items=good_events,
                             major_axis=time_array,
                             minor_axis=self.data_format.channel_names)
 
