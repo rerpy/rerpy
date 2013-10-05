@@ -493,7 +493,6 @@ def load_erpss(raw, log, calibration_events="condition == 0",
         cal_vals = {}
         for which, cursor_time in [("low", calibrate_low_cursor_time),
                                    ("high", calibrate_high_cursor_time)]:
-            sys.stdout.write("Computing %s calibration value\n" % (which,))
             # Round cursor to nearest tick
             cursor_tick = dataset.data_format.ms_to_ticks(cursor_time)
             cursor_time = dataset.data_format.ticks_to_ms(cursor_tick)
@@ -502,7 +501,8 @@ def load_erpss(raw, log, calibration_events="condition == 0",
                                cursor_time + half_width,
                                "1",
                                all_or_nothing=True,
-                               overlap_correction=False)
+                               overlap_correction=False,
+                               verbose=False)
             cal_vals[which] = erp.betas["Intercept"].mean()
         cal_diffs = cal_vals["high"] - cal_vals["low"]
         calibrate_pulse_size *= calibrate_polarity

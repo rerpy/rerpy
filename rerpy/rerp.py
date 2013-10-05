@@ -6,6 +6,7 @@ import itertools
 from collections import namedtuple
 import inspect
 import sys
+import os
 
 import numpy as np
 import scipy.sparse as sp
@@ -74,13 +75,19 @@ def test_rERPRequest():
 def multi_rerp_impl(dataset, rerp_requests,
                     artifact_query, artifact_type_field,
                     overlap_correction,
-                    regression_strategy):
+                    regression_strategy,
+                    verbose):
     if not rerp_requests:
         return []
     _check_unique_names(rerp_requests)
 
+    if verbose:
+        log_stream = sys.stdout
+    else:
+        log_stream = open(os.devnull, "w")
+
     ## Find all the requested epochs and artifacts
-    sys.stdout.write("Locating epochs and artifacts\n")
+    log_stream.write("Locating epochs and artifacts\n")
     spans = []
     # And allocate the rERP objects that we will eventually return.
     rerps = []
@@ -108,20 +115,21 @@ def multi_rerp_impl(dataset, rerp_requests,
                                            rerps[0].global_stats)
     for rerp in rerps:
         rerp._set_fit_info(regression_strategy, overlap_correction)
-    sys.stdout.write("Fitting model to %s ticks with strategy %r\n"
+    log_stream.write("Fitting model to %s ticks with strategy %r\n"
                      % (rerps[0].global_stats.ticks.accepted,
                         regression_strategy))
     # _fit_* functions fill in .betas field on rerps.
     if regression_strategy == "by-epoch":
         _fit_by_epoch(dataset, analysis_subspans, rerps)
     elif regression_strategy == "continuous":
-        all_betas = _fit_continuous(dataset, analysis_subspans, rerps)
+        all_betas = _fit_continuous(dataset, analysis_subspans, rerps,
+                                    log_stream)
     else: # pragma: no cover
         assert False
 
     for rerp in rerps:
         assert rerp._is_complete()
-    sys.stdout.write("Done.\n")
+    log_stream.write("Done.\n")
     return rerps
 
 ################################################################
@@ -1284,7 +1292,7 @@ def _fit_by_epoch(dataset, analysis_subspans, rerps):
 
 ################################################################
 
-def _fit_continuous(dataset, analysis_subspans, rerps):
+def _fit_continuous(dataset, analysis_subspans, rerps, log_stream):
     # Work out the size of the full design matrices, and the offset of each
     # rerp's individual design matrix within this overall design matrix.
     full_design_width = 0
@@ -1302,7 +1310,7 @@ def _fit_continuous(dataset, analysis_subspans, rerps):
     XtX = np.zeros((full_design_width, full_design_width))
     XtY = np.zeros((full_design_width, dataset.data_format.num_channels))
     rows = 0
-    with ProgressBar(len(analysis_subspans)) as progress_bar:
+    with ProgressBar(len(analysis_subspans), stream=log_stream) as progress_bar:
         for subspan in analysis_subspans:
             recspan = dataset[subspan.start[0]]
             data = np.asarray(recspan.iloc[subspan.start[1]:subspan.stop[1], :])

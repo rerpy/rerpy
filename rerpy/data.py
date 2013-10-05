@@ -259,7 +259,8 @@ class DataSet(object):
              artifact_query="has _ARTIFACT_TYPE",
              artifact_type_field="_ARTIFACT_TYPE",
              overlap_correction=True,
-             regression_strategy="auto"):
+             regression_strategy="auto",
+             verbose=True):
         eval_env = EvalEnvironment.capture(eval_env, reference=1)
         request = rERPRequest(event_query, start_time, stop_time, formula,
                               name=name, eval_env=eval_env,
@@ -269,7 +270,8 @@ class DataSet(object):
                                 artifact_query=artifact_query,
                                 artifact_type_field=artifact_type_field,
                                 overlap_correction=overlap_correction,
-                                regression_strategy=regression_strategy)
+                                regression_strategy=regression_strategy,
+                                verbose=verbose)
         assert len(rerps) == 1
         return rerps[0]
 
@@ -294,12 +296,14 @@ class DataSet(object):
                    artifact_query="has _ARTIFACT_TYPE",
                    artifact_type_field="_ARTIFACT_TYPE",
                    overlap_correction=True,
-                   regression_strategy="auto"):
+                   regression_strategy="auto",
+                   verbose=True):
         return multi_rerp_impl(self, rerp_requests,
                                artifact_query=artifact_query,
                                artifact_type_field=artifact_type_field,
                                overlap_correction=overlap_correction,
-                               regression_strategy=regression_strategy)
+                               regression_strategy=regression_strategy,
+                               verbose=verbose)
 
     ################################################################
     # Convenience methods
