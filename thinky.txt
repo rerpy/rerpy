@@ -26,6 +26,7 @@ two levels of metadata on sensors/channels:
     transformations should alter this stuff -- need some way to say
     that channels are changing when calling .transform I guess?
 
+maybe we can store
 
 it would be nice to support fancy "nearby" type queries, like cdbl and
 Binlister[1]

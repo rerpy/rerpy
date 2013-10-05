@@ -8,6 +8,7 @@ import os
 import string
 from collections import OrderedDict
 import bisect
+import sys
 
 import numpy as np
 import pandas
@@ -392,7 +393,13 @@ def test_read_log():
 # lots of data sets together). The way to do it for crw files is just to read
 # through the file without decompressing to find where each block is located
 # on disk, and then we can do random access after we know that.
-def load_erpss(raw, log, calibration_events="condition == 0"):
+def load_erpss(raw, log, calibration_events="condition == 0",
+               calibrate=False,
+               calibrate_half_width_ticks=5,
+               calibrate_low_cursor_ticks=None,
+               calibrate_high_cursor_ticks=None,
+               calibrate_pulse_size=None,
+               calibrate_polarity=1):
     dtype = np.float64
 
     metadata = {}
@@ -407,7 +414,11 @@ def load_erpss(raw, log, calibration_events="condition == 0"):
 
     (hz, channel_names, raw_codes, data, header_metadata) = read_raw(raw, dtype)
     metadata.update(header_metadata)
-    data_format = DataFormat(hz, "RAW", channel_names)
+    if calibrate:
+        units = "uV"
+    else:
+        units = "RAW"
+    data_format = DataFormat(hz, units, channel_names)
 
     raw_log_events = read_log(log)
     expanded_log_codes = np.zeros(raw_codes.shape, dtype=int)
@@ -465,6 +476,33 @@ def load_erpss(raw, log, calibration_events="condition == 0"):
         for key in list(cal_event):
             del cal_event[key]
         cal_event["calibration_pulse"] = True
+
+    if calibrate:
+        for kwarg in ["calibrate_low_cursor_ticks",
+                      "calibrate_high_cursor_ticks",
+                      "calibrate_pulse_size"]:
+            if locals()[kwarg] is None:
+                raise ValueError("when calibrating, %s= argument must be "
+                                 "specified" % (kwarg,))
+        half_width = dataset.data_format.ticks_to_ms(calibrate_half_width_ticks)
+        cal_vals = {}
+        for which, cursor_ticks in [("low", calibrate_low_cursor_ticks),
+                                    ("high", calibrate_high_cursor_ticks)]:
+            sys.stdout.write("Computing %s calibration value\n" % (which,))
+            center = dataset.data_format.ticks_to_ms(cursor_ticks)
+            erp = dataset.rerp("calibration_pulse",
+                               center - half_width,
+                               center + half_width,
+                               "1",
+                               all_or_nothing=True,
+                               overlap_correction=False)
+            cal_vals[which] = erp.betas["Intercept"].mean()
+        cal_diffs = cal_vals["high"] - cal_vals["low"]
+        calibrate_pulse_size *= calibrate_polarity
+        # For each channel, we want to multiply by a factor with units uV/raw
+        # We have calibrate_pulse_size uV = cal_diffs raw
+        cal_scaler = calibrate_pulse_size / cal_diffs
+        dataset.transform(np.diagflat(cal_scaler))
 
     return dataset
 
@@ -544,6 +582,31 @@ def test_load_erpss():
     assert len(dataset2.events("condition == 65")) == 0
     assert len(dataset2.events("condition == 0")) == 2
     assert len(dataset2.events("calibration_pulse")) == 4
+
+    # check calibration
+    # idea: if calibration works, then the "calibration erp" will have the
+    # expected size
+    dataset_cal = load_erpss(test_data_path("erpss/tiny-complete.crw"),
+                             test_data_path("erpss/tiny-complete.log"),
+                             calibration_events="condition == 65",
+                             calibrate=True,
+                             calibrate_half_width_ticks=2,
+                             calibrate_low_cursor_ticks=-4,
+                             calibrate_high_cursor_ticks=5,
+                             calibrate_pulse_size=12.34,
+                             calibrate_polarity=-1)
+    assert dataset_cal.data_format.units == "uV"
+    # 4 ticks = 16 ms, +/-2 for the window = 8 to 24 ms
+    low_cal = dataset_cal.rerp("calibration_pulse", -24, -8, "1",
+                               all_or_nothing=True,
+                               overlap_correction=False)
+    # 5 ticks = 20 ms, +/-2 for the window = 12 to 28 ms
+    high_cal = dataset_cal.rerp("calibration_pulse", 12, 28, "1",
+                                all_or_nothing=True,
+                                overlap_correction=False)
+    low = low_cal.betas["Intercept"].mean(axis=0)
+    high = high_cal.betas["Intercept"].mean(axis=0)
+    assert np.allclose(high - low, -1 * 12.34)
 
     # check that we can load from file handles (not sure if anyone cares but
     # hey you never know...)
