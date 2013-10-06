@@ -96,10 +96,10 @@ def _read_header(stream):
     header = np.fromstring(header_str, dtype=_header_dtype)[0]
     if header["magic"] == 0x17a5:
         # Raw file magic number:
-        reader = _read_raw_chunk
+        fetcher = RawChunkFetcher(stream, header["nchans"])
     elif header["magic"] == 0x97a5:
         # Compressed file magic number:
-        reader = _read_compressed_chunk
+        fetcher = CrwChunkFetcher(stream, header["nchans"])
     else: # pragma: no cover
         assert False, "Unrecognized file type"
     hz = 1 / (header["10usec_per_tick"] / 100000.0)
@@ -118,7 +118,7 @@ def _read_header(stream):
     # And save the raw header in case anyone wants it later (you never know)
     info["erpss_raw_header"] = header_str
 
-    return (reader, header["nchans"], hz, channel_names, info, header)
+    return (fetcher, header["nchans"], hz, channel_names, info, header)
 
 def _channel_names_from_header(header):
     if header["nchans"] <= 16:
@@ -206,8 +206,8 @@ def test_channel_names_roundtrip():
         assert_raises(ValueError,
                       _channel_names_to_header, ["a" * 5] * i, header)
 
-def read_raw(stream, dtype):
-    (reader, nchans, hz, channel_names, info, header) = _read_header(stream)
+def read_raw(stream, dtype, load_data):
+    (fetcher, nchans, hz, channel_names, info, header) = _read_header(stream)
     # Data is stored in a series of "chunks" -- each chunk contains 256 s16
     # samples from each channel (the 32/64/whatever analog channels, plus 1
     # channel for codes -- that channel being first.).  The code channel
@@ -217,61 +217,136 @@ def read_raw(stream, dtype):
     code_chunks = []
     data_chunks = []
     while True:
-        read = reader(stream, nchans)
+        read = fetcher.read_next_chunk(load_data)
         if read is None:
             break
         (code_chunk, data_chunk) = read
         assert len(code_chunk) == 256
-        assert data_chunk.shape == (256 * nchans,)
         assert code_chunk[0] == chunkno
         code_chunk[0] = 0
-        code_chunk = np.asarray(code_chunk, dtype=np.uint16)
-        data_chunk.resize((256, nchans))
-        data_chunk = np.asarray(data_chunk, dtype=dtype)
         code_chunks.append(code_chunk)
-        data_chunks.append(data_chunk)
+        if load_data:
+            assert data_chunk.shape == (256 * nchans,)
+            data_chunk.resize((256, nchans))
+            data_chunk = np.asarray(data_chunk, dtype=dtype)
+            data_chunks.append(data_chunk)
         chunkno += 1
-    return (hz, channel_names,
-            np.concatenate(code_chunks),
-            np.row_stack(data_chunks),
-            info)
+    codes = np.concatenate(code_chunks)
+    if load_data:
+        data = np.row_stack(data_chunks)
+    else:
+        data = None
+    return (fetcher, hz, channel_names, codes, data, info)
 
-def _read_raw_chunk(stream, nchans):
-    chunk_bytes = (nchans + 1) * 512
-    buf = stream.read(chunk_bytes)
-    # Check for EOF:
-    if not buf:
-        return None
-    codes_list = list(struct.unpack("<256H", buf[:512]))
-    data_chunk = np.fromstring(buf[512:], dtype="<i2")
-    return (codes_list, data_chunk)
+# These two classes have slightly weird invariants. They have one of two life
+# cycles:
+# Option 1:
+# - __init__
+# - read_next_chunk(True) called repeatedly to load all codes and data
+# Option 2:
+# - __init__
+# - read_next_chunk(False) called repeatedly to load all codes
+# - get_chunk(chunk_number) called repeatedly to load random pieces of data
+# read_next_chunk has the invariants that at entry, the stream will always be
+# pointing to the beginning of the wanted chunk, and then on exit, the stream
+# will always be pointing to beginning of the next chunk.
+class RawChunkFetcher(object):
+    def __init__(self, stream, nchans):
+        self._stream = stream
+        self._nchans = nchans
+        self._chunk_size_bytes = (nchans + 1) * 256 * 2
 
-def _read_compressed_chunk(stream, nchans):
-    # Check for EOF:
-    ncode_records_minus_one_buf = stream.read(1)
-    if not ncode_records_minus_one_buf:
-        return None
-    # Code track (run length encoded):
-    (ncode_records_minus_one,) = struct.unpack("<B",
-                                               ncode_records_minus_one_buf)
-    ncode_records = ncode_records_minus_one + 1
-    code_records = []
-    for i in xrange(ncode_records):
-        code_records.append(struct.unpack("<BH", stream.read(3)))
-    codes_list = []
-    for (repeat_minus_one, code) in code_records:
-        codes_list += [code] * (repeat_minus_one + 1)
-    assert len(codes_list) == 256
-    # Data bytes (delta encoded and packed into variable-length integers):
-    (ncompressed_words,) = struct.unpack("<H", stream.read(2))
-    compressed_data = stream.read(ncompressed_words * 2)
-    data_chunk = _decompress_crw_chunk(compressed_data, ncompressed_words,
-                                       nchans)
-    return (codes_list, data_chunk)
+    def read_next_chunk(self, return_data):
+        buf = self._stream.read(self._chunk_size_bytes)
+        # Check for EOF:
+        if not buf:
+            return None
+        codes = np.fromstring(buf[:512], dtype=np.uint16)
+        if return_data:
+            data_chunk = np.fromstring(buf[512:], dtype="<i2")
+        else:
+            data_chunk = None
+        return codes, data_chunk
+
+    def get_chunk(self, chunk_number):
+        offset = 512 + chunk * self._chunk_size_bytes
+        self._stream.seek(offset)
+        chunk_bytes = self._stream.read(self._chunk_size_bytes)
+        data = np.fromstring(buf[512:], dtype="<i2")
+        return data
+
+class CrwChunkFetcher(object):
+    def __init__(self, stream, nchans):
+        self._stream = stream
+        self._nchans = nchans
+        self._offsets = []
+
+    def read_next_chunk(self, return_data):
+        # Check for EOF:
+        ncode_records_minus_one_buf = self._stream.read(1)
+        if not ncode_records_minus_one_buf:
+            return None
+        # Code track (run length encoded):
+        (ncode_records_minus_one,) = struct.unpack("<B",
+                                                   ncode_records_minus_one_buf)
+        ncode_records = ncode_records_minus_one + 1
+        codes = np.empty(256, np.uint16)
+        cursor = 0
+        for i in xrange(ncode_records):
+            repeat_minus_one, code = struct.unpack("<BH", self._stream.read(3))
+            codes[cursor:cursor + repeat_minus_one + 1] = code
+            cursor += repeat_minus_one + 1
+        assert cursor == 256
+        # Data bytes (delta encoded and packed into variable-length integers):
+        # Record where these start so we can find it again in get_chunk().
+        self._offsets.append(self._stream.tell())
+        (ncompressed_words,) = struct.unpack("<H", self._stream.read(2))
+        compressed_data = self._stream.read(ncompressed_words * 2)
+        if return_data:
+            # This is the slow part of loading data:
+            data_chunk = _decompress_crw_chunk(compressed_data,
+                                               ncompressed_words,
+                                               self._nchans)
+        else:
+            data_chunk = None
+        return codes, data_chunk
+
+    def get_chunk(self, chunk_number):
+        self._stream.seek(self._offsets(chunk_number))
+        (ncompressed_words,) = struct.unpack("<H", stream.read(2))
+        return _decompress_crw_chunk(self._stream.read(ncompressed_words * 2),
+                                     ncompressed_words,
+                                     self._nchans)
+
+class DemandLoader(object):
+    def __init__(self, chunk_fetcher, dtype, nchans):
+        self._chunk_fetcher = chunk_fetcher
+        self._dtype = dtype
+        self._nchans = nchans
+
+    def get_slice(start_tick, stop_tick):
+        assert stop_tick <= self.ticks
+        output = np.empty((stop_tick - start_tick, self._nchans),
+                          dtype=self._dtype)
+        cursor = 0
+        chunk_number = start_tick // 256
+        while True:
+            tick = chunk_number * 256
+            if tick >= stop_tick:
+                break
+            _, data = self._get_chunk(chunk_number)
+            data.resize((256, self._nchans))
+            low = max(tick, start_tick)
+            high = min(tick + 256, stop_tick)
+            next_cursor = cursor + (high - low)
+            output[cursor:next_cursor, :] = data[low:high]
+            cursor = next_cursor
+            chunk_number += 1
+        return output
 
 def assert_files_match(p1, p2):
-    (hz1, channames1, codes1, data1, info1) = read_raw(open(p1), "u2")
-    (hz2, channames2, codes2, data2, info2) = read_raw(open(p2), "u2")
+    (_, hz1, channames1, codes1, data1, info1) = read_raw(open(p1), "u2", True)
+    (_, hz2, channames2, codes2, data2, info2) = read_raw(open(p2), "u2", True)
     assert hz1 == hz2
     assert (channames1 == channames2).all()
     assert (codes1 == codes2).all()
@@ -296,7 +371,7 @@ def test_read_raw_on_test_data():
 def test_64bit_channel_names():
     from rerpy.test import test_data_path
     stream = open(test_data_path("erpss/two-chunks-64chan.raw"))
-    (hz, channel_names, codes, data, info) = read_raw(stream, int)
+    (_, hz, channel_names, codes, data, info) = read_raw(stream, int, False)
     # "Correct" channel names as listed by headinfo(1):
     assert (channel_names ==
             ["LOPf", "ROPf", "LMPf", "RMPf", "LTPf", "RTPf", "LLPf", "RLPf",
@@ -337,7 +412,7 @@ def read_log(file_like):
 # bother. (Though could, I guess.)
 def make_log(raw, condition=64): # pragma: no cover
     import warnings; warnings.warn("This code is not tested!")
-    codes = read_raw(maybe_open(raw), np.float64)[2]
+    codes = read_raw(maybe_open(raw), np.float64)[3]
     log = []
     for i in codes.nonzero()[0]:
         log.append(struct.pack("<HHHBB",
@@ -412,7 +487,8 @@ def load_erpss(raw, log, calibration_events="condition == 0",
     raw = maybe_open(raw)
     log = maybe_open(log)
 
-    (hz, channel_names, raw_codes, data, header_metadata) = read_raw(raw, dtype)
+    (fetcher, hz, channel_names, raw_codes, data, header_metadata
+     ) = read_raw(raw, dtype, True)
     metadata.update(header_metadata)
     if calibrate:
         units = "uV"
