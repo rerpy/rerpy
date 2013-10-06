@@ -495,7 +495,7 @@ def test_read_log():
     t(data, expected)
 
 def load_erpss(raw, log, calibration_events="condition == 0",
-               preload=True,
+               preload=False,
                calibrate=False,
                calibrate_half_width_ticks=5,
                calibrate_low_cursor_time=None,
