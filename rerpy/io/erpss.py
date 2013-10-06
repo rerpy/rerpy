@@ -261,7 +261,7 @@ class RawChunkFetcher(object):
         # Check for EOF:
         if not buf:
             return None
-        codes = np.fromstring(buf[:512], dtype=np.uint16)
+        codes = np.fromstring(buf[:512], dtype="<u2")
         if return_data:
             data_chunk = np.fromstring(buf[512:], dtype="<i2")
         else:
@@ -269,10 +269,10 @@ class RawChunkFetcher(object):
         return codes, data_chunk
 
     def get_chunk(self, chunk_number):
-        offset = 512 + chunk * self._chunk_size_bytes
+        offset = 512 + chunk_number * self._chunk_size_bytes
         self._stream.seek(offset)
         chunk_bytes = self._stream.read(self._chunk_size_bytes)
-        data = np.fromstring(buf[512:], dtype="<i2")
+        data = np.fromstring(chunk_bytes[512:], dtype="<i2")
         return data
 
 class CrwChunkFetcher(object):
@@ -318,13 +318,21 @@ class CrwChunkFetcher(object):
                                      ncompressed_words,
                                      self._nchans)
 
-class DemandLoader(object):
-    def __init__(self, chunk_fetcher, dtype, nchans):
-        self._chunk_fetcher = chunk_fetcher
+# XX FIXME: should perhaps wrap an LRU around this at some point.
+class LazyRecspan(object):
+    def __init__(self, fetcher, dtype, nchans,
+                 recspan_start, recspan_stop):
+        self._fetcher = fetcher
         self._dtype = dtype
         self._nchans = nchans
+        self._recspan_start = recspan_start
+        self._recspan_stop = recspan_stop
 
-    def get_slice(self, start_tick, stop_tick):
+    def get_slice(self, local_start_tick, local_stop_tick):
+        start_tick = self._recspan_start + local_start_tick
+        stop_tick = self._recspan_start + local_stop_tick
+        if stop_tick > self._recspan_stop:
+            raise IndexError("attempt to index beyond end of recspan")
         output = np.empty((stop_tick - start_tick, self._nchans),
                           dtype=self._dtype)
         cursor = 0
@@ -333,7 +341,7 @@ class DemandLoader(object):
             tick = chunk_number * 256
             if tick >= stop_tick:
                 break
-            data = self._chunk_fetcher.get_chunk(chunk_number)
+            data = self._fetcher.get_chunk(chunk_number)
             data.resize((256, self._nchans))
             low = max(tick, start_tick)
             high = min(tick + 256, stop_tick)
@@ -343,18 +351,36 @@ class DemandLoader(object):
             chunk_number += 1
         return output
 
+def test_LazyRecspan():
+    from nose.tools import assert_raises
+    from rerpy.test import test_data_path
+    for suffix in ["crw", "raw"]:
+        (fetcher, hz, channames, codes, data, info) = read_raw(
+            open(test_data_path("erpss/tiny-complete.%s" % (suffix,)), "rb"),
+            "u2", True)
+        # This fake recspan is chosen to cover part of the first and last
+        # chunks, plus the entire middle chunk. It's exactly 512 samples long.
+        lr = LazyRecspan(fetcher, "u2", len(channames), 128, 640)
+        assert_raises(IndexError, lr.get_slice, 0, 513)
+        for (start, stop) in [(0, 512), (10, 20), (256, 266), (500, 510),
+                              (120, 130)]:
+            assert np.all(lr.get_slice(start, stop)
+                          == data[128 + start:128 + stop])
+
 def assert_files_match(p1, p2):
-    (_, hz1, channames1, codes1, data1, info1) = read_raw(open(p1), "u2", True)
+    (_, hz1, channames1, codes1, data1, info1) = read_raw(open(p1, "rb"), "u2", True)
     for (p, load_data) in [(p1, False), (p2, True), (p2, False)]:
         (fetcher2, hz2, channames2, codes2, data2, info2
-         ) = read_raw(open(p), "u2", load_data)
+         ) = read_raw(open(p, "rb"), "u2", load_data)
     assert hz1 == hz2
     assert (channames1 == channames2).all()
     assert (codes1 == codes2).all()
     if not load_data:
         assert data2 is None
-        loader = DemandLoader(fetcher2, "u2", len(channames2))
-        data2 = loader.get_slice(0, len(codes2))
+        # Slight abuse, pretend that there's one recspan that has the whole
+        # file
+        loader2 = LazyRecspan(fetcher2, "u2", len(channames2), 0, len(codes2))
+        data2 = loader2.get_slice(0, len(codes2))
     assert (data1 == data2).all()
     for k in set(info1.keys() + info2.keys()):
         if k != "erpss_raw_header":
@@ -375,7 +401,7 @@ def test_read_raw_on_test_data():
 
 def test_64bit_channel_names():
     from rerpy.test import test_data_path
-    stream = open(test_data_path("erpss/two-chunks-64chan.raw"))
+    stream = open(test_data_path("erpss/two-chunks-64chan.raw"), "rb")
     (_, hz, channel_names, codes, data, info) = read_raw(stream, int, False)
     # "Correct" channel names as listed by headinfo(1):
     assert (channel_names ==
@@ -468,12 +494,8 @@ def test_read_log():
         )
     t(data, expected)
 
-# XX someday should fix this so that it has the option to delay reading the
-# actual data until needed (to avoid the giant memory overhead of loading in
-# lots of data sets together). The way to do it for crw files is just to read
-# through the file without decompressing to find where each block is located
-# on disk, and then we can do random access after we know that.
 def load_erpss(raw, log, calibration_events="condition == 0",
+               preload=True,
                calibrate=False,
                calibrate_half_width_ticks=5,
                calibrate_low_cursor_time=None,
@@ -493,13 +515,15 @@ def load_erpss(raw, log, calibration_events="condition == 0",
     log = maybe_open(log)
 
     (fetcher, hz, channel_names, raw_codes, data, header_metadata
-     ) = read_raw(raw, dtype, True)
+     ) = read_raw(raw, dtype, preload)
     metadata.update(header_metadata)
     if calibrate:
         units = "uV"
     else:
         units = "RAW"
     data_format = DataFormat(hz, units, channel_names)
+
+    total_ticks = raw_codes.shape[0]
 
     raw_log_events = read_log(log)
     expanded_log_codes = np.zeros(raw_codes.shape, dtype=int)
@@ -533,14 +557,20 @@ def load_erpss(raw, log, calibration_events="condition == 0",
     break_ticks += 1
     span_edges = np.concatenate(([0], break_ticks))
     assert span_edges[0] == 0
-    assert span_edges[-1] == data.shape[0]
+    assert span_edges[-1] == total_ticks
 
     span_slices = [slice(span_edges[i], span_edges[i + 1])
                    for i in xrange(len(span_edges) - 1)]
 
     dataset = Dataset(data_format)
     for span_slice in span_slices:
-        dataset.add_recspan(data[span_slice, :], metadata)
+        if preload:
+            dataset.add_recspan(data[span_slice, :], metadata)
+        else:
+            lr = LazyRecspan(fetcher, dtype, len(channel_names),
+                             span_slice.start, span_slice.stop)
+            dataset.add_lazy_recspan(lr, span_slice.stop - span_slice.start,
+                                     metadata)
 
     span_starts = [s.start for s in span_slices]
     recspan_ids = []
@@ -612,105 +642,124 @@ def test_load_erpss():
     #   are supposed to be reserved for special stuff and deleted events, but
     #   it happens the file I was using as a basis violated this rule. Oh
     #   well.
-    dataset = load_erpss(test_data_path("erpss/tiny-complete.crw"),
-                          test_data_path("erpss/tiny-complete.log"))
-    assert len(dataset) == 2
-    assert dataset[0].shape == (512, 32)
-    assert dataset[1].shape == (256, 32)
-
-    assert dataset.data_format.exact_sample_rate_hz == 250
-    assert dataset.data_format.units == "RAW"
-    assert list(dataset.data_format.channel_names) == [
-        "lle", "lhz", "MiPf", "LLPf", "RLPf", "LMPf", "RMPf", "LDFr", "RDFr",
-        "LLFr", "RLFr", "LMFr", "RMFr", "LMCe", "RMCe", "MiCe", "MiPa", "LDCe",
-        "RDCe", "LDPa", "RDPa", "LMOc", "RMOc", "LLTe", "RLTe", "LLOc", "RLOc",
-        "MiOc", "A2", "HEOG", "rle", "rhz",
-        ]
-
-    for recspan_info in dataset.recspan_infos:
-        assert recspan_info["raw_file"].endswith("tiny-complete.crw")
-        assert recspan_info["log_file"].endswith("tiny-complete.log")
-        assert recspan_info["experiment"] == "brown-1"
-        assert recspan_info["subject"] == "Subject p3 2008-08-20"
-        assert recspan_info["odelay"] == 8
-        assert len(recspan_info["erpss_raw_header"]) == 512
-
-    assert dataset.recspan_infos[0].ticks == 512
-    assert dataset.recspan_infos[1].ticks == 256
-    assert dataset.recspan_infos[1]["deleted"]
-
-    assert len(dataset.events()) == 14
-    # 2 are calibration events
-    assert len(dataset.events("has code")) == 12
-    for ev in dataset.events("has code"):
-        assert ev["condition"] in (64, 65)
-        assert ev["flag"] == 0
-        assert not ev["flag_data_error"]
-        assert not ev["flag_polinv"]
-        assert not ev["flag_rejected"]
-    for ev in dataset.events("calibration_pulse"):
-        assert dict(ev) == {"calibration_pulse": True}
-    def check_ticks(query, recspan_ids, start_ticks):
-        events = dataset.events(query)
-        assert len(events) == len(recspan_ids) == len(start_ticks)
-        for ev, recspan_id, start_tick in zip(events, recspan_ids, start_ticks):
-            assert ev.recspan_id == recspan_id
-            assert ev.start_tick == start_tick
-            assert ev.stop_tick == start_tick + 1
-
-    check_ticks("condition == 64",
-                [0] * 8, [21, 221, 304, 329, 379, 458, 483, 511])
-    check_ticks("condition == 65",
-                [1] * 4,
-                [533 - 512, 733 - 512, 762 - 512, 767 - 512])
-    check_ticks("calibration_pulse", [0, 0], [250, 408])
-
-    # check calibration_events option
-    dataset2 = load_erpss(test_data_path("erpss/tiny-complete.crw"),
-                          test_data_path("erpss/tiny-complete.log"),
-                          calibration_events="condition == 65")
-    assert len(dataset2.events("condition == 65")) == 0
-    assert len(dataset2.events("condition == 0")) == 2
-    assert len(dataset2.events("calibration_pulse")) == 4
-
-    # check calibration
-    # idea: if calibration works, then the "calibration erp" will have been
-    # set to be the same size as whatever we told it to be.
-    dataset_cal = load_erpss(test_data_path("erpss/tiny-complete.crw"),
+    for preload in [True, False]:
+        dataset = load_erpss(test_data_path("erpss/tiny-complete.crw"),
                              test_data_path("erpss/tiny-complete.log"),
-                             calibration_events="condition == 65",
-                             calibrate=True,
-                             calibrate_half_width_ticks=2,
-                             calibrate_low_cursor_time=-16,
-                             calibrate_high_cursor_time=21,
-                             calibrate_pulse_size=12.34,
-                             calibrate_polarity=-1)
-    assert dataset_cal.data_format.units == "uV"
-    # -16 ms +/-2 ticks = -24 to -8 ms
-    low_cal = dataset_cal.rerp("calibration_pulse", -24, -8, "1",
-                               all_or_nothing=True,
-                               overlap_correction=False)
-    # 21 ms rounds to 20 ms, +/-2 ticks for the window = 12 to 28 ms
-    high_cal = dataset_cal.rerp("calibration_pulse", 12, 28, "1",
-                                all_or_nothing=True,
-                                overlap_correction=False)
-    low = low_cal.betas["Intercept"].mean(axis=0)
-    high = high_cal.betas["Intercept"].mean(axis=0)
-    assert np.allclose(high - low, -1 * 12.34)
+                             preload=preload)
+        assert len(dataset) == 2
+        assert dataset[0].shape == (512, 32)
+        assert dataset[1].shape == (256, 32)
 
-    # check that we can load from file handles (not sure if anyone cares but
-    # hey you never know...)
-    assert len(load_erpss(open(test_data_path("erpss/tiny-complete.crw")),
-                          open(test_data_path("erpss/tiny-complete.log")))) == 2
+        assert dataset.data_format.exact_sample_rate_hz == 250
+        assert dataset.data_format.units == "RAW"
+        assert list(dataset.data_format.channel_names) == [
+            "lle", "lhz", "MiPf", "LLPf", "RLPf", "LMPf", "RMPf", "LDFr", "RDFr",
+            "LLFr", "RLFr", "LMFr", "RMFr", "LMCe", "RMCe", "MiCe", "MiPa", "LDCe",
+            "RDCe", "LDPa", "RDPa", "LMOc", "RMOc", "LLTe", "RLTe", "LLOc", "RLOc",
+            "MiOc", "A2", "HEOG", "rle", "rhz",
+            ]
 
-    # check that code/raw mismatch is detected
-    from nose.tools import assert_raises
-    for bad in ["bad-code", "bad-tick", "bad-tick2"]:
-        assert_raises(ValueError,
-                      load_erpss,
-                      test_data_path("erpss/tiny-complete.crw"),
-                      test_data_path("erpss/tiny-complete.%s.log" % (bad,)))
-    # But if the only mismatch is an event that is "deleted" (sign bit set) in
-    # the log file, but not in the raw file, then that is okay:
-    load_erpss(test_data_path("erpss/tiny-complete.crw"),
-               test_data_path("erpss/tiny-complete.code-deleted.log"))
+        for recspan_info in dataset.recspan_infos:
+            assert recspan_info["raw_file"].endswith("tiny-complete.crw")
+            assert recspan_info["log_file"].endswith("tiny-complete.log")
+            assert recspan_info["experiment"] == "brown-1"
+            assert recspan_info["subject"] == "Subject p3 2008-08-20"
+            assert recspan_info["odelay"] == 8
+            assert len(recspan_info["erpss_raw_header"]) == 512
+
+        assert dataset.recspan_infos[0].ticks == 512
+        assert dataset.recspan_infos[1].ticks == 256
+        assert dataset.recspan_infos[1]["deleted"]
+
+        assert len(dataset.events()) == 14
+        # 2 are calibration events
+        assert len(dataset.events("has code")) == 12
+        for ev in dataset.events("has code"):
+            assert ev["condition"] in (64, 65)
+            assert ev["flag"] == 0
+            assert not ev["flag_data_error"]
+            assert not ev["flag_polinv"]
+            assert not ev["flag_rejected"]
+        for ev in dataset.events("calibration_pulse"):
+            assert dict(ev) == {"calibration_pulse": True}
+        def check_ticks(query, recspan_ids, start_ticks):
+            events = dataset.events(query)
+            assert len(events) == len(recspan_ids) == len(start_ticks)
+            for ev, recspan_id, start_tick in zip(events, recspan_ids, start_ticks):
+                assert ev.recspan_id == recspan_id
+                assert ev.start_tick == start_tick
+                assert ev.stop_tick == start_tick + 1
+
+        check_ticks("condition == 64",
+                    [0] * 8, [21, 221, 304, 329, 379, 458, 483, 511])
+        check_ticks("condition == 65",
+                    [1] * 4,
+                    [533 - 512, 733 - 512, 762 - 512, 767 - 512])
+        check_ticks("calibration_pulse", [0, 0], [250, 408])
+
+        # check calibration_events option
+        dataset2 = load_erpss(test_data_path("erpss/tiny-complete.crw"),
+                              test_data_path("erpss/tiny-complete.log"),
+                              preload=preload,
+                              calibration_events="condition == 65")
+        assert len(dataset2.events("condition == 65")) == 0
+        assert len(dataset2.events("condition == 0")) == 2
+        assert len(dataset2.events("calibration_pulse")) == 4
+
+        # check calibration
+        # idea: if calibration works, then the "calibration erp" will have been
+        # set to be the same size as whatever we told it to be.
+        dataset_cal = load_erpss(test_data_path("erpss/tiny-complete.crw"),
+                                 test_data_path("erpss/tiny-complete.log"),
+                                 preload=preload,
+                                 calibration_events="condition == 65",
+                                 calibrate=True,
+                                 calibrate_half_width_ticks=2,
+                                 calibrate_low_cursor_time=-16,
+                                 calibrate_high_cursor_time=21,
+                                 calibrate_pulse_size=12.34,
+                                 calibrate_polarity=-1)
+        assert dataset_cal.data_format.units == "uV"
+        # -16 ms +/-2 ticks = -24 to -8 ms
+        low_cal = dataset_cal.rerp("calibration_pulse", -24, -8, "1",
+                                   all_or_nothing=True,
+                                   overlap_correction=False)
+        # 21 ms rounds to 20 ms, +/-2 ticks for the window = 12 to 28 ms
+        high_cal = dataset_cal.rerp("calibration_pulse", 12, 28, "1",
+                                    all_or_nothing=True,
+                                    overlap_correction=False)
+        low = low_cal.betas["Intercept"].mean(axis=0)
+        high = high_cal.betas["Intercept"].mean(axis=0)
+        assert np.allclose(high - low, -1 * 12.34)
+
+        # check that we can load from file handles (not sure if anyone cares but
+        # hey you never know...)
+        crw = open(test_data_path("erpss/tiny-complete.crw"), "rb")
+        log = open(test_data_path("erpss/tiny-complete.log"), "rb")
+        assert len(load_erpss(crw, log, preload=preload)) == 2
+
+        # check that code/raw mismatch is detected
+        from nose.tools import assert_raises
+        for bad in ["bad-code", "bad-tick", "bad-tick2"]:
+            assert_raises(ValueError,
+                          load_erpss,
+                          test_data_path("erpss/tiny-complete.crw"),
+                          test_data_path("erpss/tiny-complete.%s.log" % (bad,)),
+                          preload=preload)
+        # But if the only mismatch is an event that is "deleted" (sign bit
+        # set) in the log file, but not in the raw file, then that is okay:
+        load_erpss(test_data_path("erpss/tiny-complete.crw"),
+                   test_data_path("erpss/tiny-complete.code-deleted.log"),
+                   preload=preload)
+
+    # Compare preload to no-preload directly
+    pre = load_erpss(test_data_path("erpss/tiny-complete.crw"),
+                     test_data_path("erpss/tiny-complete.log"),
+                     preload=True)
+    lazy = load_erpss(test_data_path("erpss/tiny-complete.crw"),
+                      test_data_path("erpss/tiny-complete.log"),
+                      preload=False)
+    from pandas.util.testing import assert_frame_equal
+    assert len(pre) == len(lazy)
+    for pre_recspan, lazy_recspan in zip(pre, lazy):
+        assert_frame_equal(pre_recspan, lazy_recspan)

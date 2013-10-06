@@ -1238,10 +1238,9 @@ def _fit_by_epoch(dataset, analysis_subspans, rerps):
     Xs_Ys_by_rerp = {rerp: ([], []) for rerp in rerps}
     for epoch in epochs:
         this_X = epoch.design_row
-        recspan = dataset[epoch.recspan_id]
-        y_data = recspan.iloc[epoch.start_tick:epoch.stop_tick, :]
-        ticks = epoch.stop_tick - epoch.start_tick
-        this_Y = np.asarray(y_data).reshape((1, ticks * channels))
+        y_data = dataset.raw_slice(epoch.recspan_id,
+                                   epoch.start_tick, epoch.stop_tick)
+        this_Y = y_data.reshape((1, -1))
         Xs, Ys = Xs_Ys_by_rerp[epoch.rerp]
         Xs.append(this_X)
         Ys.append(this_Y)
@@ -1312,8 +1311,8 @@ def _fit_continuous(dataset, analysis_subspans, rerps, log_stream):
     rows = 0
     with ProgressBar(len(analysis_subspans), stream=log_stream) as progress_bar:
         for subspan in analysis_subspans:
-            recspan = dataset[subspan.start[0]]
-            data = np.asarray(recspan.iloc[subspan.start[1]:subspan.stop[1], :])
+            data = dataset.raw_slice(subspan.start[0],
+                                     subspan.start[1], subspan.stop[1])
             rows += data.shape[0]
             nnz = 0
             for epoch in subspan.epochs:

@@ -131,6 +131,8 @@ def test_DataFormat():
     assert df.ms_to_ticks(1000.1, round="up") == 1025
     assert df.ms_to_ticks(1000.9, round="up") == 1025
 
+    assert_raises(ValueError, df.ms_to_ticks, 1000, round="sideways")
+
     assert df.ms_span_to_ticks(-1000, 1000) == (-1024, 1025)
     assert df.ms_span_to_ticks(-999.99, 999.99) == (-1023, 1024)
     assert df.ms_span_to_ticks(-1000.01, 1000.01) == (-1024, 1025)
@@ -146,7 +148,6 @@ def test_DataFormat():
                             [0,  0.5, 0],
                             [0,    0, 1]])
 
-    from nose.tools import assert_raises
     assert_raises(ValueError, df.compute_symbolic_transform, "A2/2, A2/3")
     assert_raises(ValueError, df.compute_symbolic_transform, "A2/2 + 1")
 
@@ -155,6 +156,8 @@ class Dataset(object):
         self.data_format = data_format
         self._events = rerpy.events.Events()
         self._recspans = []
+        self._lazy_recspans = []
+        self._lazy_transforms = []
         self.recspan_infos = []
 
     def transform(self, matrix, exclude=[]):
@@ -166,11 +169,34 @@ class Dataset(object):
                 raise ValueError("exclude= can only be specified if matrix= "
                                  "is a symbolic expression")
         matrix = np.asarray(matrix)
-        for i, recspan in enumerate(self._recspans):
-            new_data = np.dot(recspan, matrix.T)
-            self._recspans[i] = pandas.DataFrame(new_data,
-                                                 columns=recspan.columns,
-                                                 index=recspan.index)
+        for i in xrange(len(self._recspans)):
+            if self._recspans[i] is not None:
+                recspan = self._recspans[i]
+                new_data = np.dot(recspan, matrix.T)
+                self._recspans[i] = pandas.DataFrame(new_data,
+                                                     columns=recspan.columns,
+                                                     index=recspan.index)
+            else:
+                old_transform = self._lazy_transforms[i]
+                if old_transform is None:
+                    old_transform = np.eye(self.data_format.num_channels)
+                self._lazy_transforms[i] = np.dot(matrix, old_transform)
+
+    def _add_recspan_info(self, ticks, metadata):
+        recspan_id = len(self.recspan_infos)
+        recspan_info = self._events.add_recspan_info(recspan_id,
+                                                     ticks,
+                                                     metadata)
+        self.recspan_infos.append(recspan_info)
+
+    def _decorate_recspan(self, data):
+        ticks = data.shape[0]
+        index = np.arange(ticks, dtype=float)
+        index *= self.data_format.approx_sample_period_ms
+        df = pandas.DataFrame(data,
+                              columns=self.data_format.channel_names,
+                              index=index)
+        return df
 
     def add_recspan(self, data, metadata):
         data = np.asarray(data, dtype=np.float64)
@@ -179,20 +205,56 @@ class Dataset(object):
                              "shape (ticks, %s)"
                              % (self.data_format.num_channels,))
         ticks = data.shape[0]
-        recspan_id = len(self._recspans)
-        recspan_info = self._events.add_recspan_info(recspan_id,
-                                                     ticks,
-                                                     metadata)
-        self.recspan_infos.append(recspan_info)
-        index = np.arange(ticks) * float(self.data_format.approx_sample_period_ms)
-        df = pandas.DataFrame(data,
-                              columns=self.data_format.channel_names,
-                              index=index)
-        self._recspans.append(df)
+        self._add_recspan_info(ticks, metadata)
+        self._recspans.append(self._decorate_recspan(data))
+        self._lazy_recspans.append(None)
+        self._lazy_transforms.append(None)
+
+    def add_lazy_recspan(self, loader, ticks, metadata):
+        self._add_recspan_info(ticks, metadata)
+        self._recspans.append(None)
+        self._lazy_recspans.append(loader)
+        self._lazy_transforms.append(None)
+
+    def add_dataset(self, dataset):
+        # Metadata
+        if self.data_format != dataset.data_format:
+            raise ValueError("data format mismatch")
+        # Recspans
+        our_recspan_id_base = len(self._recspans)
+        for recspan_info in dataset.recspan_infos:
+            self._add_recspan_info(recspan_info.ticks, dict(recspan_info))
+        self._recspans += dataset._recspans
+        self._lazy_recspans += dataset._lazy_recspans
+        self._lazy_transforms += dataset._lazy_transforms
+        # Events
+        for their_event in dataset.events_query():
+            self.add_event(their_event.recspan_id + our_recspan_id_base,
+                           their_event.start_tick,
+                           their_event.stop_tick,
+                           dict(their_event))
 
     # We act like a sequence of recspan data objects
     def __len__(self):
         return len(self._recspans)
+
+    def raw_slice(self, recspan_id, start_tick, stop_tick):
+        if start_tick < 0 or stop_tick < 0:
+            raise IndexError("only positive indexes allowed")
+        ticks = stop_tick - start_tick
+        recspan = self._recspans[recspan_id]
+        if recspan is not None:
+            result = np.asarray(recspan.iloc[start_tick:stop_tick, :])
+        else:
+            lr = self._lazy_recspans[recspan_id]
+            lazy_data = lr.get_slice(start_tick, stop_tick)
+            transform = self._lazy_transforms[recspan_id]
+            if transform is not None:
+                lazy_data = np.dot(lazy_data, transform.T)
+            result = lazy_data
+        if result.shape[0] != ticks:
+            raise IndexError("slice spans missing data")
+        return result
 
     def __getitem__(self, key):
         if not isinstance(key, int) and hasattr(key, "__index__"):
@@ -201,7 +263,12 @@ class Dataset(object):
             raise TypeError("Dataset indexing allows only a single integer "
                             "(no slicing or other fanciness!)")
         # May raise IndexError, which is what we want:
-        return self._recspans[key]
+        recspan = self._recspans[key]
+        if recspan is None:
+            ticks = self.recspan_infos[key].ticks
+            raw = self.raw_slice(key, 0, ticks)
+            recspan = self._decorate_recspan(raw)
+        return recspan
 
     def __iter__(self):
         for i in xrange(len(self)):
@@ -356,21 +423,6 @@ class Dataset(object):
                             items=good_events,
                             major_axis=time_array,
                             minor_axis=self.data_format.channel_names)
-
-    def add_dataset(self, dataset):
-        # Metadata
-        if self.data_format != dataset.data_format:
-            raise ValueError("data format mismatch")
-        # Recspans
-        our_recspan_id_base = len(self._recspans)
-        for recspan, recspan_info in zip(dataset, dataset.recspan_infos):
-            self.add_recspan(recspan, dict(recspan_info))
-        # Events
-        for their_event in dataset.events_query():
-            self.add_event(their_event.recspan_id + our_recspan_id_base,
-                           their_event.start_tick,
-                           their_event.stop_tick,
-                           dict(their_event))
 
     def merge_df(self, df, on, restrict=None):
         # 'on' is like {df_colname: event_key}

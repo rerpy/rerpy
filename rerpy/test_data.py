@@ -8,15 +8,27 @@ from nose.tools import assert_raises
 
 from rerpy.data import Dataset, DataFormat
 
+class FakeLazyRecspan(object):
+    def __init__(self, data):
+        self._data = data
+
+    def get_slice(self, start, stop):
+        return self._data[start:stop, :]
+
 def mock_dataset(num_channels=4, num_recspans=4, ticks_per_recspan=100,
-                 hz=250):
+                 hz=250, lazy="mixed"):
+    assert lazy in ["all", "mixed", "none"]
     data_format = DataFormat(hz, "uV",
                              ["MOCK%s" % (i,) for i in xrange(num_channels)])
     dataset = Dataset(data_format)
     r = np.random.RandomState(0)
     for i in xrange(num_recspans):
         data = r.normal(size=(ticks_per_recspan, num_channels))
-        dataset.add_recspan(data, {})
+        if lazy == "all" or (lazy == "mixed" and i % 2 == 0):
+            lr = FakeLazyRecspan(data)
+            dataset.add_lazy_recspan(lr, ticks_per_recspan, {})
+        else:
+            dataset.add_recspan(data, {})
     return dataset
 
 def test_Dataset():
@@ -29,8 +41,10 @@ def test_Dataset():
     assert list(dataset) == []
 
     dataset.add_recspan(np.ones((10, 2)) * 0, {"a": 0})
-    dataset.add_recspan(np.ones((20, 2)) * 1, {"a": 1})
-    dataset.add_recspan(np.ones((30, 2)) * 0, {"a": 2})
+    dataset.add_lazy_recspan(FakeLazyRecspan(np.ones((20, 2)) * 1),
+                             20, {"a": 1})
+    dataset.add_lazy_recspan(FakeLazyRecspan(np.ones((30, 2)) * 0),
+                             30, {"a": 2})
     dataset.add_recspan(np.ones((40, 2)) * 1, {"a": 3})
 
     assert len(dataset) == 4
@@ -55,6 +69,17 @@ def test_Dataset():
             local_recspan_id = recspan_id % 2
             expected_values = local_recspan_id
         assert np.allclose(recspan, expected_values)
+        assert np.allclose(ds.raw_slice(recspan_id, 0, recspan.shape[0]),
+                           recspan)
+        assert_raises(IndexError,
+                      ds.raw_slice, recspan_id, -1, 10)
+        assert_raises(IndexError,
+                      ds.raw_slice, recspan_id, 10, -1)
+        assert ds.raw_slice(recspan_id, 2, 2).shape == (0, 2)
+        assert np.all(ds.raw_slice(recspan_id, 2, 5)
+                      == recspan.iloc[2:5, :])
+        assert_raises(IndexError,
+                      ds.raw_slice, recspan_id, 0, 200)
 
         assert ds.recspan_infos[recspan_id]["a"] == recspan_id
         assert ds.recspan_infos[recspan_id].ticks == expected_ticks
@@ -103,6 +128,9 @@ def test_Dataset():
     from pandas.util.testing import assert_frame_equal
     for i in xrange(4):
         assert_frame_equal(recspans[i], dataset[i])
+
+    # Smoke test
+    repr(dataset)
 
 def test_Dataset_add_recspan():
     dataset = mock_dataset(num_channels=2, num_recspans=4)
