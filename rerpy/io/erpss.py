@@ -312,8 +312,8 @@ class CrwChunkFetcher(object):
         return codes, data_chunk
 
     def get_chunk(self, chunk_number):
-        self._stream.seek(self._offsets(chunk_number))
-        (ncompressed_words,) = struct.unpack("<H", stream.read(2))
+        self._stream.seek(self._offsets[chunk_number])
+        (ncompressed_words,) = struct.unpack("<H", self._stream.read(2))
         return _decompress_crw_chunk(self._stream.read(ncompressed_words * 2),
                                      ncompressed_words,
                                      self._nchans)
@@ -324,8 +324,7 @@ class DemandLoader(object):
         self._dtype = dtype
         self._nchans = nchans
 
-    def get_slice(start_tick, stop_tick):
-        assert stop_tick <= self.ticks
+    def get_slice(self, start_tick, stop_tick):
         output = np.empty((stop_tick - start_tick, self._nchans),
                           dtype=self._dtype)
         cursor = 0
@@ -334,22 +333,28 @@ class DemandLoader(object):
             tick = chunk_number * 256
             if tick >= stop_tick:
                 break
-            _, data = self._get_chunk(chunk_number)
+            data = self._chunk_fetcher.get_chunk(chunk_number)
             data.resize((256, self._nchans))
             low = max(tick, start_tick)
             high = min(tick + 256, stop_tick)
             next_cursor = cursor + (high - low)
-            output[cursor:next_cursor, :] = data[low:high]
+            output[cursor:next_cursor, :] = data[low - tick:high - tick]
             cursor = next_cursor
             chunk_number += 1
         return output
 
 def assert_files_match(p1, p2):
     (_, hz1, channames1, codes1, data1, info1) = read_raw(open(p1), "u2", True)
-    (_, hz2, channames2, codes2, data2, info2) = read_raw(open(p2), "u2", True)
+    for (p, load_data) in [(p1, False), (p2, True), (p2, False)]:
+        (fetcher2, hz2, channames2, codes2, data2, info2
+         ) = read_raw(open(p), "u2", load_data)
     assert hz1 == hz2
     assert (channames1 == channames2).all()
     assert (codes1 == codes2).all()
+    if not load_data:
+        assert data2 is None
+        loader = DemandLoader(fetcher2, "u2", len(channames2))
+        data2 = loader.get_slice(0, len(codes2))
     assert (data1 == data2).all()
     for k in set(info1.keys() + info2.keys()):
         if k != "erpss_raw_header":
