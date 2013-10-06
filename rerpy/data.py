@@ -424,6 +424,8 @@ class Dataset(object):
                             major_axis=time_array,
                             minor_axis=self.data_format.channel_names)
 
+    # This could possibly be made substantially faster by loading the df into
+    # the database as a temporary table and then letting sqlite do the joins.
     def merge_df(self, df, on, restrict=None):
         # 'on' is like {df_colname: event_key}
         # or just [colname]
