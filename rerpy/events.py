@@ -99,7 +99,7 @@ _BLOB = "text"
 _BOOL = "bool"
 
 def _value_type(value):
-    # must come first, because issubclass(bool, int)
+    # must come before numeric, because issubclass(bool, int)
     if isinstance(value, (bool, np.bool_)):
         return _BOOL
     elif isinstance(value, (int, long, float, np.number)):
@@ -143,6 +143,25 @@ def _encode_sql_value(val):
     else:
         return val
 
+def _encode_seq_to_sql_values(seq):
+    dtype = pandas.Series(seq).dtype
+    if np.issubdtype(dtype, np.bool_):
+        type_ = bool
+    elif np.issubdtype(dtype, np.integer):
+        type_ = int
+    elif np.issubdtype(dtype, np.floating):
+        type_ = float
+    else:
+        # Series store strings as 'object' dtype, and that's the only valid
+        # thing that gets stored using an object dtype.
+        type_ = sqlite3.Binary
+    def convert(value):
+        if value is None:
+            return None
+        else:
+            return type_(value)
+    return [convert(value) for value in seq]
+
 # And reverse the transformation on the way out.
 def _decode_sql_value(val):
     if isinstance(val, sqlite3.Binary):
@@ -183,14 +202,13 @@ class ObjType(object):
     def __init__(self, name, sys_table, event_join_field):
         # Maps key names to value types (NUMERIC, BLOB, BOOL), or None if we
         # have yet to see any values for the given key and so don't know what
-        # type it should have.
+        # type it should have. Used not just for type checking, but also to
+        # know which tables we've inserted values into (needed for iterating
+        # over all keys, etc.).
         self.key_types = {}
         self.name = name
         self.sys_table = sys_table
         self.event_join_field = event_join_field
-        # Optimization: which keys we've created tables for already (because
-        # asking the database is surprisingly expensive)
-        self.have_tables_for = set()
 
     def table_name(self, key):
         return self.name + "_attr_" + _munge_name(key)
@@ -210,7 +228,7 @@ class ObjType(object):
             if wanted_type != value_type:
                 err = ("Invalid value %r for key %s: wanted %s"
                        % (value, key, wanted_type))
-                raise ValueError, err
+                raise TypeError(err)
 
 class Events(object):
     def __init__(self):
@@ -277,17 +295,17 @@ class Events(object):
 
     # WARNING: this should not be called inside a transaction, it might commit
     # it.
-    def _incr_op_count(self):
-        self._op_count += 1
+    def _incr_op_count(self, count=1):
+        self._op_count += count
         if self._op_count >= self._analyze_threshold:
             self._connection.execute("ANALYZE;")
-        self._analyze_threshold *= 2
+        self._analyze_threshold = 2 * self._op_count
 
     # WARNING: this will commit any ongoing transaction!
     def _ensure_table_for_key(self, objtype, key):
         # Non-trivial optimization when doing bulk inserts (e.g. adding
         # thousands of events when loading a file)
-        if key in objtype.have_tables_for:
+        if key in objtype.key_types:
             return
         table = objtype.table_name(key)
         self._connection.execute("CREATE TABLE IF NOT EXISTS %s ("
@@ -297,7 +315,6 @@ class Events(object):
                                  % (table, objtype.sys_table))
         self._connection.execute("CREATE INDEX IF NOT EXISTS %s_idx "
                                  "ON %s (value);" % (table, table))
-        objtype.have_tables_for.add(key)
 
     # WARNING: this neither commits nor creates the table if it doesn't exist,
     # it's your job to call _ensure_table_for_key and start a transaction
@@ -309,33 +326,70 @@ class Events(object):
                       "VALUES (?, ?);"
                       % (table,), (id, value))
 
-    def add_event(self, recspan_id, start_tick, stop_tick, attributes):
+    def add_events(self, recspan_ids, start_ticks, stop_ticks,
+                   attributes):
+        """Add a set of events in bulk.
+
+        This method is substantially faster than repeated calls to
+        add_event(), but it requires that all the events have the same types
+        of attribute (though the actual attribute values may differ).
+
+        Example::
+
+          add_events([0, 1], [10, 10], [11, 11], {"x": [1, 2], "y": [3, 4]})
+
+        :arg recspan_ids: An iterable of recspan ids, one per event.
+        :arg start_ticks: An iterable of start sticks, one per event.
+        :arg stop_ticks: An iterable of stop sticks, one per event.
+        :arg attributes: A dict-like object who values are each an iterable of
+          attribute values, one per event. (In particular, a pandas DataFrame
+          will work well here.)
+        """
         objtype = self._objtypes["event"]
+        event_ids = range(self._next_id, self._next_id + len(recspan_ids))
+        self._next_id += len(recspan_ids)
+        interval_magnitudes = []
+        for start_tick, stop_tick in zip(start_ticks, stop_ticks):
+            if not start_tick < stop_tick:
+                raise ValueError("start_tick must be < stop_tick")
+            if not start_tick >= 0:
+                raise ValueError("start_tick must be >= 0")
+            interval_magnitude = approx_interval_magnitude(stop_tick - start_tick)
+            interval_magnitudes.append(interval_magnitude)
+        self._interval_magnitudes.update(interval_magnitudes)
+        # Make sure everything is an int (skips _encode_sql_value)
+        recspan_ids = [int(recspan_id) for recspan_id in recspan_ids]
+        start_ticks = [int(tick) for tick in start_ticks]
+        stop_ticks = [int(tick) for tick in stop_ticks]
         # Create tables up front before entering transaction:
         for key in attributes:
             self._ensure_table_for_key(objtype, key)
-        if not start_tick < stop_tick:
-            raise ValueError, "start_tick must be < stop_tick"
-        if not start_tick >= 0:
-            raise ValueError, "start_tick must be >= 0"
-        interval_magnitude = approx_interval_magnitude(stop_tick - start_tick)
-        self._interval_magnitudes.add(interval_magnitude)
-        event_id = self._next_id
-        self._next_id += 1
         with self._connection:
             try:
-                self._execute(
+                self._connection.executemany(
                     "INSERT INTO sys_events "
                     "  (id, recspan_id, start_tick, stop_tick, "
                     "   interval_magnitude) "
                     "values (?, ?, ?, ?, ?)",
-                    [event_id, recspan_id, start_tick, stop_tick,
-                     interval_magnitude])
+                    zip(event_ids, recspan_ids, start_ticks, stop_ticks,
+                        interval_magnitudes))
             except sqlite3.IntegrityError:
                 raise EventsError("undefined recspan")
-            for key, value in attributes.iteritems():
-                self._obj_setitem_core(objtype, event_id, key, value)
-        self._incr_op_count()
+            for column in attributes:
+                sql_values = _encode_seq_to_sql_values(attributes[column])
+                table = objtype.table_name(column)
+                for value in attributes[column]:
+                    objtype.observe_value_for_key(column, value)
+                self._connection.executemany(
+                    "INSERT INTO %s (obj_id, value) VALUES (?, ?)" % (table,),
+                    zip(event_ids, sql_values))
+        self._incr_op_count(len(recspan_ids))
+
+    def add_event(self, recspan_id, start_tick, stop_tick, attributes):
+        objtype = self._objtypes["event"]
+        event_id = self._next_id
+        self.add_events([recspan_id], [start_tick], [stop_tick],
+                        {key: [val] for (key, val) in attributes.iteritems()})
         return Event(self, event_id)
 
     def add_recspan_info(self, recspan_id, ticks, attributes):

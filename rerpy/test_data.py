@@ -6,22 +6,22 @@ import numpy as np
 import pandas
 from nose.tools import assert_raises
 
-from rerpy.data import DataSet, DataFormat
+from rerpy.data import Dataset, DataFormat
 
 def mock_dataset(num_channels=4, num_recspans=4, ticks_per_recspan=100,
                  hz=250):
     data_format = DataFormat(hz, "uV",
                              ["MOCK%s" % (i,) for i in xrange(num_channels)])
-    dataset = DataSet(data_format)
+    dataset = Dataset(data_format)
     r = np.random.RandomState(0)
     for i in xrange(num_recspans):
         data = r.normal(size=(ticks_per_recspan, num_channels))
         dataset.add_recspan(data, {})
     return dataset
 
-def test_DataSet():
+def test_Dataset():
     data_format = DataFormat(250, "uV", ["MOCK1", "MOCK2"])
-    dataset = DataSet(data_format)
+    dataset = Dataset(data_format)
 
     assert len(dataset) == 0
     assert_raises(IndexError, dataset.__getitem__, 0)
@@ -63,10 +63,10 @@ def test_DataSet():
         t(dataset, i)
 
     # DataFormat mismatch
-    diff_dataset = DataSet(DataFormat(500, "uV", ["MOCK1", "MOCK2"]))
+    diff_dataset = Dataset(DataFormat(500, "uV", ["MOCK1", "MOCK2"]))
     assert_raises(ValueError, diff_dataset.add_dataset, dataset)
 
-    dataset_copy = DataSet(data_format)
+    dataset_copy = Dataset(data_format)
     dataset_copy.add_dataset(dataset)
     assert len(dataset_copy) == 4
     for i in xrange(4):
@@ -90,7 +90,7 @@ def test_DataSet():
         t(dataset, i, expected_values=[[2 * (i % 2),
                                          3 * (i % 2) - (2./3) * (i % 2)]])
 
-    # Also check that changing one DataSet's metadata doesn't affect the copy.
+    # Also check that changing one Dataset's metadata doesn't affect the copy.
     dataset.recspan_infos[0]["a"] = 100
     assert dataset.recspan_infos[0]["a"] == 100
     assert dataset_copy.recspan_infos[0]["a"] == 0
@@ -104,7 +104,7 @@ def test_DataSet():
     for i in xrange(4):
         assert_frame_equal(recspans[i], dataset[i])
 
-def test_DataSet_add_recspan():
+def test_Dataset_add_recspan():
     dataset = mock_dataset(num_channels=2, num_recspans=4)
     dataset.add_recspan([[1, 2], [3, 4], [5, 6]], {"a": 31337})
     assert len(dataset) == 5
@@ -118,7 +118,7 @@ def test_DataSet_add_recspan():
     assert_raises(ValueError,
                   dataset.add_recspan, [[1, 2, 3], [4, 5, 6]], {})
 
-def test_DataSet_events():
+def test_Dataset_events():
     # Thorough tests are in test_events; here we just make sure the basic API
     # is functioning.
     dataset = mock_dataset()
@@ -159,7 +159,7 @@ def test_transforms():
     for saved_data, data in zip(saved_datas, dataset):
         assert np.allclose(np.dot(saved_data, tr1.T), data)
 
-    dataset_copy = DataSet(dataset.data_format)
+    dataset_copy = Dataset(dataset.data_format)
     dataset_copy.add_dataset(dataset)
     assert len(saved_datas) == len(dataset_copy)
     for saved_data, copy_data in zip(saved_datas, dataset_copy):
@@ -177,7 +177,7 @@ def test_transforms():
     for saved_data, data in zip(saved_datas, dataset):
         assert np.allclose(np.dot(saved_data, tr_both.T), data)
 
-def test_DataSet_merge_df():
+def test_Dataset_merge_df():
     def make_events():
         ds = mock_dataset()
         ev1 = ds.add_event(0, 10, 11, {"code": 10, "code2": 20})
@@ -251,7 +251,7 @@ def test_DataSet_merge_df():
     assert dict(ev2) == {"code": 10, "code2": 21, "foo": "b"}
     assert dict(ev3) == {"code": 11, "code2": 20}
 
-def test_DataSet_merge_csv():
+def test_Dataset_merge_csv():
     from cStringIO import StringIO
     for sep in [",", "\t"]:
         ds = mock_dataset()

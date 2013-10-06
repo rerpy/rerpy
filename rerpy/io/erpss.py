@@ -13,7 +13,7 @@ import sys
 import numpy as np
 import pandas
 
-from rerpy.data import DataFormat, DataSet
+from rerpy.data import DataFormat, Dataset
 from rerpy.util import maybe_open
 from rerpy.io._erpss import _decompress_crw_chunk
 
@@ -457,25 +457,27 @@ def load_erpss(raw, log, calibration_events="condition == 0",
     span_slices = [slice(span_edges[i], span_edges[i + 1])
                    for i in xrange(len(span_edges) - 1)]
 
-    dataset = DataSet(data_format)
+    dataset = Dataset(data_format)
     for span_slice in span_slices:
         dataset.add_recspan(data[span_slice, :], metadata)
 
     span_starts = [s.start for s in span_slices]
-    for tick, row in raw_log_events.iterrows():
-        attrs = row.to_dict()
-        span_id = bisect.bisect(span_starts, tick) - 1
-        span_slice = span_slices[span_id]
+    recspan_ids = []
+    start_ticks = []
+    for tick in raw_log_events.index:
+        recspan_id = bisect.bisect(span_starts, tick) - 1
+        span_slice = span_slices[recspan_id]
         span_start = span_slice.start
         span_stop = span_slice.stop
         assert span_start <= tick < span_stop
+        recspan_ids.append(recspan_id)
+        start_ticks.append(tick - span_start)
+    stop_ticks = [tick + 1 for tick in start_ticks]
+    dataset.add_events(recspan_ids, start_ticks, stop_ticks,
+                       raw_log_events)
 
-        dataset.add_event(span_id,
-                           tick - span_start, tick - span_start + 1,
-                           attrs)
-
-        if attrs["code"] == DELETE_CODE:
-            dataset.recspan_infos[span_id]["deleted"] = True
+    for delete_event in dataset.events_query({"code": DELETE_CODE}):
+        delete_event.recspan_info["deleted"] = True
 
     for cal_event in dataset.events_query(calibration_events):
         for key in list(cal_event):

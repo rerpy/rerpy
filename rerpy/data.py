@@ -150,7 +150,7 @@ def test_DataFormat():
     assert_raises(ValueError, df.compute_symbolic_transform, "A2/2, A2/3")
     assert_raises(ValueError, df.compute_symbolic_transform, "A2/2 + 1")
 
-class DataSet(object):
+class Dataset(object):
     def __init__(self, data_format):
         self.data_format = data_format
         self._events = rerpy.events.Events()
@@ -198,7 +198,7 @@ class DataSet(object):
         if not isinstance(key, int) and hasattr(key, "__index__"):
             key = key.__index__()
         if not isinstance(key, int):
-            raise TypeError("DataSet indexing allows only a single integer "
+            raise TypeError("Dataset indexing allows only a single integer "
                             "(no slicing or other fanciness!)")
         # May raise IndexError, which is what we want:
         return self._recspans[key]
@@ -218,15 +218,23 @@ class DataSet(object):
     # Event handling methods (mostly delegated to ._events)
     ################################################################
 
+    def add_events(self, recspan_ids, start_ticks, stop_ticks, attributes_df):
+        return self._events.add_events(recspan_ids, start_ticks, stop_ticks,
+                                       attributes_df)
+    add_events.__doc__ = rerpy.events.Events.add_events.__doc__
+
     def add_event(self, recspan_id, start_tick, stop_tick, attributes):
         return self._events.add_event(recspan_id, start_tick, stop_tick,
                                       attributes)
+    add_event.__doc__ = rerpy.events.Events.add_event.__doc__
 
     def placeholder_event(self):
         return self._events.placeholder_event()
+    placeholder_event.__doc__ = rerpy.events.Events.placeholder_event.__doc__
 
     def events_query(self, restrict=None):
         return self._events.events_query(restrict)
+    events_query.__doc__ = rerpy.events.Events.events_query.__doc__
 
     def events(self, restrict=None):
         return list(self.events_query(restrict))

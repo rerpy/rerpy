@@ -20,12 +20,13 @@ def test_Events_basic():
     assert r1.id == 0
     assert r1.ticks == 100
     assert r1["a"] == "hello"
-    assert r1["b"] == True
+    assert r1["b"] is True
     assert r1["c"] is None
     assert r1["d"] is 1
     # Use same names, different types, to check that type constraints don't
     # apply between events and recspans
-    ev1 = e.add_event(0, 10, 11, {"a": 1, "b": "hello", "c": True, "d": 1.5})
+    ev1 = e.add_event(0, 10, 11, {"a": 1, "b": "hello", "c": True, "d": 1.5,
+                                  "e": None})
     assert ev1.recspan_id == 0
     assert ev1.start_tick == 10
     assert ev1.stop_tick == 11
@@ -33,28 +34,29 @@ def test_Events_basic():
     assert ev1.recspan_info == r1
     assert ev1["a"] == 1
     assert ev1["b"] == "hello"
-    assert ev1["c"] == True
+    assert ev1["c"] is True
     assert ev1["d"] == 1.5
+    assert ev1["e"] is None
     assert type(ev1["a"]) == int
     assert type(ev1["b"]) == str
     assert type(ev1["c"]) == bool
     assert type(ev1["d"]) == float
-    assert dict(ev1) == {"a": 1, "b": "hello", "c": True, "d": 1.5}
+    assert dict(ev1) == {"a": 1, "b": "hello", "c": True, "d": 1.5, "e": None}
     ev1["a"] = 2
     assert ev1["a"] == 2
-    assert_raises(ValueError, e.add_event, 0, 20, 21, {"a": "string"})
-    assert_raises(ValueError, e.add_event, 0, 20, 21, {"a": True})
-    assert_raises(ValueError, e.add_event, 0, 20, 21, {"b": 10})
-    assert_raises(ValueError, e.add_event, 0, 20, 21, {"b": True})
-    assert_raises(ValueError, e.add_event, 0, 20, 21, {"c": 10})
-    assert_raises(ValueError, e.add_event, 0, 20, 21, {"c": "string"})
-    assert_raises(ValueError, e.add_event, 0, 20, 21, {"asdf": []})
+    assert_raises(TypeError, e.add_event, 0, 20, 21, {"a": "string"})
+    assert_raises(TypeError, e.add_event, 0, 20, 21, {"a": True})
+    assert_raises(TypeError, e.add_event, 0, 20, 21, {"b": 10})
+    assert_raises(TypeError, e.add_event, 0, 20, 21, {"b": True})
+    assert_raises(TypeError, e.add_event, 0, 20, 21, {"c": 10})
+    assert_raises(TypeError, e.add_event, 0, 20, 21, {"c": "string"})
+    assert_raises(TypeError, e.add_event, 0, 20, 21, {"asdf": []})
     ev1["a"] = None
     assert ev1["a"] is None
     ev1["xxx"] = None
     ev2 = e.add_event(0, 11, 12, {"xxx": 3})
-    assert_raises(ValueError, e.add_event, 0, 20, 21, {"xxx": "string"})
-    assert_raises(ValueError, e.add_event, 0, 20, 21, {"xxx": True})
+    assert_raises(TypeError, e.add_event, 0, 20, 21, {"xxx": "string"})
+    assert_raises(TypeError, e.add_event, 0, 20, 21, {"xxx": True})
     assert ev2["xxx"] == 3
     assert ev2.start_tick == 11
     assert ev1["xxx"] is None
@@ -101,7 +103,7 @@ def test_Event():
     assert_raises(KeyError, ev1.__delitem__, "added")
     assert "a" in ev1
     assert "added" not in ev1
-    assert_raises(ValueError, ev1.__setitem__, "c", "asdf")
+    assert_raises(TypeError, ev1.__setitem__, "c", "asdf")
     assert ev1["c"] == True
 
     assert ev1.get("c") == True
@@ -493,3 +495,31 @@ def test_matches():
 
     p = e.placeholder_event()
     assert list(p.matches("a == 1")) == [e1]
+
+def test_add_events():
+    e = Events()
+    e.add_recspan_info(0, 100, {})
+    e.add_recspan_info(1, 100, {})
+
+    e.add_events([0, 1, 0], [10, 20, 30], [20, 30, 40],
+                 {"x": [1, 2, 3], "y": ["a", None, "c"], "z": [1.0, None, 2.0]})
+
+    evs = list(e.events_query())
+    assert evs[0].recspan_id == 0
+    assert evs[0].start_tick == 10
+    assert evs[0].stop_tick == 20
+    assert dict(evs[0]) == {"x": 1, "y": "a", "z": 1.0}
+    assert evs[1].recspan_id == 0
+    assert evs[1].start_tick == 30
+    assert evs[1].stop_tick == 40
+    assert dict(evs[1]) == {"x": 3, "y": "c", "z": 2.0}
+    assert evs[2].recspan_id == 1
+    assert evs[2].start_tick == 20
+    assert evs[2].stop_tick == 30
+    assert dict(evs[2]) == {"x": 2, "y": None, "z": None}
+
+    assert_raises(TypeError,
+                  e.add_events, [0, 0], [0, 0], [1, 1],
+                  {"string_type": ["a", 1.0]})
+    assert_raises(ValueError, e.add_events, [0], [-1], [10], {})
+    assert_raises(ValueError, e.add_events, [0], [10], [10], {})
