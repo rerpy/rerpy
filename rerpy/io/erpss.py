@@ -206,7 +206,7 @@ def test_channel_names_roundtrip():
         assert_raises(ValueError,
                       _channel_names_to_header, ["a" * 5] * i, header)
 
-def read_raw(stream, dtype, load_data):
+def read_raw(stream, dtype, lazy):
     (fetcher, nchans, hz, channel_names, info, header) = _read_header(stream)
     # Data is stored in a series of "chunks" -- each chunk contains 256 s16
     # samples from each channel (the 32/64/whatever analog channels, plus 1
@@ -217,7 +217,7 @@ def read_raw(stream, dtype, load_data):
     code_chunks = []
     data_chunks = []
     while True:
-        read = fetcher.read_next_chunk(load_data)
+        read = fetcher.read_next_chunk(lazy)
         if read is None:
             break
         (code_chunk, data_chunk) = read
@@ -225,28 +225,31 @@ def read_raw(stream, dtype, load_data):
         assert code_chunk[0] == chunkno
         code_chunk[0] = 0
         code_chunks.append(code_chunk)
-        if load_data:
+        if not lazy:
             assert data_chunk.shape == (256 * nchans,)
             data_chunk.resize((256, nchans))
             data_chunk = np.asarray(data_chunk, dtype=dtype)
             data_chunks.append(data_chunk)
         chunkno += 1
     codes = np.concatenate(code_chunks)
-    if load_data:
-        data = np.row_stack(data_chunks)
-    else:
+    if lazy:
         data = None
+    else:
+        data = np.row_stack(data_chunks)
     return (fetcher, hz, channel_names, codes, data, info)
 
 # These two classes have slightly weird invariants. They have one of two life
 # cycles:
 # Option 1:
 # - __init__
-# - read_next_chunk(True) called repeatedly to load all codes and data
+# - read_next_chunk(False) called repeatedly to load all codes and data
 # Option 2:
 # - __init__
-# - read_next_chunk(False) called repeatedly to load all codes
+# - read_next_chunk(True) called repeatedly to load all codes
 # - get_chunk(chunk_number) called repeatedly to load random pieces of data
+# The key thing is that get_chunk is not guaranteed to work until after
+# read_next_chunk has been called to scan the whole file.
+#
 # read_next_chunk has the invariants that at entry, the stream will always be
 # pointing to the beginning of the wanted chunk, and then on exit, the stream
 # will always be pointing to beginning of the next chunk.
@@ -256,16 +259,16 @@ class RawChunkFetcher(object):
         self._nchans = nchans
         self._chunk_size_bytes = (nchans + 1) * 256 * 2
 
-    def read_next_chunk(self, return_data):
+    def read_next_chunk(self, lazy):
         buf = self._stream.read(self._chunk_size_bytes)
         # Check for EOF:
         if not buf:
             return None
         codes = np.fromstring(buf[:512], dtype="<u2")
-        if return_data:
-            data_chunk = np.fromstring(buf[512:], dtype="<i2")
-        else:
+        if lazy:
             data_chunk = None
+        else:
+            data_chunk = np.fromstring(buf[512:], dtype="<i2")
         return codes, data_chunk
 
     def get_chunk(self, chunk_number):
@@ -281,7 +284,7 @@ class CrwChunkFetcher(object):
         self._nchans = nchans
         self._offsets = []
 
-    def read_next_chunk(self, return_data):
+    def read_next_chunk(self, lazy):
         # Check for EOF:
         ncode_records_minus_one_buf = self._stream.read(1)
         if not ncode_records_minus_one_buf:
@@ -302,13 +305,13 @@ class CrwChunkFetcher(object):
         self._offsets.append(self._stream.tell())
         (ncompressed_words,) = struct.unpack("<H", self._stream.read(2))
         compressed_data = self._stream.read(ncompressed_words * 2)
-        if return_data:
+        if lazy:
+            data_chunk = None
+        else:
             # This is the slow part of loading data:
             data_chunk = _decompress_crw_chunk(compressed_data,
                                                ncompressed_words,
                                                self._nchans)
-        else:
-            data_chunk = None
         return codes, data_chunk
 
     def get_chunk(self, chunk_number):
@@ -357,7 +360,7 @@ def test_LazyRecspan():
     for suffix in ["crw", "raw"]:
         (fetcher, hz, channames, codes, data, info) = read_raw(
             open(test_data_path("erpss/tiny-complete.%s" % (suffix,)), "rb"),
-            "u2", True)
+            "u2", False)
         # This fake recspan is chosen to cover part of the first and last
         # chunks, plus the entire middle chunk. It's exactly 512 samples long.
         lr = LazyRecspan(fetcher, "u2", len(channames), 128, 640)
@@ -368,14 +371,14 @@ def test_LazyRecspan():
                           == data[128 + start:128 + stop])
 
 def assert_files_match(p1, p2):
-    (_, hz1, channames1, codes1, data1, info1) = read_raw(open(p1, "rb"), "u2", True)
-    for (p, load_data) in [(p1, False), (p2, True), (p2, False)]:
+    (_, hz1, channames1, codes1, data1, info1) = read_raw(open(p1, "rb"), "u2", False)
+    for (p, lazy) in [(p1, True), (p2, False), (p2, True)]:
         (fetcher2, hz2, channames2, codes2, data2, info2
-         ) = read_raw(open(p, "rb"), "u2", load_data)
+         ) = read_raw(open(p, "rb"), "u2", lazy)
     assert hz1 == hz2
     assert (channames1 == channames2).all()
     assert (codes1 == codes2).all()
-    if not load_data:
+    if lazy:
         assert data2 is None
         # Slight abuse, pretend that there's one recspan that has the whole
         # file
@@ -402,7 +405,7 @@ def test_read_raw_on_test_data():
 def test_64bit_channel_names():
     from rerpy.test import test_data_path
     stream = open(test_data_path("erpss/two-chunks-64chan.raw"), "rb")
-    (_, hz, channel_names, codes, data, info) = read_raw(stream, int, False)
+    (_, hz, channel_names, codes, data, info) = read_raw(stream, int, True)
     # "Correct" channel names as listed by headinfo(1):
     assert (channel_names ==
             ["LOPf", "ROPf", "LMPf", "RMPf", "LTPf", "RTPf", "LLPf", "RLPf",
@@ -443,7 +446,7 @@ def read_log(file_like):
 # bother. (Though could, I guess.)
 def make_log(raw, condition=64): # pragma: no cover
     import warnings; warnings.warn("This code is not tested!")
-    codes = read_raw(maybe_open(raw), np.float64)[3]
+    codes = read_raw(maybe_open(raw), np.float64, True)[3]
     log = []
     for i in codes.nonzero()[0]:
         log.append(struct.pack("<HHHBB",
@@ -495,7 +498,7 @@ def test_read_log():
     t(data, expected)
 
 def load_erpss(raw, log, calibration_events="condition == 0",
-               preload=False,
+               lazy=True,
                calibrate=False,
                calibrate_half_width_ticks=5,
                calibrate_low_cursor_time=None,
@@ -515,7 +518,7 @@ def load_erpss(raw, log, calibration_events="condition == 0",
     log = maybe_open(log)
 
     (fetcher, hz, channel_names, raw_codes, data, header_metadata
-     ) = read_raw(raw, dtype, preload)
+     ) = read_raw(raw, dtype, lazy)
     metadata.update(header_metadata)
     if calibrate:
         units = "uV"
@@ -564,13 +567,13 @@ def load_erpss(raw, log, calibration_events="condition == 0",
 
     dataset = Dataset(data_format)
     for span_slice in span_slices:
-        if preload:
-            dataset.add_recspan(data[span_slice, :], metadata)
-        else:
+        if lazy:
             lr = LazyRecspan(fetcher, dtype, len(channel_names),
                              span_slice.start, span_slice.stop)
             dataset.add_lazy_recspan(lr, span_slice.stop - span_slice.start,
                                      metadata)
+        else:
+            dataset.add_recspan(data[span_slice, :], metadata)
 
     span_starts = [s.start for s in span_slices]
     recspan_ids = []
@@ -642,10 +645,10 @@ def test_load_erpss():
     #   are supposed to be reserved for special stuff and deleted events, but
     #   it happens the file I was using as a basis violated this rule. Oh
     #   well.
-    for preload in [True, False]:
+    for lazy in [False, True]:
         dataset = load_erpss(test_data_path("erpss/tiny-complete.crw"),
                              test_data_path("erpss/tiny-complete.log"),
-                             preload=preload)
+                             lazy=lazy)
         assert len(dataset) == 2
         assert dataset[0].shape == (512, 32)
         assert dataset[1].shape == (256, 32)
@@ -700,7 +703,7 @@ def test_load_erpss():
         # check calibration_events option
         dataset2 = load_erpss(test_data_path("erpss/tiny-complete.crw"),
                               test_data_path("erpss/tiny-complete.log"),
-                              preload=preload,
+                              lazy=lazy,
                               calibration_events="condition == 65")
         assert len(dataset2.events("condition == 65")) == 0
         assert len(dataset2.events("condition == 0")) == 2
@@ -711,7 +714,7 @@ def test_load_erpss():
         # set to be the same size as whatever we told it to be.
         dataset_cal = load_erpss(test_data_path("erpss/tiny-complete.crw"),
                                  test_data_path("erpss/tiny-complete.log"),
-                                 preload=preload,
+                                 lazy=lazy,
                                  calibration_events="condition == 65",
                                  calibrate=True,
                                  calibrate_half_width_ticks=2,
@@ -736,7 +739,7 @@ def test_load_erpss():
         # hey you never know...)
         crw = open(test_data_path("erpss/tiny-complete.crw"), "rb")
         log = open(test_data_path("erpss/tiny-complete.log"), "rb")
-        assert len(load_erpss(crw, log, preload=preload)) == 2
+        assert len(load_erpss(crw, log, lazy=lazy)) == 2
 
         # check that code/raw mismatch is detected
         from nose.tools import assert_raises
@@ -745,21 +748,21 @@ def test_load_erpss():
                           load_erpss,
                           test_data_path("erpss/tiny-complete.crw"),
                           test_data_path("erpss/tiny-complete.%s.log" % (bad,)),
-                          preload=preload)
+                          lazy=lazy)
         # But if the only mismatch is an event that is "deleted" (sign bit
         # set) in the log file, but not in the raw file, then that is okay:
         load_erpss(test_data_path("erpss/tiny-complete.crw"),
                    test_data_path("erpss/tiny-complete.code-deleted.log"),
-                   preload=preload)
+                   lazy=lazy)
 
-    # Compare preload to no-preload directly
-    pre = load_erpss(test_data_path("erpss/tiny-complete.crw"),
+    # Compare lazy to eager directly
+    eager = load_erpss(test_data_path("erpss/tiny-complete.crw"),
                      test_data_path("erpss/tiny-complete.log"),
-                     preload=True)
+                     lazy=False)
     lazy = load_erpss(test_data_path("erpss/tiny-complete.crw"),
                       test_data_path("erpss/tiny-complete.log"),
-                      preload=False)
+                      lazy=True)
     from pandas.util.testing import assert_frame_equal
-    assert len(pre) == len(lazy)
-    for pre_recspan, lazy_recspan in zip(pre, lazy):
-        assert_frame_equal(pre_recspan, lazy_recspan)
+    assert len(eager) == len(lazy)
+    for eager_recspan, lazy_recspan in zip(eager, lazy):
+        assert_frame_equal(eager_recspan, lazy_recspan)
