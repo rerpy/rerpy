@@ -117,7 +117,10 @@ def multi_rerp_impl(dataset, rerp_requests,
         rerp._set_fit_info(regression_strategy, overlap_correction)
     if overlap_correction:
         gs = rerps[0].global_stats
-        overlap_proportion = gs.event_ticks.accepted * 1.0 / gs.ticks.accepted
+        if gs.ticks.accepted:
+            overlap_proportion = gs.event_ticks.accepted * 1.0 / gs.ticks.accepted
+        else:
+            overlap_proportion = np.nan
         if overlap_proportion == 1.0:
             overlap_msg = "enabled (but there is no overlap)"
         else:
