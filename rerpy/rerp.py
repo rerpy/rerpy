@@ -115,7 +115,7 @@ def multi_rerp_impl(dataset, rerp_requests,
                                            rerps[0].global_stats)
     for rerp in rerps:
         rerp._set_fit_info(regression_strategy, overlap_correction)
-    log_stream.write("Fitting model to %s ticks with strategy %r\n"
+    log_stream.write("Fitting rERPs to %s ticks with strategy %r\n"
                      % (rerps[0].global_stats.ticks.accepted,
                         regression_strategy))
     # _fit_* functions fill in .betas field on rerps.
@@ -1346,14 +1346,16 @@ def _fit_continuous(dataset, analysis_subspans, rerps, log_stream):
             x_strip = sp.coo_matrix((design_data, (design_i, design_j)),
                                     shape=(data.shape[0], full_design_width))
             x_strip = x_strip.tocsc()
-            # This actually transmutes XtX and XtY into np.matrix
-            # objects. Weird and annoying, but not harmful.
-            XtX += x_strip.T * x_strip
-            XtY += x_strip.T * data
+            XtX_strip = x_strip.T * x_strip
+            # This is an elaborate way of doing:
+            #   XtX += XtX_strip
+            # because as of scipy 0.13, dense += sparse is expanded into:
+            #   dense = dense + sparse.todense()
+            # which is just ridiculously inefficient.
+            XtX_strip_coo = XtX_strip.tocoo()
+            XtX[XtX_strip_coo.row, XtX_strip_coo.col] += XtX_strip_coo.data
+            XtY += np.asarray(x_strip.T * data)
             progress_bar.increment()
-    # Turn them back into ndarrays, to avoid any surprises later.
-    XtX = np.asarray(XtX)
-    XtY = np.asarray(XtY)
     if rows < full_design_width:
         raise ValueError("This analysis has more predictors than data "
                          "points. I'm afraid this isn't going to work out.")
