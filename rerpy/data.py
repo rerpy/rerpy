@@ -275,11 +275,12 @@ class Dataset(object):
             yield self[i]
 
     def __repr__(self):
-        return ("<%s with %s recspans, %s events, and %s frames>"
+        return ("<%s with %s events in %s total ticks over %s recspans>"
                 % (self.__class__.__name__,
-                   len(self),
                    len(self.events_query()),
-                   sum([ri.ticks for ri in self.recspan_infos])))
+                   sum([ri.ticks for ri in self.recspan_infos]),
+                   len(self),
+                   ))
 
     ################################################################
     # Event handling methods (mostly delegated to ._events)
