@@ -125,9 +125,15 @@ def multi_rerp_impl(dataset, rerp_requests,
                 overlap_proportion,)
     else:
         overlap_msg = "DISABLED\n"
-    log_stream.write("Fitting rERPs to %s ticks with strategy %r\n"
+    total_predictors = 0
+    for rerp in rerps:
+        total_predictors += len(rerp.design_info.column_names)
+    log_stream.write("Fitting %s rERPs with %s predictors to %s ticks "
+                     "(strategy: %s)\n"
                      "  overlap correction is %s\n"
-                     % (rerps[0].global_stats.ticks.accepted,
+                     % (len(rerps),
+                        total_predictors,
+                        rerps[0].global_stats.ticks.accepted,
                         regression_strategy, overlap_msg))
     # _fit_* functions fill in .betas field on rerps.
     if regression_strategy == "by-epoch":
