@@ -115,9 +115,20 @@ def multi_rerp_impl(dataset, rerp_requests,
                                            rerps[0].global_stats)
     for rerp in rerps:
         rerp._set_fit_info(regression_strategy, overlap_correction)
+    if overlap_correction:
+        gs = rerps[0].global_stats
+        overlap_proportion = gs.event_ticks.accepted * 1.0 / gs.ticks.accepted
+        if overlap_proportion == 1.0:
+            overlap_msg = "enabled (but there is no overlap)"
+        else:
+            overlap_msg = "ENABLED (average of %0.2f events/tick)" % (
+                overlap_proportion,)
+    else:
+        overlap_msg = "DISABLED\n"
     log_stream.write("Fitting rERPs to %s ticks with strategy %r\n"
+                     "  overlap correction is %s\n"
                      % (rerps[0].global_stats.ticks.accepted,
-                        regression_strategy))
+                        regression_strategy, overlap_msg))
     # _fit_* functions fill in .betas field on rerps.
     if regression_strategy == "by-epoch":
         _fit_by_epoch(dataset, analysis_subspans, rerps)
