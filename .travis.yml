@@ -9,7 +9,8 @@ before_install:
   - sudo apt-get -qq update
   - sudo apt-get build-dep -qq python-scipy python-pandas cython
   # Need something like scipy 0.10, pandas 0.12, not sure about cython (want memoryview support anyway, 0.15 does NOT work, 0.19 does)
-  - pip install --use-mirrors --upgrade coverage scipy cython patsy pandas
+  - pip install --use-mirrors --install-option="--no-cython-compile" cython
+  - pip install --use-mirrors --upgrade coverage scipy patsy pandas
   - echo Final installation
   - pip freeze
   - which nosetests
