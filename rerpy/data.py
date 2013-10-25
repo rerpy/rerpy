@@ -55,7 +55,7 @@ class DataFormat(object):
         return not (self == other)
 
     def ms_to_ticks(self, ms, round="nearest"):
-        float_tick = ms * self.exact_sample_rate_hz / 1000.0
+        float_tick = np.asarray(ms) * self.exact_sample_rate_hz / 1000.0
         if round == "nearest":
             tick = np.round(float_tick)
         elif round == "down":
@@ -64,7 +64,7 @@ class DataFormat(object):
             tick = np.ceil(float_tick)
         else:
             raise ValueError("round= must be \"nearest\", \"up\", or \"down\"")
-        return int(tick)
+        return tick.astype(int)
 
     def ticks_to_ms(self, ticks):
         return np.asarray(ticks) * 1000.0 / self.exact_sample_rate_hz
@@ -130,6 +130,15 @@ def test_DataFormat():
     assert df.ms_to_ticks(1000, round="up") == 1024
     assert df.ms_to_ticks(1000.1, round="up") == 1025
     assert df.ms_to_ticks(1000.9, round="up") == 1025
+
+    assert isinstance(df.ms_to_ticks(1000.1), int)
+
+    assert np.array_equal(df.ms_to_ticks([1000.1, 1000.9]),
+                          [1024, 1025])
+    assert np.array_equal(df.ms_to_ticks([1000.1, 1000.9], round="down"),
+                          [1024, 1024])
+    assert isinstance(df.ms_to_ticks([1000.1, 1000.9]), np.ndarray)
+    assert df.ms_to_ticks([1000.1, 1000.9]).dtype == np.int_
 
     assert_raises(ValueError, df.ms_to_ticks, 1000, round="sideways")
 
