@@ -1,14 +1,17 @@
-rERPy is a Python toolkit for doing ERP analysis of brainwave data
-(EEG, MEG), using both traditional averaging-based ERP estimation, and
-a fancy new regression-based technique for ERP estimation, which we
-call rERP for short. rERPs can do anything ERPs can do -- in fact,
-ERPs are special cases of rERPs; every ERP is also a rERP. But, the
-reverse is not true. rERPs make it straightforward to analyze
+rERPy is a Python toolkit for doing ERP/ERF analysis of brainwave data
+(EEG, MEG), using both traditional averaging-based ERP/ERF estimation,
+and a fancy new regression-based technique for ERP/ERF estimation,
+which we call rERP/rERF. rERPs can do anything ERPs can do -- in fact,
+ERPs are special cases of rERPs; every ERP is also a rERP. But rERPs
+are much more powerful. rERPs make it straightforward to analyze
 experimental designs that use a mix of categorical and continuous
 manipulations, even when these manipulations are partially confounded
 or produce non-linear effects, and they can separate out overlapping
 waveforms timelocked to temporally adjacent events. They can even do
-all these things at the same time.
+all these things at the same time. Nonetheless, they are relatively
+simple to use.
+
+For more details on rERP/rERF analysis, see: http://vorpus.org/rERP
 
 .. image:: https://travis-ci.org/rerpy/rerpy.png?branch=master
    :target: https://travis-ci.org/rerpy/rerpy
@@ -27,6 +30,10 @@ Dependencies:
   * scipy
   * pandas
   * patsy
+
+If you're starting from scratch (not previously a Python user), then
+we recommend `installing a scientific Python distribution
+<http://www.scipy.org/install.html>`_.
 
 Optional dependencies:
   * nose: needed to run tests
