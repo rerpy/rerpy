@@ -6,7 +6,6 @@ import os.path
 import struct
 import os
 import string
-from collections import OrderedDict
 import bisect
 import sys
 

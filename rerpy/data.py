@@ -3,7 +3,7 @@
 # See file LICENSE.txt for license information.
 
 import cPickle
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 from itertools import groupby, izip
 import abc
 import csv
