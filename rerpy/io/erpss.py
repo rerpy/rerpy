@@ -624,7 +624,7 @@ def load_erpss(raw, log, calibration_events="condition == 0",
         # For each channel, we want to multiply by a factor with units uV/raw
         # We have calibrate_pulse_size uV = cal_diffs raw
         cal_scaler = calibrate_pulse_size / cal_diffs
-        dataset.transform(np.diagflat(cal_scaler))
+        dataset.transform(np.diagflat(np.asarray(cal_scaler)))
 
     return dataset
 
