@@ -1,5 +1,5 @@
 Compatibility notes
--------------------
+===================
 
 Coming from ERPSS
 -----------------

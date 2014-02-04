@@ -37,8 +37,8 @@ except ImportError:
 # The short X.Y version.
 import sys, os
 sys.path.insert(0, os.getcwd() + "/..")
-import patsy
-version = patsy.__version__
+import rerpy
+version = rerpy.__version__
 # The full version, including alpha/beta/rc tags.
 release = version
 

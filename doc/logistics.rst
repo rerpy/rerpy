@@ -1,11 +1,11 @@
-Vital statistics
-================
+rERPy's vital statistics
+========================
 
 Documentation:
-  not yet
+  http://rerpy.readthedocs.org/
 
 Downloads:
-  not yet
+  no official releases yet
 
 Dependencies:
   * Python 2.7 (not Python 3 yet, sorry -- patches accepted!)
