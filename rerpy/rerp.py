@@ -1255,7 +1255,7 @@ def _fit_by_epoch(dataset, analysis_subspans, rerps):
     # Process recspans in order, to improve data locality
     epochs = sorted(epochs, key=lambda e: (e.recspan_id, e.start_tick))
     channels = dataset.data_format.num_channels
-    Xs_Ys_by_rerp = {rerp: ([], []) for rerp in rerps}
+    Xs_Ys_by_rerp = dict([(rerp, ([], [])) for rerp in rerps])
     for epoch in epochs:
         this_X = epoch.design_row
         y_data = dataset.raw_slice(epoch.recspan_id,
