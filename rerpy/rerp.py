@@ -351,7 +351,7 @@ def _rerp_design(formula, events, eval_env):
     desc.lhs_termlist = [Term([_RangeFactor(len(events))])]
     fake_lhs, design = dmatrices(desc, _FormulaEnv(events))
     surviving_event_idxes = np.asarray(fake_lhs, dtype=int).ravel()
-    design_row_idxes = np.empty(len(events))
+    design_row_idxes = np.empty(len(events), dtype=int)
     design_row_idxes.fill(-1)
     design_row_idxes[surviving_event_idxes] = np.arange(design.shape[0])
     # Now design_row_idxes[i] is -1 if event i was thrown out, and
