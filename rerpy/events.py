@@ -331,8 +331,8 @@ class Events(object):
         """Add a set of events in bulk.
 
         This method is substantially faster than repeated calls to
-        add_event(), but it requires that all the events have the same types
-        of attribute (though the actual attribute values may differ).
+        add_event(), but it requires that all the events have the same
+        attribute names (though the actual attribute values may differ).
 
         Example::
 
@@ -388,8 +388,8 @@ class Events(object):
     def add_event(self, recspan_id, start_tick, stop_tick, attributes):
         objtype = self._objtypes["event"]
         event_id = self._next_id
-        self.add_events([recspan_id], [start_tick], [stop_tick],
-                        {key: [val] for (key, val) in attributes.iteritems()})
+        events = dict([(key, [val]) for (key, val) in attributes.iteritems()])
+        self.add_events([recspan_id], [start_tick], [stop_tick], events)
         return Event(self, event_id)
 
     def add_recspan_info(self, recspan_id, ticks, attributes):
